@@ -1,4 +1,4 @@
-# Copyright (c) 2020 Tigera, Inc. All rights reserved.
+# Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import sys
 
 from tests.k8st.test_base import TestBaseV6
 from tests.k8st.utils.utils import start_external_node_with_bgp, \
-        retry_until_success, run, curl, DiagsCollector, calicoctl, kubectl, node_info
+        retry_until_success, run, curl, DiagsCollector, calicoctl, kubectl, node_info, NGINX_IMAGE
 
 _log = logging.getLogger(__name__)
 
@@ -312,7 +312,7 @@ EOF
         """
         with DiagsCollector():
 
-            # Whitelist two IP ranges for the external IPs we'll test with
+            # Allow two IP ranges for the external IPs we'll test with
             calicoctl("""apply -f - << EOF
 apiVersion: projectcalico.org/v3
 kind: BGPConfiguration
@@ -455,6 +455,60 @@ EOF
                     self.assertNotIn(cip, routes)
             retry_until_success(check_routes_gone, retries=10, wait_time=5)
 
+    def test_bgp_filter_ip_advertisement(self):
+        with DiagsCollector():
+            # Add BGPConfiguration with serviceClusterIP
+            kubectl("""apply -f - << EOF
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  serviceClusterIPs:
+  - cidr: fd00:10:96::/112
+EOF
+""")
+            # Assert that a route to the service IP range is present.
+            retry_until_success(lambda: self.assertIn("fd00:10:96::/112", self.get_routes()))
+
+            # Create a Local type NodePort service with a single replica.
+            local_svc = "nginx-local"
+            self.deploy("gcr.io/kubernetes-e2e-test-images/test-webserver:1.0", local_svc, self.ns, 80, ipv6=True)
+            self.wait_until_exists(local_svc, "svc", self.ns)
+
+            # Get clusterIPs.
+            local_svc_ip = self.get_svc_cluster_ip(local_svc, self.ns)
+
+            # Wait for the deployment to roll out.
+            self.wait_for_deployment(local_svc, self.ns)
+
+            # Assert that nginx service can be curled from the external node.
+            retry_until_success(curl, function_args=[local_svc_ip])
+
+            # Assert that local clusterIP is an advertised route.
+            retry_until_success(lambda: self.assertIn(local_svc_ip, self.get_routes()))
+
+            # Create an export BGP filter that rejects the service IP range
+            kubectl("""apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: test-filter-export-1
+spec:
+  exportV6:
+  - cidr: fd00:10:96::/112
+    matchOperator: In
+    action: Reject
+EOF
+""")
+        kubectl("patch bgppeer node-extra.peer --patch '{\"spec\": {\"filters\": [\"test-filter-export-1\"]}}'")
+        self.add_cleanup(lambda: kubectl("patch bgppeer node-extra.peer --patch '{\"spec\": {\"filters\": []}}'"))
+        self.add_cleanup(lambda: kubectl("delete bgpfilter test-filter-export-1"))
+
+        # Assert that local clusterIP is no longer advertised.
+        retry_until_success(lambda: self.assertNotIn(local_svc_ip, self.get_routes()))
+        # Assert that a route to the service IP range is no longer present.
+        retry_until_success(lambda: self.assertNotIn("fd00:10:96::/112", self.get_routes()))
 
 class TestBGPAdvertV6RR(_TestBGPAdvertV6):
 
@@ -507,7 +561,7 @@ spec:
     spec:
       containers:
       - name: nginx-rr
-        image: nginx:1.7.9
+        image: %s
         ports:
         - containerPort: 80
       nodeSelector:
@@ -536,7 +590,7 @@ spec:
   type: NodePort
   externalTrafficPolicy: Local
 EOF
-""" % self.nodes[1])
+""" % (NGINX_IMAGE, self.nodes[1]))
 
         calicoctl("get nodes -o yaml")
         calicoctl("get bgppeers -o yaml")
@@ -586,3 +640,112 @@ EOF
         external_ip = svc_dict['spec']['externalIPs'][0]
         retry_until_success(lambda: self.assertIn(cluster_ip, self.get_routes()))
         retry_until_success(lambda: self.assertIn(external_ip, self.get_routes()))
+
+
+    def test_single_ip_lb_rr(self):
+        """
+        Tests a /128 LB service with externalTrafficPolicy=Local using a RR
+        """
+        # Create ExternalTrafficPolicy Local service with one endpoint on node-1
+        kubectl("""apply -f - << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-rr
+  namespace: bgp-test
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+      run: nginx-rr
+  template:
+    metadata:
+      labels:
+        app: nginx
+        run: nginx-rr
+    spec:
+      containers:
+      - name: nginx-rr
+        image: %s
+        ports:
+        - containerPort: 80
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/hostname: %s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-rr
+  namespace: bgp-test
+  labels:
+    app: nginx
+    run: nginx-rr
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: fdff::96
+spec:
+  ipFamilies:
+  - IPv6
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    app: nginx
+    run: nginx-rr
+  type: LoadBalancer
+  loadBalancerIP: fdff::96
+  externalTrafficPolicy: Local
+EOF
+""" % (NGINX_IMAGE, self.nodes[1]))
+
+        calicoctl("get nodes -o yaml")
+        calicoctl("get bgppeers -o yaml")
+        calicoctl("get bgpconfigs -o yaml")
+
+        # Update the node-2 to behave as a route-reflector
+        json_str = calicoctl("get node %s -o json" % self.nodes[2])
+        node_dict = json.loads(json_str)
+        node_dict['metadata']['labels']['i-am-a-route-reflector'] = 'true'
+        node_dict['spec']['bgp']['routeReflectorClusterID'] = '224.0.0.1'
+        calicoctl("""apply -f - << EOF
+%s
+EOF
+""" % json.dumps(node_dict))
+
+        # Disable node-to-node mesh, add cluster and external IP CIDRs to
+        # advertise, and configure BGP peering between the cluster nodes and the
+        # RR.  (The BGP peering from the external node to the RR is included in
+        # get_bird_conf() above.)
+        calicoctl("""apply -f - << EOF
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  nodeToNodeMeshEnabled: false
+  asNumber: 64512
+  serviceClusterIPs:
+  - cidr: fd00:10:96::/112
+  serviceLoadBalancerIPs:
+  - cidr: fdff::96/128
+EOF
+""")
+
+        calicoctl("""apply -f - << EOF
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata: {name: peer-with-rr}
+spec:
+  peerIP: %s
+  asNumber: 64512
+EOF
+""" % self.ipv6s[2])
+        svc_json = kubectl("get svc nginx-rr -n bgp-test -o json")
+        svc_dict = json.loads(svc_json)
+        cluster_ip = svc_dict['spec']['clusterIP']
+        load_balancer_ip = svc_dict['spec']['loadBalancerIP']
+        retry_until_success(lambda: self.assertIn(cluster_ip, self.get_routes()))
+        retry_until_success(lambda: self.assertIn(load_balancer_ip, self.get_routes()))

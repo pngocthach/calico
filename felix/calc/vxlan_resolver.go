@@ -20,14 +20,12 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/dispatcher"
+	"github.com/projectcalico/calico/felix/proto"
 	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	"github.com/projectcalico/calico/felix/dispatcher"
-	"github.com/projectcalico/calico/felix/proto"
 )
 
 // VXLANResolver is responsible for resolving node IPs and node config to calculate the
@@ -63,7 +61,6 @@ type VXLANResolver struct {
 	nodeNameToIPv6Addr          map[string]string
 	nodeNameToVXLANMacV6        map[string]string
 	nodeNameToSentVTEP          map[string]*proto.VXLANTunnelEndpointUpdate
-	blockToRoutes               map[string]set.Set
 	vxlanPools                  map[string]model.IPPool
 	useNodeResourceUpdates      bool
 }
@@ -80,7 +77,6 @@ func NewVXLANResolver(hostname string, callbacks vxlanCallbacks, useNodeResource
 		nodeNameToIPv6Addr:          map[string]string{},
 		nodeNameToVXLANMacV6:        map[string]string{},
 		nodeNameToSentVTEP:          map[string]*proto.VXLANTunnelEndpointUpdate{},
-		blockToRoutes:               map[string]set.Set{},
 		vxlanPools:                  map[string]model.IPPool{},
 		useNodeResourceUpdates:      useNodeResourceUpdates,
 	}
@@ -160,7 +156,8 @@ func (c *VXLANResolver) onNodeIPUpdate(nodeName string, newIPv4 string, newIPv6 
 		"newIPv4":  newIPv4,
 		"currIPv4": currIPv4,
 		"newIPv6":  newIPv6,
-		"currIPv6": currIPv6})
+		"currIPv6": currIPv6,
+	})
 	logCtx.Debug("Node IP update")
 
 	// net.IP.String() may return an actual string with value "<nil>"
@@ -266,20 +263,20 @@ func (c *VXLANResolver) hasVTEPInfo(node string) (bool, bool) {
 	hasV4Info, hasV6Info := true, true
 
 	if _, ok := c.nodeNameToVXLANTunnelAddr[node]; !ok {
-		logCtx.Info("Missing IPv4 VXLAN tunnel address for node")
+		logCtx.Debug("Missing IPv4 VXLAN tunnel address for node")
 		hasV4Info = false
 	}
 	if _, ok := c.nodeNameToIPv4Addr[node]; !ok {
-		logCtx.Info("Missing IPv4 address for node")
+		logCtx.Debug("Missing IPv4 address for node")
 		hasV4Info = false
 	}
 
 	if _, ok := c.nodeNameToVXLANTunnelAddrV6[node]; !ok {
-		logCtx.Info("Missing IPv6 VXLAN tunnel address for node")
+		logCtx.Debug("Missing IPv6 VXLAN tunnel address for node")
 		hasV6Info = false
 	}
 	if _, ok := c.nodeNameToIPv6Addr[node]; !ok {
-		logCtx.Info("Missing IPv6 address for node")
+		logCtx.Debug("Missing IPv6 address for node")
 		hasV6Info = false
 	}
 
@@ -324,7 +321,7 @@ func (c *VXLANResolver) sendVTEPUpdateOrRemove(node string) {
 
 	if hasSentVTEP {
 		if c.vtepEqual(oldVTEP, vtep) {
-			logCtx.Info("VTEP information has not changed, skipping duplicate update")
+			logCtx.Debug("VTEP information has not changed, skipping duplicate update")
 			return
 		}
 		// Skip removing node from c.nodeNameToSentVTEP because it will be updated below

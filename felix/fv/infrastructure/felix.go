@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,23 @@
 package infrastructure
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
 
+	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/bpf/jump"
+	"github.com/projectcalico/calico/felix/bpf/polprog"
 	"github.com/projectcalico/calico/felix/fv/containers"
+	"github.com/projectcalico/calico/felix/fv/metrics"
 	"github.com/projectcalico/calico/felix/fv/tcpdump"
 	"github.com/projectcalico/calico/felix/fv/utils"
 )
@@ -35,28 +44,47 @@ type Felix struct {
 	*containers.Container
 
 	// ExpectedIPIPTunnelAddr contains the IP that the infrastructure expects to
-	// get assigned to the IPIP tunnel.  Filled in by AddNode().
+	// get assigned to the IPIP tunnel.  Filled in by SetExpectedIPIPTunnelAddr().
 	ExpectedIPIPTunnelAddr string
 	// ExpectedVXLANTunnelAddr contains the IP that the infrastructure expects to
-	// get assigned to the VXLAN tunnel.  Filled in by AddNode().
+	// get assigned to the IPv4 VXLAN tunnel.  Filled in by SetExpectedVXLANTunnelAddr().
 	ExpectedVXLANTunnelAddr string
-	// ExpectedWireguardTunnelAddr contains the IP that the infrastructure expects to
-	// get assigned to the Wireguard tunnel.  Filled in by AddNode().
+	// ExpectedVXLANV6TunnelAddr contains the IP that the infrastructure expects to
+	// get assigned to the IPv6 VXLAN tunnel.  Filled in by SetExpectedVXLANV6TunnelAddr().
+	ExpectedVXLANV6TunnelAddr string
+	// ExpectedWireguardTunnelAddr contains the IPv4 address that the infrastructure expects to
+	// get assigned to the IPv4 Wireguard tunnel.  Filled in by SetExpectedWireguardTunnelAddr().
 	ExpectedWireguardTunnelAddr string
+	// ExpectedWireguardV6TunnelAddr contains the IPv6 address that the infrastructure expects to
+	// get assigned to the IPv6 Wireguard tunnel.  Filled in by SetExpectedWireguardV6TunnelAddr().
+	ExpectedWireguardV6TunnelAddr string
 
 	// IP of the Typha that this Felix is using (if any).
 	TyphaIP string
 
-	// If sets, acts like an external IP of a node. Filled in by AddNode().
-	// XXX setup routes
+	// If set, acts like an external IP of a node. Filled in by SetExternalIP().
 	ExternalIP string
 
 	startupDelayed bool
+	restartDelayed bool
+	Workloads      []workload
+
+	TopologyOptions TopologyOptions
+}
+
+type workload interface {
+	Runs() bool
+	GetIP() string
+	GetInterfaceName() string
+	GetSpoofInterfaceName() string
 }
 
 func (f *Felix) GetFelixPID() int {
 	if f.startupDelayed {
 		log.Panic("GetFelixPID() called but startup is delayed")
+	}
+	if f.restartDelayed {
+		log.Panic("GetFelixPID() called but restart is delayed")
 	}
 	return f.GetSinglePID("calico-felix")
 }
@@ -64,6 +92,9 @@ func (f *Felix) GetFelixPID() int {
 func (f *Felix) GetFelixPIDs() []int {
 	if f.startupDelayed {
 		log.Panic("GetFelixPIDs() called but startup is delayed")
+	}
+	if f.restartDelayed {
+		log.Panic("GetFelixPIDs() called but restart is delayed")
 	}
 	return f.GetPIDs("calico-felix")
 }
@@ -95,6 +126,7 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 		"SET_CORE_PATTERN": "true",
 
 		"FELIX_LOGSEVERITYSCREEN":        options.FelixLogSeverity,
+		"FELIX_LogDebugFilenameRegex":    options.FelixDebugFilenameRegex,
 		"FELIX_PROMETHEUSMETRICSENABLED": "true",
 		"FELIX_BPFLOGLEVEL":              "debug",
 		"FELIX_USAGEREPORTINGENABLED":    "false",
@@ -104,9 +136,21 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 		"FELIX_DEBUGDISABLELOGDROPPING": "true",
 	}
 	// Collect the volumes for this container.
+	wd, err := os.Getwd()
+	Expect(err).NotTo(HaveOccurred(), "failed to get working directory")
+
+	arch := utils.GetSysArch()
+
+	fvBin := os.Getenv("FV_BINARY")
+	if fvBin == "" {
+		fvBin = fmt.Sprintf("bin/calico-felix-%s", arch)
+	}
 	volumes := map[string]string{
-		"/lib/modules": "/lib/modules",
-		"/tmp":         "/tmp",
+		path.Join(wd, "..", "bin"):        "/usr/local/bin",
+		path.Join(wd, "..", fvBin):        "/usr/local/bin/calico-felix",
+		path.Join(wd, "..", "bin", "bpf"): "/usr/lib/calico/bpf/",
+		"/lib/modules":                    "/lib/modules",
+		"/tmp":                            "/tmp",
 	}
 
 	containerName := containers.UniqueName(fmt.Sprintf("felix-%d", id))
@@ -185,12 +229,16 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 		"-P", "FORWARD", "DROP")
 
 	return &Felix{
-		Container:      c,
-		startupDelayed: options.DelayFelixStart,
+		Container:       c,
+		startupDelayed:  options.DelayFelixStart,
+		TopologyOptions: options,
 	}
 }
 
 func (f *Felix) Stop() {
+	if f == nil {
+		return
+	}
 	if CreateCgroupV2 {
 		_ = f.ExecMayFail("rmdir", path.Join("/run/calico/cgroup/", f.Name))
 	}
@@ -203,18 +251,267 @@ func (f *Felix) Restart() {
 	Eventually(f.GetFelixPID, "10s", "100ms").ShouldNot(Equal(oldPID))
 }
 
+func (f *Felix) RestartWithDelayedStartup() func() {
+	if f.restartDelayed {
+		log.Panic("RestartWithDelayedStartup() called but restart was delayed already")
+	}
+	oldPID := f.GetFelixPID()
+	f.restartDelayed = true
+	f.Exec("touch", "/delay-felix-restart")
+	f.Exec("kill", "-HUP", fmt.Sprint(oldPID))
+	triggerChan := make(chan struct{})
+
+	go func() {
+		defer GinkgoRecover()
+		select {
+		case <-time.After(time.Second * 30):
+			log.Panic("Restart with delayed startup timed out after 30s")
+		case <-triggerChan:
+			return
+		}
+	}()
+
+	return func() {
+		close(triggerChan)
+		f.Exec("rm", "/delay-felix-restart")
+		f.restartDelayed = false
+		Eventually(f.GetFelixPID, "10s", "100ms").ShouldNot(Equal(oldPID))
+	}
+}
+
+func (f *Felix) SetEnv(env map[string]string) {
+	fn := "extra-env.sh"
+
+	file, err := os.OpenFile("./"+fn, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	Expect(err).NotTo(HaveOccurred())
+
+	fw := bufio.NewWriter(file)
+
+	for k, v := range env {
+		fmt.Fprintf(fw, "export %s=%v\n", k, v)
+	}
+
+	fw.Flush()
+	file.Close()
+
+	err = f.CopyFileIntoContainer("./"+fn, "/"+fn)
+	Expect(err).NotTo(HaveOccurred())
+}
+
 // AttachTCPDump returns tcpdump attached to the container
 func (f *Felix) AttachTCPDump(iface string) *tcpdump.TCPDump {
 	return tcpdump.Attach(f.Container.Name, "", iface)
 }
 
-func (f *Felix) ProgramIptablesDNAT(serviceIP, targetIP, chain string) {
-	f.Exec(
-		"iptables",
-		"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
-		"-W", "100000", // How often to probe the lock in microsecs.
-		"-t", "nat", "-A", chain,
-		"--destination", serviceIP,
-		"-j", "DNAT", "--to-destination", targetIP,
-	)
+func (f *Felix) ProgramIptablesDNAT(serviceIP, targetIP, chain string, ipv6 bool) {
+	if !ipv6 {
+		f.Exec(
+			"iptables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-t", "nat", "-A", chain,
+			"--destination", serviceIP,
+			"-j", "DNAT", "--to-destination", targetIP,
+		)
+	} else {
+		f.Exec(
+			"ip6tables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-t", "nat", "-A", chain,
+			"-d", serviceIP,
+			"-j", "DNAT", "--to-destination", targetIP,
+		)
+	}
+}
+
+type BPFIfState struct {
+	IfIndex         int
+	Workload        bool
+	V4Ready         bool
+	V6Ready         bool
+	IngressPolicyV4 int
+	EgressPolicyV4  int
+	IngressPolicyV6 int
+	EgressPolicyV6  int
+}
+
+var bpfIfStateRegexp = regexp.MustCompile(`.*([0-9]+) : \{flags: (.*) name: (.*)}`)
+
+func (f *Felix) BPFIfState(family int) map[string]BPFIfState {
+	out, err := f.ExecOutput("calico-bpf", "ifstate", "dump")
+	Expect(err).NotTo(HaveOccurred())
+
+	states := make(map[string]BPFIfState)
+
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		match := bpfIfStateRegexp.FindStringSubmatch(line)
+		if len(match) == 0 {
+			continue
+		}
+
+		name := match[3]
+		flags := match[2]
+		ifIndex, _ := strconv.Atoi(match[1])
+
+		inPolV4 := -1
+		outPolV4 := -1
+		inPolV6 := -1
+		outPolV6 := -1
+		if family == 4 {
+			r := regexp.MustCompile(`IngressPolicyV4: (\d+)`)
+			m := r.FindStringSubmatch(line)
+			inPolV4, _ = strconv.Atoi(m[1])
+			r = regexp.MustCompile(`EgressPolicyV4: (\d+)`)
+			m = r.FindStringSubmatch(line)
+			outPolV4, _ = strconv.Atoi(m[1])
+		} else {
+			r := regexp.MustCompile(`IngressPolicyV6: (\d+)`)
+			m := r.FindStringSubmatch(line)
+			inPolV6, _ = strconv.Atoi(m[1])
+			r = regexp.MustCompile(`EgressPolicyV6: (\d+)`)
+			m = r.FindStringSubmatch(line)
+			outPolV6, _ = strconv.Atoi(m[1])
+		}
+
+		state := BPFIfState{
+			IfIndex:         ifIndex,
+			Workload:        strings.Contains(flags, "workload"),
+			V4Ready:         strings.Contains(flags, "v4Ready"),
+			V6Ready:         strings.Contains(flags, "v6Ready"),
+			IngressPolicyV4: inPolV4,
+			EgressPolicyV4:  outPolV4,
+			IngressPolicyV6: inPolV6,
+			EgressPolicyV6:  outPolV6,
+		}
+
+		states[name] = state
+	}
+
+	return states
+}
+
+func (f *Felix) BPFNumContiguousPolProgramsFn(iface string, ingressOrEgress string, family int) func() int {
+	return func() int {
+		cont, _ := f.BPFNumPolProgramsByName(iface, ingressOrEgress, family)
+		return cont
+	}
+}
+
+func (f *Felix) BPFNumPolProgramsByName(iface string, ingressOrEgress string, family int) (contiguous, total int) {
+	entryPointIdx := f.BPFPolEntryPointIdx(iface, ingressOrEgress, family)
+	return f.BPFNumPolProgramsByEntryPoint(entryPointIdx)
+}
+
+func (f *Felix) BPFPolEntryPointIdx(iface string, ingressOrEgress string, family int) int {
+	ifState := f.BPFIfState(family)[iface]
+	var entryPointIdx int
+	if ingressOrEgress == "ingress" {
+		entryPointIdx = ifState.IngressPolicyV4
+		if family == 6 {
+			entryPointIdx = ifState.IngressPolicyV6
+		}
+	} else {
+		entryPointIdx = ifState.EgressPolicyV4
+		if family == 6 {
+			entryPointIdx = ifState.EgressPolicyV6
+		}
+	}
+	return entryPointIdx
+}
+
+func (f *Felix) BPFNumPolProgramsTotalByEntryPointFn(entryPointIdx int) func() (total int) {
+	return func() (total int) {
+		_, total = f.BPFNumPolProgramsByEntryPoint(entryPointIdx)
+		return
+	}
+}
+
+func (f *Felix) BPFNumPolProgramsByEntryPoint(entryPointIdx int) (contiguous, total int) {
+	gapSeen := false
+	for i := 0; i < jump.MaxSubPrograms; i++ {
+		k := polprog.SubProgramJumpIdx(entryPointIdx, i, jump.TCMaxEntryPoints)
+		out, err := f.ExecOutput(
+			"bpftool", "map", "lookup",
+			"pinned", "/sys/fs/bpf/tc/globals/cali_jump3",
+			"key",
+			fmt.Sprintf("%d", k&0xff),
+			fmt.Sprintf("%d", (k>>8)&0xff),
+			fmt.Sprintf("%d", (k>>16)&0xff),
+			fmt.Sprintf("%d", (k>>24)&0xff),
+		)
+		if err != nil {
+			gapSeen = true
+		}
+		if strings.Contains(out, "value:") {
+			total++
+			if !gapSeen {
+				contiguous++
+			}
+		} else {
+			gapSeen = true
+		}
+	}
+	return
+}
+
+func (f *Felix) IPTablesChains(table string) map[string][]string {
+	out := map[string][]string{}
+	raw, err := f.ExecOutput("iptables-save", "-t", table)
+	Expect(err).NotTo(HaveOccurred())
+	lines := strings.Split(raw, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "#") {
+			// Line is a comment, ignore.
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			// A chain declaration line, for example:
+			// :cali-INPUT - [0:0]
+			chainName := strings.SplitN(line[1:], " ", 2)[0]
+			out[chainName] = []string{}
+			continue
+		}
+		if strings.HasPrefix(line, "-A") {
+			// "-A" means "append rule to chain".  For example:
+			// -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+			chainName := strings.SplitN(line[3:], " ", 2)[0]
+			out[chainName] = append(out[chainName], line)
+			continue
+		}
+	}
+	return out
+}
+
+func (f *Felix) PromMetric(name string) PrometheusMetric {
+	return PrometheusMetric{
+		f:    f,
+		Name: name,
+	}
+}
+
+type PrometheusMetric struct {
+	f    *Felix
+	Name string
+}
+
+func (p PrometheusMetric) Raw() (string, error) {
+	return metrics.GetFelixMetric(p.f.IP, p.Name)
+}
+
+func (p PrometheusMetric) Int() (int, error) {
+	raw, err := p.Raw()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(raw)
+}
+
+func (p PrometheusMetric) Float() (float64, error) {
+	raw, err := p.Raw()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(raw, 64)
 }

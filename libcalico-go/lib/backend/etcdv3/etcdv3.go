@@ -28,6 +28,8 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
+
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
@@ -82,7 +84,7 @@ func NewEtcdV3Client(config *apiconfig.EtcdConfig) (api.Client, error) {
 	// If Etcd Certificate and Key are provided inline through command line argument,
 	// then the inline values take precedence over the ones in the config file.
 	// All the three parameters, Certificate, key and CA certificate are to be provided inline for processing.
-	var tls *tls.Config
+	var tlsConfig *tls.Config
 	var err error
 
 	haveInline := config.EtcdCert != "" || config.EtcdKey != "" || config.EtcdCACert != ""
@@ -98,24 +100,31 @@ func NewEtcdV3Client(config *apiconfig.EtcdConfig) (api.Client, error) {
 			Cert:   config.EtcdCert,
 			Key:    config.EtcdKey,
 		}
-		tls, err = tlsInfo.ClientConfigInlineCertKey()
+		tlsConfig, err = tlsInfo.ClientConfigInlineCertKey()
 	} else {
 		tlsInfo := &transport.TLSInfo{
 			TrustedCAFile: config.EtcdCACertFile,
 			CertFile:      config.EtcdCertFile,
 			KeyFile:       config.EtcdKeyFile,
 		}
-		tls, err = tlsInfo.ClientConfig()
+		tlsConfig, err = tlsInfo.ClientConfig()
 	}
 
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize etcdv3 client: %+v", err)
 	}
 
+	baseTLSConfig := calicotls.NewTLSConfig()
+	tlsConfig.MaxVersion = baseTLSConfig.MaxVersion
+	tlsConfig.MinVersion = baseTLSConfig.MinVersion
+	tlsConfig.CipherSuites = baseTLSConfig.CipherSuites
+	tlsConfig.CurvePreferences = baseTLSConfig.CurvePreferences
+	tlsConfig.Renegotiation = baseTLSConfig.Renegotiation
+
 	// Build the etcdv3 config.
 	cfg := clientv3.Config{
 		Endpoints:            etcdLocation,
-		TLS:                  tls,
+		TLS:                  tlsConfig,
 		DialTimeout:          clientTimeout,
 		DialKeepAliveTime:    keepaliveTime,
 		DialKeepAliveTimeout: keepaliveTimeout,
@@ -250,7 +259,7 @@ func (c *etcdV3Client) Update(ctx context.Context, d *model.KVPair) (*model.KVPa
 	return d, nil
 }
 
-//TODO Remove once we get rid of the v1 client.  Apply should no longer be supported
+// TODO Remove once we get rid of the v1 client.  Apply should no longer be supported
 // at least in it's current guise.  Apply will need to be handled further up the stack
 // by performing a Get/Create or Update to ensure we don't lose certain read-only Metadata.
 // It's possible that we will just perform that processing in the clients (e.g. calicoctl),

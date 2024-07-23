@@ -17,10 +17,9 @@
 package libbpf
 
 import (
+	"runtime"
 	"time"
 )
-
-const MapTypeProgrArray = 3
 
 type Obj struct {
 }
@@ -36,6 +35,14 @@ func (m *Map) Name() string {
 }
 
 func (m *Map) Type() int {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) ValueSize() int {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) KeySize() int {
 	panic("LIBBPF syscall stub")
 }
 
@@ -59,11 +66,47 @@ func (m *Map) NextMap() (*Map, error) {
 	panic("LIBBPF syscall stub")
 }
 
-func (o *Obj) AttachClassifier(secName, ifName, hook string) (int, error) {
+func QueryClassifier(ifindex, handle, pref int, ingress bool) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func DetachClassifier(ifindex, handle, pref int, ingress bool) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) AttachXDP(ifName, progName string, oldFD int, mode uint) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func DetachXDP(ifName string, mode uint) error {
+	panic("LIBBPF syscall stub")
+}
+
+func GetXDPProgramID(ifName string) (int, error) {
 	panic("LIBBPF syscall stub")
 }
 
 func (o *Obj) AttachCGroup(_, _ string) (*Link, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) PinPrograms(_ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) UnpinPrograms(_ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) PinMaps(_ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (o *Obj) ProgramFD(_ string) (int, error) {
 	panic("LIBBPF syscall stub")
 }
 
@@ -88,17 +131,37 @@ func (m *Map) IsMapInternal() bool {
 }
 
 const (
-	GlobalsIPv6Enabled uint32 = 1
+	GlobalsIPv6Enabled      uint32 = 1
+	GlobalsRPFOptionEnabled uint32 = 16
+	GlobalsRPFOptionStrict  uint32 = 32
+	GlobalsNoDSRCidrs       uint32 = 12345
+	GlobalsLoUDPOnly        uint32 = 12345
 )
 
-func TcSetGlobals(_ *Map, _, _, _ uint32, _, _, _, _ uint16, _, _ uint32) error {
+func TcSetGlobals(_ *Map, globalData *TcGlobalData) error {
 	panic("LIBBPF syscall stub")
 }
 
-func CTLBSetGlobals(_ *Map, _ time.Duration) error {
+func CTLBSetGlobals(_ *Map, _ time.Duration, _ bool) error {
 	panic("LIBBPF syscall stub")
 }
 
-func (m *Map) SetMapSize(size uint32) error {
+func XDPSetGlobals(_ *Map, _ *XDPGlobalData) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) SetSize(size int) error {
+	panic("LIBBPF syscall stub")
+}
+
+func NumPossibleCPUs() (int, error) {
+	return runtime.NumCPU(), nil
+}
+
+func ObjPin(_ int, _ string) error {
+	panic("LIBBPF syscall stub")
+}
+
+func ObjGet(_ string) (int, error) {
 	panic("LIBBPF syscall stub")
 }

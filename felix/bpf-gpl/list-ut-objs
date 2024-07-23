@@ -11,10 +11,11 @@
 
 emit_filename() {
   echo "bin/test_${from_or_to}_${ep_type}_fib_${log_level}${dsr}.o"
+  echo "bin/test_${from_or_to}_${ep_type}_fib_${log_level}${dsr}_v6.o"
 }
 
 log_level=debug
-ep_types="wep hep"
+ep_types="wep hep nat"
 for ep_type in $ep_types; do
   directions="from to"
   for from_or_to in $directions; do
@@ -36,4 +37,6 @@ for ep_type in $ep_types; do
 done
 
 echo "bin/test_from_hep_fib_no_log_skb0x0.o"
+echo "bin/test_from_wep_fib_no_log.o"
 echo "bin/test_xdp_debug.o"
+echo "bin/test_xdp_debug_co-re_v6.o"

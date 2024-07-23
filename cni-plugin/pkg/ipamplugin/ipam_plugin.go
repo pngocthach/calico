@@ -29,8 +29,8 @@ import (
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	cniSpecVersion "github.com/containernetworking/cni/pkg/version"
+
 	"github.com/gofrs/flock"
-	"github.com/prometheus/common/log"
 	"github.com/sirupsen/logrus"
 
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
@@ -106,7 +106,13 @@ func Main(version string) {
 		os.Exit(0)
 	}
 
-	skel.PluginMain(cmdAdd, nil, cmdDel,
+	funcs := skel.CNIFuncs{
+		Add:   cmdAdd,
+		Check: nil,
+		Del:   cmdDel,
+	}
+
+	skel.PluginMainFuncs(funcs,
 		cniSpecVersion.PluginSupports("0.1.0", "0.2.0", "0.3.0", "0.3.1", "0.4.0", "1.0.0"),
 		"Calico CNI IPAM "+version)
 }
@@ -295,7 +301,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 				}
 				_, err := calicoClient.IPAM().ReleaseIPs(ctx, v6IPs...)
 				if err != nil {
-					log.Errorf("Error releasing IPv6 addresses %+v on IPv4 address assignment failure: %s", v6IPs, err)
+					logrus.Errorf("Error releasing IPv6 addresses %+v on IPv4 address assignment failure: %s", v6IPs, err)
 				}
 			}
 		}
@@ -311,7 +317,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 				}
 				_, err := calicoClient.IPAM().ReleaseIPs(ctx, v4IPs...)
 				if err != nil {
-					log.Errorf("Error releasing IPv4 addresses %+v on IPv6 address assignment failure: %s", v4IPs, err)
+					logrus.Errorf("Error releasing IPv4 addresses %+v on IPv6 address assignment failure: %s", v4IPs, err)
 				}
 			}
 		}
@@ -349,7 +355,7 @@ type unlockFn func()
 // (for example permissions or missing directory) then it returns immediately.  Returns a function that unlocks the
 // lock again (or a no-op function if acquiring the lock failed).
 func acquireIPAMLockBestEffort(path string) unlockFn {
-	log.Info("About to acquire host-wide IPAM lock.")
+	logrus.Info("About to acquire host-wide IPAM lock.")
 	if path == "" {
 		path = ipamLockPath
 	}
@@ -364,13 +370,13 @@ func acquireIPAMLockBestEffort(path string) unlockFn {
 		logrus.WithError(err).Error("Failed to grab IPAM lock, may contend for datastore updates")
 		return func() {}
 	}
-	log.Info("Acquired host-wide IPAM lock.")
+	logrus.Info("Acquired host-wide IPAM lock.")
 	return func() {
 		err := ipamLock.Unlock()
 		if err != nil {
 			logrus.WithError(err).Warn("Failed to release IPAM lock; ignoring because process is about to exit.")
 		} else {
-			log.Info("Released host-wide IPAM lock.")
+			logrus.Info("Released host-wide IPAM lock.")
 		}
 	}
 }

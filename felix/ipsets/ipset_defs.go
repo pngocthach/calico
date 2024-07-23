@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,20 +15,19 @@
 package ipsets
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
-
+	"fmt"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 
-	"fmt"
-	"strconv"
+	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
 
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 
 	"github.com/projectcalico/calico/felix/ip"
 	"github.com/projectcalico/calico/felix/labelindex"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 var (
@@ -69,6 +68,8 @@ func init() {
 
 const MaxIPSetNameLength = 31
 
+const IPSetNamePrefix = "cali"
+
 // IPSetType constants for the different kinds of IP set.
 type IPSetType string
 
@@ -76,7 +77,17 @@ const (
 	IPSetTypeHashIP     IPSetType = "hash:ip"
 	IPSetTypeHashIPPort IPSetType = "hash:ip,port"
 	IPSetTypeHashNet    IPSetType = "hash:net"
+	IPSetTypeBitmapPort IPSetType = "bitmap:port"
+	IPSetTypeHashNetNet IPSetType = "hash:net,net"
 )
+
+var AllIPSetTypes = []IPSetType{
+	IPSetTypeHashIP,
+	IPSetTypeHashIPPort,
+	IPSetTypeHashNet,
+	IPSetTypeBitmapPort,
+	IPSetTypeHashNetNet,
+}
 
 func (t IPSetType) SetType() string {
 	return string(t)
@@ -102,12 +113,33 @@ func (p V6IPPort) String() string {
 	return fmt.Sprintf("%s,%s:%d", p.IP.String(), p.Protocol.String(), p.Port)
 }
 
+type Port uint16
+
+func (p Port) String() string {
+	return fmt.Sprintf("%d", p)
+}
+
 func (t IPSetType) IsMemberIPV6(member string) bool {
 	switch t {
 	case IPSetTypeHashIP, IPSetTypeHashNet:
 		return strings.Contains(member, ":")
 	case IPSetTypeHashIPPort:
 		return strings.Contains(strings.Split(member, ",")[0], ":")
+	case IPSetTypeHashNetNet:
+		cidrs := strings.Split(member, ",")
+		if len(cidrs) != 2 {
+			log.WithField("member", member).Panic("Is not type IPSetTypeHashNetNet")
+		}
+		cidr1 := strings.Contains(cidrs[0], ":")
+		cidr2 := strings.Contains(cidrs[1], ":")
+
+		if cidr1 != cidr2 {
+			log.WithField("member", member).Panic("Each cidr has different version")
+		}
+
+		return cidr1
+	case IPSetTypeBitmapPort:
+		return strings.HasPrefix("v6,", member)
 	}
 	log.WithField("type", string(t)).Panic("Unknown IPSetType")
 	return false
@@ -115,11 +147,11 @@ func (t IPSetType) IsMemberIPV6(member string) bool {
 
 // CanonicaliseMember converts the string representation of an IP set member to a canonical
 // object of some kind.  The object is required to by hashable.
-func (t IPSetType) CanonicaliseMember(member string) ipSetMember {
+func (t IPSetType) CanonicaliseMember(member string) IPSetMember {
 	switch t {
 	case IPSetTypeHashIP:
 		// Convert the string into our ip.Addr type, which is backed by an array.
-		ipAddr := ip.FromString(member)
+		ipAddr := ip.FromIPOrCIDRString(member)
 		if ipAddr == nil {
 			// This should be prevented by validation in libcalico-go.
 			log.WithField("ip", member).Panic("Failed to parse IP")
@@ -153,6 +185,9 @@ func (t IPSetType) CanonicaliseMember(member string) ipSetMember {
 		if err != nil {
 			log.WithField("member", member).WithError(err).Panic("Bad port")
 		}
+		if port > math.MaxUint16 || port < 0 {
+			log.WithField("member", member).Panic("Bad port range (should be between 0 and 65535)")
+		}
 		// Return a dedicated struct for V4 or V6.  This slightly reduces occupancy over storing
 		// the address as an interface by storing one fewer interface headers.  That is worthwhile
 		// because we store many IP set members.
@@ -174,24 +209,53 @@ func (t IPSetType) CanonicaliseMember(member string) ipSetMember {
 		// pretty-printing, the hash:net ipset type prints IPs with no "/32" or "/128"
 		// suffix.
 		return ip.MustParseCIDROrIP(member)
+	case IPSetTypeBitmapPort:
+		// Trim the family if it exists
+		if member[0] == 'v' {
+			member = member[3:]
+		}
+		port, err := strconv.Atoi(member)
+		if err == nil && port >= 0 && port <= 0xffff {
+			return Port(port)
+		}
+	case IPSetTypeHashNetNet:
+		cidrs := strings.Split(member, ",")
+		return netNet{
+			cidr1: ip.MustParseCIDROrIP(cidrs[0]),
+			cidr2: ip.MustParseCIDROrIP(cidrs[1]),
+		}
 	}
 	log.WithField("type", string(t)).Panic("Unknown IPSetType")
 	return nil
 }
 
-type ipSetMember interface {
+type rawIPSetMember string
+
+func (r rawIPSetMember) String() string {
+	return string(r)
+}
+
+type IPSetMember interface {
 	String() string
+}
+
+type netNet struct {
+	cidr1, cidr2 ip.CIDR
+}
+
+func (nn netNet) String() string {
+	return nn.cidr1.String() + "," + nn.cidr2.String()
 }
 
 func (t IPSetType) IsValid() bool {
 	switch t {
-	case IPSetTypeHashIP, IPSetTypeHashNet, IPSetTypeHashIPPort:
+	case IPSetTypeHashIP, IPSetTypeHashNet, IPSetTypeHashIPPort, IPSetTypeHashNetNet, IPSetTypeBitmapPort:
 		return true
 	}
 	return false
 }
 
-// IPSetType constants for the names that the ipset command uses for the IP versions.
+// IPFamily constants for the names that the ipset command uses for the IP versions.
 type IPFamily string
 
 const (
@@ -218,32 +282,11 @@ func (f IPFamily) Version() int {
 
 // IPSetMetadata contains the metadata for a particular IP set, such as its name, type and size.
 type IPSetMetadata struct {
-	SetID   string
-	Type    IPSetType
-	MaxSize int
-}
-
-// ipSet holds the state for a particular IP set.
-type ipSet struct {
-	IPSetMetadata
-
-	MainIPSetName string
-
-	// members either contains the members that we've programmed or is nil, indicating that
-	// we're out of sync.
-	members set.Set /*<ipSetMember>*/
-
-	// pendingReplace is either nil to indicate that there is no pending replace or a set
-	// containing all the entries that we want to write.
-	pendingReplace set.Set /*<ipSetMember>*/
-	// pendingAdds contains members that are queued up to add to the IP set.  If pendingReplace
-	// is non-nil then pendingAdds is empty (and we add members directly to pendingReplace
-	// instead).
-	pendingAdds set.Set /*<ipSetMember>*/
-	// pendingDeletions contains members that are queued up for deletion.  If pendingReplace
-	// is non-nil then pendingDeletions is empty (and we delete members directly from
-	// pendingReplace instead).
-	pendingDeletions set.Set /*<ipSetMember>*/
+	SetID    string
+	Type     IPSetType
+	MaxSize  int
+	RangeMin int
+	RangeMax int
 }
 
 // IPVersionConfig wraps up the metadata for a particular IP version.  It can be used by
@@ -339,4 +382,12 @@ func combineAndTrunc(prefix, suffix string, maxLength int) string {
 	} else {
 		return combined
 	}
+}
+
+func StripIPSetNamePrefix(ipSetName string) string {
+	prefixLen := len(IPSetNamePrefix) + 2 // "cali40"
+	if len(ipSetName) < prefixLen {
+		return ""
+	}
+	return ipSetName[prefixLen:]
 }

@@ -17,31 +17,27 @@
 package dataplane
 
 import (
+	"context"
 	"math/bits"
 	"net"
-	"net/http"
 	"os/exec"
 	"runtime/debug"
-	"strconv"
 	"strings"
-	"time"
-
-	log "github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/clock"
-
-	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
+	coreV1 "k8s.io/api/core/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/clock"
 
 	"github.com/projectcalico/calico/felix/aws"
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
 	"github.com/projectcalico/calico/felix/config"
 	extdataplane "github.com/projectcalico/calico/felix/dataplane/external"
 	"github.com/projectcalico/calico/felix/dataplane/inactive"
@@ -117,7 +113,7 @@ func StartDataplaneDriver(configParams *config.Config,
 		markScratch0, _ = markBitsManager.NextSingleBitMark()
 		markScratch1, _ = markBitsManager.NextSingleBitMark()
 
-		if configParams.WireguardEnabled {
+		if configParams.WireguardEnabled || configParams.WireguardEnabledV6 {
 			log.Info("Wireguard enabled, allocating a mark bit")
 			markWireguard, _ = markBitsManager.NextSingleBitMark()
 			if markWireguard == 0 {
@@ -166,68 +162,49 @@ func StartDataplaneDriver(configParams *config.Config,
 		var wireguardEnabled bool
 		var wireguardTableIndex int
 		if idx, err := routeTableIndexAllocator.GrabIndex(); err == nil {
-			log.Debugf("Assigned wireguard table index: %d", idx)
+			log.Debugf("Assigned IPv4 wireguard table index: %d", idx)
 			wireguardEnabled = configParams.WireguardEnabled
 			wireguardTableIndex = idx
 		} else {
-			log.WithError(err).Warning("Unable to assign table index for wireguard")
+			log.WithError(err).Warning("Unable to assign table index for IPv4 wireguard")
 		}
 
-		// If wireguard is enabled, update the failsafe ports to include the wireguard port.
-		failsafeInboundHostPorts := configParams.FailsafeInboundHostPorts
-		failsafeOutboundHostPorts := configParams.FailsafeOutboundHostPorts
-		if configParams.WireguardEnabled {
-			found := false
-			for _, i := range failsafeInboundHostPorts {
-				if i.Port == uint16(configParams.WireguardListeningPort) && i.Protocol == "udp" {
-					log.WithFields(log.Fields{
-						"net":      i.Net,
-						"port":     i.Port,
-						"protocol": i.Protocol,
-					}).Debug("FailsafeInboundHostPorts is already configured for wireguard")
-					found = true
-					break
-				}
-			}
-			if !found {
-				failsafeInboundHostPorts = make([]config.ProtoPort, len(configParams.FailsafeInboundHostPorts)+1)
-				copy(failsafeInboundHostPorts, configParams.FailsafeInboundHostPorts)
-				log.Debug("Adding permissive FailsafeInboundHostPorts for wireguard")
-				failsafeInboundHostPorts[len(configParams.FailsafeInboundHostPorts)] = config.ProtoPort{
-					Port:     uint16(configParams.WireguardListeningPort),
-					Protocol: "udp",
-				}
+		var wireguardEnabledV6 bool
+		var wireguardTableIndexV6 int
+		if idx, err := routeTableIndexAllocator.GrabIndex(); err == nil {
+			log.Debugf("Assigned IPv6 wireguard table index: %d", idx)
+			wireguardEnabledV6 = configParams.WireguardEnabledV6
+			wireguardTableIndexV6 = idx
+		} else {
+			log.WithError(err).Warning("Unable to assign table index for IPv6 wireguard")
+		}
+
+		// Extract node labels from the hosts such they could be referenced later
+		// e.g. Topology Aware Hints.
+		felixHostname := configParams.FelixHostname
+
+		var felixNodeZone string
+		if k8sClientSet != nil {
+
+			// Code defensively here as k8sClientSet may be nil for certain FV tests e.g. OpenStack
+			felixNode, err := k8sClientSet.CoreV1().Nodes().Get(context.Background(), felixHostname, v1.GetOptions{})
+			if err != nil {
+				log.WithFields(log.Fields{
+					"FelixHostname": felixHostname,
+				}).Info("Unable to extract node labels from Felix host")
 			}
 
-			found = false
-			for _, i := range failsafeOutboundHostPorts {
-				if i.Port == uint16(configParams.WireguardListeningPort) && i.Protocol == "udp" {
-					log.WithFields(log.Fields{
-						"net":      i.Net,
-						"port":     i.Port,
-						"protocol": i.Protocol,
-					}).Debug("FailsafeOutboundHostPorts is already configured for wireguard")
-					found = true
-					break
-				}
-			}
-			if !found {
-				failsafeOutboundHostPorts = make([]config.ProtoPort, len(configParams.FailsafeOutboundHostPorts)+1)
-				copy(failsafeOutboundHostPorts, configParams.FailsafeOutboundHostPorts)
-				log.Debug("Adding permissive FailsafeOutboundHostPorts for wireguard")
-				failsafeOutboundHostPorts[len(configParams.FailsafeOutboundHostPorts)] = config.ProtoPort{
-					Port:     uint16(configParams.WireguardListeningPort),
-					Protocol: "udp",
-				}
-			}
+			felixNodeZone = felixNode.Labels[coreV1.LabelTopologyZone]
 		}
 
 		dpConfig := intdataplane.Config{
-			Hostname:           configParams.FelixHostname,
+			Hostname:           felixHostname,
+			NodeZone:           felixNodeZone,
 			FloatingIPsEnabled: strings.EqualFold(configParams.FloatingIPs, string(apiv3.FloatingIPsEnabled)),
 			IfaceMonitorConfig: ifacemonitor.Config{
 				InterfaceExcludes: configParams.InterfaceExclude,
 				ResyncInterval:    configParams.InterfaceRefreshInterval,
+				NetlinkTimeout:    configParams.NetlinkTimeoutSecs,
 			},
 			RulesConfig: rules.Config{
 				WorkloadIfacePrefixes: configParams.InterfacePrefixes(),
@@ -259,22 +236,27 @@ func StartDataplaneDriver(configParams *config.Config,
 				IptablesMarkEndpoint:        markEndpointMark,
 				IptablesMarkNonCaliEndpoint: markEndpointNonCaliEndpoint,
 
-				VXLANEnabled: configParams.Encapsulation.VXLANEnabled,
-				VXLANPort:    configParams.VXLANPort,
-				VXLANVNI:     configParams.VXLANVNI,
+				VXLANEnabled:   configParams.Encapsulation.VXLANEnabled,
+				VXLANEnabledV6: configParams.Encapsulation.VXLANEnabledV6,
+				VXLANPort:      configParams.VXLANPort,
+				VXLANVNI:       configParams.VXLANVNI,
 
 				IPIPEnabled:            configParams.Encapsulation.IPIPEnabled,
 				FelixConfigIPIPEnabled: configParams.IpInIpEnabled,
 				IPIPTunnelAddress:      configParams.IpInIpTunnelAddr,
 				VXLANTunnelAddress:     configParams.IPv4VXLANTunnelAddr,
+				VXLANTunnelAddressV6:   configParams.IPv6VXLANTunnelAddr,
 
 				AllowVXLANPacketsFromWorkloads: configParams.AllowVXLANPacketsFromWorkloads,
 				AllowIPIPPacketsFromWorkloads:  configParams.AllowIPIPPacketsFromWorkloads,
 
 				WireguardEnabled:            configParams.WireguardEnabled,
+				WireguardEnabledV6:          configParams.WireguardEnabledV6,
 				WireguardInterfaceName:      configParams.WireguardInterfaceName,
+				WireguardInterfaceNameV6:    configParams.WireguardInterfaceNameV6,
 				WireguardIptablesMark:       markWireguard,
 				WireguardListeningPort:      configParams.WireguardListeningPort,
+				WireguardListeningPortV6:    configParams.WireguardListeningPortV6,
 				WireguardEncryptHostTraffic: configParams.WireguardHostEncryptionEnabled,
 				RouteSource:                 configParams.RouteSource,
 
@@ -282,9 +264,10 @@ func StartDataplaneDriver(configParams *config.Config,
 				EndpointToHostAction:      configParams.DefaultEndpointToHostAction,
 				IptablesFilterAllowAction: configParams.IptablesFilterAllowAction,
 				IptablesMangleAllowAction: configParams.IptablesMangleAllowAction,
+				IptablesFilterDenyAction:  configParams.IptablesFilterDenyAction,
 
-				FailsafeInboundHostPorts:  failsafeInboundHostPorts,
-				FailsafeOutboundHostPorts: failsafeOutboundHostPorts,
+				FailsafeInboundHostPorts:  configParams.FailsafeInboundHostPorts,
+				FailsafeOutboundHostPorts: configParams.FailsafeOutboundHostPorts,
 
 				DisableConntrackInvalid: configParams.DisableConntrackInvalidCheck,
 
@@ -292,25 +275,34 @@ func StartDataplaneDriver(configParams *config.Config,
 				IptablesNATOutgoingInterfaceFilter: configParams.IptablesNATOutgoingInterfaceFilter,
 				NATOutgoingAddress:                 configParams.NATOutgoingAddress,
 				BPFEnabled:                         configParams.BPFEnabled,
+				BPFForceTrackPacketsFromIfaces:     configParams.BPFForceTrackPacketsFromIfaces,
 				ServiceLoopPrevention:              configParams.ServiceLoopPrevention,
 			},
 			Wireguard: wireguard.Config{
 				Enabled:             wireguardEnabled,
+				EnabledV6:           wireguardEnabledV6,
 				ListeningPort:       configParams.WireguardListeningPort,
+				ListeningPortV6:     configParams.WireguardListeningPortV6,
 				FirewallMark:        int(markWireguard),
 				RoutingRulePriority: configParams.WireguardRoutingRulePriority,
 				RoutingTableIndex:   wireguardTableIndex,
+				RoutingTableIndexV6: wireguardTableIndexV6,
 				InterfaceName:       configParams.WireguardInterfaceName,
+				InterfaceNameV6:     configParams.WireguardInterfaceNameV6,
 				MTU:                 configParams.WireguardMTU,
+				MTUV6:               configParams.WireguardMTUV6,
 				RouteSource:         configParams.RouteSource,
 				EncryptHostTraffic:  configParams.WireguardHostEncryptionEnabled,
 				PersistentKeepAlive: configParams.WireguardPersistentKeepAlive,
+				RouteSyncDisabled:   configParams.RouteSyncDisabled,
 			},
 			IPIPMTU:                        configParams.IpInIpMtu,
 			VXLANMTU:                       configParams.VXLANMTU,
+			VXLANMTUV6:                     configParams.VXLANMTUV6,
 			VXLANPort:                      configParams.VXLANPort,
 			IptablesBackend:                configParams.IptablesBackend,
 			IptablesRefreshInterval:        configParams.IptablesRefreshInterval,
+			RouteSyncDisabled:              configParams.RouteSyncDisabled,
 			RouteRefreshInterval:           configParams.RouteRefreshInterval,
 			DeviceRouteSourceAddress:       configParams.DeviceRouteSourceAddress,
 			DeviceRouteSourceAddressIPv6:   configParams.DeviceRouteSourceAddressIPv6,
@@ -324,7 +316,7 @@ func StartDataplaneDriver(configParams *config.Config,
 			IptablesLockProbeInterval:      configParams.IptablesLockProbeIntervalMillis,
 			MaxIPSetSize:                   configParams.MaxIpsetSize,
 			IPv6Enabled:                    configParams.Ipv6Support,
-			BPFIpv6Enabled:                 configParams.BpfIpv6Support,
+			BPFIpv6Enabled:                 configParams.Ipv6Support && configParams.BPFEnabled,
 			BPFHostConntrackBypass:         configParams.BPFHostConntrackBypass,
 			StatusReportingInterval:        configParams.ReportingIntervalSecs,
 			XDPRefreshInterval:             configParams.XDPRefreshInterval,
@@ -347,15 +339,22 @@ func StartDataplaneDriver(configParams *config.Config,
 			HealthAggregator:                   healthAggregator,
 			WatchdogTimeout:                    configParams.DataplaneWatchdogTimeout,
 			DebugSimulateDataplaneHangAfter:    configParams.DebugSimulateDataplaneHangAfter,
+			DebugSimulateDataplaneApplyDelay:   configParams.DebugSimulateDataplaneApplyDelay,
 			ExternalNodesCidrs:                 configParams.ExternalNodesCIDRList,
 			SidecarAccelerationEnabled:         configParams.SidecarAccelerationEnabled,
 			BPFEnabled:                         configParams.BPFEnabled,
+			BPFPolicyDebugEnabled:              configParams.BPFPolicyDebugEnabled,
 			BPFDisableUnprivileged:             configParams.BPFDisableUnprivileged,
 			BPFConnTimeLBEnabled:               configParams.BPFConnectTimeLoadBalancingEnabled,
+			BPFConnTimeLB:                      configParams.BPFConnectTimeLoadBalancing,
+			BPFHostNetworkedNAT:                configParams.BPFHostNetworkedNATWithoutCTLB,
 			BPFKubeProxyIptablesCleanupEnabled: configParams.BPFKubeProxyIptablesCleanupEnabled,
 			BPFLogLevel:                        configParams.BPFLogLevel,
+			BPFLogFilters:                      configParams.BPFLogFilters,
+			BPFCTLBLogFilter:                   configParams.BPFCTLBLogFilter,
 			BPFExtToServiceConnmark:            configParams.BPFExtToServiceConnmark,
 			BPFDataIfacePattern:                configParams.BPFDataIfacePattern,
+			BPFL3IfacePattern:                  configParams.BPFL3IfacePattern,
 			BPFCgroupV2:                        configParams.DebugBPFCgroupV2,
 			BPFMapRepin:                        configParams.DebugBPFMapRepinEnabled,
 			KubeProxyMinSyncPeriod:             configParams.BPFKubeProxyMinSyncPeriod,
@@ -366,16 +365,21 @@ func StartDataplaneDriver(configParams *config.Config,
 			BPFMapSizeNATAffinity:              configParams.BPFMapSizeNATAffinity,
 			BPFMapSizeConntrack:                configParams.BPFMapSizeConntrack,
 			BPFMapSizeIPSets:                   configParams.BPFMapSizeIPSets,
+			BPFMapSizeIfState:                  configParams.BPFMapSizeIfState,
 			BPFEnforceRPF:                      configParams.BPFEnforceRPF,
+			BPFDisableGROForIfaces:             configParams.BPFDisableGROForIfaces,
 			XDPEnabled:                         configParams.XDPEnabled,
 			XDPAllowGeneric:                    configParams.GenericXDPEnabled,
 			BPFConntrackTimeouts:               conntrack.DefaultTimeouts(), // FIXME make timeouts configurable
 			RouteTableManager:                  routeTableIndexAllocator,
 			MTUIfacePattern:                    configParams.MTUIfacePattern,
+			BPFExcludeCIDRsFromNAT:             configParams.BPFExcludeCIDRsFromNAT,
+			ServiceLoopPrevention:              configParams.ServiceLoopPrevention,
 
 			KubeClientSet: k8sClientSet,
 
 			FeatureDetectOverrides: configParams.FeatureDetectOverride,
+			FeatureGates:           configParams.FeatureGates,
 
 			RouteSource: configParams.RouteSource,
 
@@ -384,16 +388,18 @@ func StartDataplaneDriver(configParams *config.Config,
 
 		if configParams.BPFExternalServiceMode == "dsr" {
 			dpConfig.BPFNodePortDSREnabled = true
+			dpConfig.BPFDSROptoutCIDRs = configParams.BPFDSROptoutCIDRs
 		}
 
 		intDP := intdataplane.NewIntDataplaneDriver(dpConfig)
 		intDP.Start()
 
 		// Set source-destination-check on AWS EC2 instance.
-		if configParams.AWSSrcDstCheck != string(apiv3.AWSSrcDstCheckOptionDoNothing) {
+		check := apiv3.AWSSrcDstCheckOption(configParams.AWSSrcDstCheck)
+		if check != apiv3.AWSSrcDstCheckOptionDoNothing {
 			c := &clock.RealClock{}
 			updater := aws.NewEC2SrcDstCheckUpdater()
-			go aws.WaitForEC2SrcDstCheckUpdate(configParams.AWSSrcDstCheck, healthAggregator, updater, c)
+			go aws.WaitForEC2SrcDstCheckUpdate(check, healthAggregator, updater, c)
 		}
 
 		return intDP, nil
@@ -409,11 +415,7 @@ func SupportsBPF() error {
 	return bpf.SupportsBPFDataplane()
 }
 
-func ServePrometheusMetrics(configParams *config.Config) {
-	log.WithFields(log.Fields{
-		"host": configParams.PrometheusMetricsHost,
-		"port": configParams.PrometheusMetricsPort,
-	}).Info("Starting prometheus metrics endpoint")
+func ConfigurePrometheusMetrics(configParams *config.Config) {
 	if configParams.PrometheusGoMetricsEnabled && configParams.PrometheusProcessMetricsEnabled && configParams.PrometheusWireGuardMetricsEnabled {
 		log.Info("Including Golang, Process and WireGuard metrics")
 	} else {
@@ -425,17 +427,9 @@ func ServePrometheusMetrics(configParams *config.Config) {
 			log.Info("Discarding process metrics")
 			prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		}
-		if !configParams.PrometheusWireGuardMetricsEnabled || !configParams.WireguardEnabled {
+		if !configParams.PrometheusWireGuardMetricsEnabled || (!configParams.WireguardEnabled && !configParams.WireguardEnabledV6) {
 			log.Info("Discarding WireGuard metrics")
 			prometheus.Unregister(wireguard.MustNewWireguardMetrics())
 		}
-	}
-	http.Handle("/metrics", promhttp.Handler())
-	addr := net.JoinHostPort(configParams.PrometheusMetricsHost, strconv.Itoa(configParams.PrometheusMetricsPort))
-	for {
-		err := http.ListenAndServe(addr, nil)
-		log.WithError(err).Error(
-			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1 * time.Second)
 	}
 }

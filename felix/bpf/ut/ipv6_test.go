@@ -66,9 +66,12 @@ var ipTestCases = []ipv6Test{
 func TestIPv6Parsing(t *testing.T) {
 	RegisterTestingT(t)
 
+	t.Skip("ipv6 not supported")
+
 	defer resetBPFMaps()
 
 	for _, tc := range ipTestCases {
+		skbMark = 0
 		runBpfTest(t, tc.Section, tc.Rules, func(bpfrun bpfProgRunFn) {
 			err := tc.pkt.Generate()
 			Expect(err).NotTo(HaveOccurred())
@@ -83,6 +86,6 @@ func TestIPv6Parsing(t *testing.T) {
 			Expect(res.RetvalStr()).To(Equal(result), fmt.Sprintf("expected the program to return %s", result))
 			Expect(res.dataOut).To(HaveLen(len(tc.pkt.bytes)))
 			Expect(res.dataOut).To(Equal(tc.pkt.bytes))
-		})
+		}, withIPv6(), withDescription(tc.Description))
 	}
 }

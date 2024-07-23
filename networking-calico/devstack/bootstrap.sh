@@ -16,6 +16,11 @@
 
 set -ex
 
+sudo pip uninstall -y setuptools
+sudo rm -rf /usr/local/lib/python3.8/dist-packages/setuptools-*.dist-info
+sudo find / -name "*setuptools*" || true
+sudo pip list || true
+
 #------------------------------------------------------------------------------
 # IMPORTANT - Review before use!
 #
@@ -33,7 +38,7 @@ set -ex
 #
 #     If the SERVICE_HOST environment variable is already set when ./stack.sh
 #     is run, and is _different_ from the local machine's hostname, the
-#     networking-calico DevStack plugin will interpret that as a request to set
+#     Calico DevStack plugin will interpret that as a request to set
 #     up a compute-only node, that points to $SERVICE_HOST as its controller.
 #
 #     On the other hand, if SERVICE_HOST is not set, or is the _same_ as the
@@ -62,30 +67,46 @@ set -ex
 #     set to 'true', Tempest will be installed and the required initial
 #     networks created, ready for a Tempest run after the stack setup has
 #     completed.
+#
+# NC_PLUGIN_REPO
+#
+#     Repository for the Calico devstack plugin.  By default this is
+#     https://github.com/projectcalico/calico.
+#
+# NC_PLUGIN_REF
+#
+#     Git ref for the Calico devstack plugin.  By default this is master.
+#
 # ------------------------------------------------------------------------------
+
+# Handle branch name transition from "stable/yoga" to "unmaintained/yoga".  The DevStack repo
+# internally still uses "stable/yoga" for all its defaults even though all the actual branch names
+# have changed to "unmaintained/yoga".
+if [ "${DEVSTACK_BRANCH}" = unmaintained/yoga ]; then
+    export CINDER_BRANCH=unmaintained/yoga
+    export GLANCE_BRANCH=unmaintained/yoga
+    export KEYSTONE_BRANCH=unmaintained/yoga
+    export NEUTRON_BRANCH=unmaintained/yoga
+    export NOVA_BRANCH=unmaintained/yoga
+    export PLACEMENT_BRANCH=unmaintained/yoga
+    export REQUIREMENTS_BRANCH=unmaintained/yoga
+fi
+
+: ${NC_PLUGIN_REPO:=https://github.com/projectcalico/calico}
+: ${NC_PLUGIN_REF:=master}
 
 # Assume that we are starting from the home directory of a non-root
 # user that can sudo, and hence is suitable for running DevStack.  For
 # example, the 'ubuntu' user on Ubuntu.
 cd
 
-# Create a directory for Calico stuff.
-mkdir -p calico
-cd calico
+# Create a directory for DevStack bootstrap and testing.
+mkdir -p devstack-bootstrap
+cd devstack-bootstrap
 
 # Ensure that Git is installed.
 sudo apt-get update
 sudo apt-get -y install git
-
-# Prepare networking-calico tree - the following lines will check out
-# the master branch of networking-calico (if not already present).
-test -e networking-calico
-pushd networking-calico
-
-# Remember the current directory.
-ncdir=`pwd`
-ncref=`git rev-parse --abbrev-ref HEAD`
-popd
 
 # Enable IPv4 and IPv6 forwarding.
 sudo sysctl -w net.ipv4.ip_forward=1
@@ -93,14 +114,8 @@ sudo sysctl -w net.ipv6.conf.all.forwarding=1
 
 # Clone the DevStack repository (if not already present).
 test -e devstack || \
-    git clone ${DEVSTACK_REPO:-https://opendev.org/openstack/devstack}
+    git clone -b ${DEVSTACK_BRANCH:-master} ${DEVSTACK_REPO:-https://github.com/openstack/devstack} --depth=1
 cd devstack
-
-# If DEVSTACK_BRANCH has been specified, check out that branch.  (Otherwise we
-# use DevStack's master branch.)
-if [ -n "$DEVSTACK_BRANCH" ]; then
-    git checkout ${DEVSTACK_BRANCH}
-fi
 
 # Prepare DevStack config.
 cat > local.conf <<EOF
@@ -112,11 +127,23 @@ RABBIT_PASSWORD=6366743536a8216bde26
 SERVICE_PASSWORD=91eb72bcafb4ddf246ab
 SERVICE_TOKEN=c5680feca5e2c9c8f820
 
-enable_plugin networking-calico $ncdir $ncref
+enable_plugin calico $NC_PLUGIN_REPO $NC_PLUGIN_REF
 disable_service horizon
 
 LOGFILE=stack.log
 LOG_COLOR=False
+
+TEMPEST_BRANCH=29.1.0
+
+# We clone from GitHub because we commonly used to hit GnuTLS errors when git cloning OpenStack
+# repos from opendev.org (which is the default server), for example:
+#
+# Cloning into 'devstack'...
+# remote: Enumerating objects: 28788, done.
+# remote: Counting objects: 100% (28788/28788), done.
+# remote: Compressing objects: 100% (9847/9847), done.
+# error: RPC failed; curl 56 GnuTLS recv error (-9): A TLS packet with unexpected length was received.
+GIT_BASE=https://github.com
 
 EOF
 
@@ -149,11 +176,16 @@ ls -la /opt/stack
 
 # Stack!
 sudo -u stack -H -E bash -x <<'EOF'
-
-set
 cd /opt/stack/devstack
 ./stack.sh
+EOF
 
+# We use a fresh `sudo -u stack -H -E bash ...` invocation here, because with
+# OpenStack Yoga it appears there is something in the stack.sh setup that
+# closes stdin, and that means that bash doesn't read any further commands from
+# stdin after the exit of the ./stack.sh line.
+sudo -u stack -H -E bash -x <<'EOF'
+cd /opt/stack/devstack
 if ! ${TEMPEST:-false}; then
     if [ x${SERVICE_HOST:-$HOSTNAME} = x$HOSTNAME ]; then
         # We're not running Tempest tests, and we're on the controller node.
@@ -164,7 +196,7 @@ if ! ${TEMPEST:-false}; then
     fi
 else
     # Run mainline Tempest tests.
-    source ../networking-calico/devstack/devstackgaterc
+    source ../calico/devstack/devstackgaterc
     cd /opt/stack/tempest
     tox -eall -- $DEVSTACK_GATE_TEMPEST_REGEX --concurrency=$TEMPEST_CONCURRENCY
 fi

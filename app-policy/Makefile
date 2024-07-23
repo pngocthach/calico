@@ -4,12 +4,6 @@ PACKAGE_NAME = github.com/projectcalico/calico/app-policy
 
 ###############################################################################
 
-# Figure out the users UID/GID.  These are needed to run docker containers
-# as the current user and ensure that files built inside containers are
-# owned by the current user.
-LOCAL_USER_ID:=$(shell id -u)
-MY_GID:=$(shell id -g)
-
 GENERATED_FILES=proto/felixbackend.pb.go proto/healthz.pb.go
 SRC_FILES=$(shell find . -name '*.go' |grep -v vendor) $(GENERATED_FILES)
 
@@ -18,6 +12,11 @@ SRC_FILES=$(shell find . -name '*.go' |grep -v vendor) $(GENERATED_FILES)
 DIKASTES_IMAGE ?=dikastes
 BUILD_IMAGES ?= $(DIKASTES_IMAGE)
 
+LDFLAGS = -X $(PACKAGE_NAME)/buildinfo.GitVersion=$(GIT_DESCRIPTION) \
+			-X $(PACKAGE_NAME)/buildinfo.BuildDate=$(DATE) \
+			-X $(PACKAGE_NAME)/buildinfo.GitRevision=$(GIT_COMMIT) \
+			-B 0x$(BUILD_ID)
+
 ##############################################################################
 # Download and include ../lib.Makefile before anything else
 #   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
@@ -25,11 +24,18 @@ BUILD_IMAGES ?= $(DIKASTES_IMAGE)
 ##############################################################################
 include ../lib.Makefile
 
-# We need CGO to leverage Boring SSL.  However, the cross-compile doesn't support CGO yet.
-ifeq ($(ARCH), $(filter $(ARCH),amd64))
-CGO_ENABLED=1
+CONTAINER_CREATED=.image.created-$(ARCH)
+CONTAINER_FIPS_CREATED=.image.created-$(ARCH)-fips
+
+FIPS ?= false
+
+ifeq ($(FIPS),true)
+CONTAINER_MARKER=$(CONTAINER_FIPS_CREATED)
+VALIDARCHES=amd64
+BINDIR=bin/$(ARCH)-fips
 else
-CGO_ENABLED=0
+CONTAINER_MARKER=$(CONTAINER_CREATED)
+BINDIR=bin
 endif
 
 # Shortcut targets
@@ -47,13 +53,8 @@ clean:
 	# Clean .created files which indicate images / releases have been built.
 	find . -name '.*.created*' -type f -delete
 	find . -name '.*.published*' -type f -delete
-	rm -rf .go-pkg-cache report vendor bin
-	-docker rmi $(DIKASTES_IMAGE):latest-$(ARCH)
-	-docker rmi $(DIKASTES_IMAGE):$(VERSION)-$(ARCH)
-ifeq ($(ARCH),amd64)
-	-docker rmi $(DIKASTES_IMAGE):latest
-	-docker rmi $(DIKASTES_IMAGE):$(VERSION)
-endif
+	rm -rf bin report
+	-docker image rm -f $$(docker images $(DIKASTES_IMAGE) -a -q)
 
 .PHONY: clean-generated
 # Delete (checked-in) generated files. Intentionally not part of the main clean target since these files are
@@ -67,34 +68,38 @@ clean-generated:
 
 .PHONY: build-all
 ## Build the binaries for all architectures and platforms
-build-all: $(addprefix bin/dikastes-,$(VALIDARCHES))
+$(VALIDARCHES):
+	$(MAKE) build ARCH=$@
+
+build-all: $(VALIDARCHES)
 
 .PHONY: build
 ## Build the binary for the current architecture and platform
-build: bin/dikastes-$(ARCH) bin/healthz-$(ARCH)
+build: 
+	$(MAKE) $(BINDIR)/dikastes-$(ARCH) ARCH=$(ARCH)
+	$(MAKE) $(BINDIR)/healthz-$(ARCH) ARCH=$(ARCH)
 
-bin/dikastes-amd64: ARCH=amd64
-bin/dikastes-arm64: ARCH=arm64
-bin/dikastes-ppc64le: ARCH=ppc64le
-bin/dikastes-s390x: ARCH=s390x
-bin/dikastes-%: protobuf $(SRC_FILES)
-	mkdir -p bin
-	$(DOCKER_RUN_RO) \
-	  -e CGO_ENABLED=$(CGO_ENABLED) \
-	  -v $(CURDIR)/bin:/go/src/$(PACKAGE_NAME)/bin \
-	  $(CALICO_BUILD) go build $(BUILD_FLAGS) -ldflags "-X main.VERSION=$(GIT_VERSION)" -v -o bin/dikastes-$(ARCH) ./cmd/dikastes
+$(BINDIR)/dikastes-amd64: ARCH=amd64
+$(BINDIR)/dikastes-arm64: ARCH=arm64
+$(BINDIR)/dikastes-ppc64le: ARCH=ppc64le
+$(BINDIR)/dikastes-s390x: ARCH=s390x
+$(BINDIR)/dikastes-%: protobuf $(SRC_FILES)
+ifeq ($(FIPS),true)
+	$(call build_cgo_boring_binary, ./cmd/dikastes, $@)
+else
+	$(call build_binary, ./cmd/dikastes, $@)
+endif
 
-bin/healthz-amd64: ARCH=amd64
-bin/healthz-arm64: ARCH=arm64
-bin/healthz-ppc64le: ARCH=ppc64le
-bin/healthz-s390x: ARCH=s390x
-bin/healthz-%: protobuf $(SRC_FILES)
-	mkdir -p bin || true
-	-mkdir -p .go-pkg-cache $(GOMOD_CACHE) || true
-	$(DOCKER_RUN_RO) \
-	  -e CGO_ENABLED=$(CGO_ENABLED) \
-	  -v $(CURDIR)/bin:/go/src/$(PACKAGE_NAME)/bin \
-	  $(CALICO_BUILD) go build $(BUILD_FLAGS) -ldflags "-X main.VERSION=$(GIT_VERSION)" -v -o bin/healthz-$(ARCH) ./cmd/healthz
+$(BINDIR)/healthz-amd64: ARCH=amd64
+$(BINDIR)/healthz-arm64: ARCH=arm64
+$(BINDIR)/healthz-ppc64le: ARCH=ppc64le
+$(BINDIR)/healthz-s390x: ARCH=s390x
+$(BINDIR)/healthz-%: protobuf $(SRC_FILES)
+ifeq ($(FIPS),true)
+	$(call build_cgo_boring_binary, ./cmd/healthz, $@)
+else
+	$(call build_binary, ./cmd/healthz, $@)
+endif
 
 # We use gogofast for protobuf compilation.  Regular gogo is incompatible with
 # gRPC, since gRPC uses golang/protobuf for marshalling/unmarshalling in that
@@ -109,7 +114,7 @@ PROTOC_IMPORTS =  -I proto\
 protobuf: proto/felixbackend.pb.go proto/healthz.pb.go
 
 proto/felixbackend.pb.go: proto/felixbackend.proto
-	$(DOCKER_RUN) -v $(CURDIR):/src:rw --user $(LOCAL_USER_ID):$(LOCAL_USER_ID) \
+	$(DOCKER_RUN) -v $(CURDIR):/src:rw --user $(LOCAL_USER_ID):$(LOCAL_GROUP_ID) \
 		      $(PROTOC_CONTAINER) \
 		      $(PROTOC_IMPORTS) \
 		      proto/*.proto \
@@ -117,7 +122,7 @@ proto/felixbackend.pb.go: proto/felixbackend.proto
 	$(MAKE) fix
 
 proto/healthz.pb.go: proto/healthz.proto
-	$(DOCKER_RUN) -v $(CURDIR):/src:rw --user $(LOCAL_USER_ID):$(LOCAL_USER_ID) \
+	$(DOCKER_RUN) -v $(CURDIR):/src:rw --user $(LOCAL_USER_ID):$(LOCAL_GROUP_ID) \
 		      $(PROTOC_CONTAINER) \
 		      $(PROTOC_IMPORTS) \
 		      proto/*.proto \
@@ -127,19 +132,24 @@ proto/healthz.pb.go: proto/healthz.proto
 
 # Building the image
 ###############################################################################
-CONTAINER_CREATED=.dikastes.created-$(ARCH)
 .PHONY: image $(DIKASTES_IMAGE)
 image: $(DIKASTES_IMAGE)
-image-all: $(addprefix sub-image-,$(VALIDARCHES))
+image-all: $(addprefix sub-image-,$(VALIDARCHES)) sub-image-fips-amd64
 sub-image-%:
 	$(MAKE) image ARCH=$*
+sub-image-fips-%:
+	$(MAKE) image FIPS=true ARCH=$*
 
-$(DIKASTES_IMAGE): $(CONTAINER_CREATED)
-$(CONTAINER_CREATED): Dockerfile.$(ARCH) bin/dikastes-$(ARCH) bin/healthz-$(ARCH)
-	$(DOCKER_BUILD) -t $(DIKASTES_IMAGE):latest-$(ARCH) -f Dockerfile.$(ARCH) . --load
+$(DIKASTES_IMAGE): $(CONTAINER_MARKER)
+$(CONTAINER_CREATED): register Dockerfile $(BINDIR)/dikastes-$(ARCH) $(BINDIR)/healthz-$(ARCH)
+	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(DIKASTES_IMAGE):latest-$(ARCH) -f Dockerfile .
 	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
 	touch $@
 
+$(CONTAINER_FIPS_CREATED): register Dockerfile $(BINDIR)/dikastes-$(ARCH) $(BINDIR)/healthz-$(ARCH)
+	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(DIKASTES_IMAGE):latest-fips-$(ARCH) -f Dockerfile .
+	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest-fips LATEST_IMAGE_TAG=latest-fips
+	touch $@
 ###############################################################################
 # UTs
 ###############################################################################
@@ -155,11 +165,6 @@ ut: protobuf
 
 .PHONY: ci
 ci: mod-download build-all check-generated-files static-checks ut
-
-check-boring-ssl: bin/dikastes-amd64
-	$(DOCKER_RUN) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD) \
-		go tool nm bin/dikastes-amd64 > bin/tags.txt && grep '_Cfunc__goboringcrypto_' bin/tags.txt 1> /dev/null
-	-rm -f bin/tags.txt
 
 ## Check if generated files are out of date
 .PHONY: check-generated-files
@@ -184,12 +189,14 @@ cd: image-all cd-common
 # Release
 ###############################################################################
 ## Produces a clean build of release artifacts at the specified version.
-release-build: .release-$(VERSION).created 
+release-build: .release-$(VERSION).created
 .release-$(VERSION).created:
 	$(MAKE) clean image-all RELEASE=true
 	$(MAKE) retag-build-images-with-registries IMAGETAG=$(VERSION) RELEASE=true
 	# Generate the `latest` images.
 	$(MAKE) retag-build-images-with-registries IMAGETAG=latest RELEASE=true
+	$(MAKE) FIPS=true retag-build-images-with-registries IMAGETAG=$(VERSION)-fips RELEASE=true LATEST_IMAGE_TAG=latest-fips
+	$(MAKE) FIPS=true retag-build-images-with-registries IMAGETAG=latest-fips RELEASE=true LATEST_IMAGE_TAG=latest-fips
 	touch $@
 
 ## Verifies the release artifacts produces by `make release-build` are correct.
@@ -206,6 +213,7 @@ release-verify: release-prereqs
 release-publish: release-prereqs .release-$(VERSION).published
 .release-$(VERSION).published:
 	$(MAKE) push-images-to-registries push-manifests IMAGETAG=$(VERSION) RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
+	$(MAKE) FIPS=true push-images-to-registries push-manifests IMAGETAG=$(VERSION)-fips RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
 	touch $@
 
 # WARNING: Only run this target if this release is the latest stable release. Do NOT

@@ -19,8 +19,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -32,10 +33,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	calicoclient "github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	libclient "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 // TestGroupVersion is trivial.
@@ -93,7 +98,7 @@ func TestEtcdHealthCheckerSuccess(t *testing.T) {
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal("couldn't read response body", err)
 	}
@@ -122,7 +127,6 @@ func TestNoName(t *testing.T) {
 	if !t.Run("no-name", rootTestFunc()) {
 		t.Errorf("NoName test failed")
 	}
-
 }
 
 func testNoName(client calicoclient.Interface) error {
@@ -155,7 +159,6 @@ func TestNetworkPolicyClient(t *testing.T) {
 	if !t.Run(name, rootTestFunc()) {
 		t.Errorf("test-networkpolicy test failed")
 	}
-
 }
 
 func testNetworkPolicyClient(client calicoclient.Interface, name string) error {
@@ -212,8 +215,8 @@ func testNetworkPolicyClient(client calicoclient.Interface, name string) error {
 		return fmt.Errorf("Error on watch")
 	}
 	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		wg.Add(1)
 		defer wg.Done()
 		for e := range wIface.ResultChan() {
 			fmt.Println("Watch object: ", e)
@@ -248,7 +251,6 @@ func TestGlobalNetworkPolicyClient(t *testing.T) {
 	if !t.Run(name, rootTestFunc()) {
 		t.Errorf("test-globalnetworkpolicy test failed")
 	}
-
 }
 
 func testGlobalNetworkPolicyClient(client calicoclient.Interface, name string) error {
@@ -277,7 +279,7 @@ func testGlobalNetworkPolicyClient(client calicoclient.Interface, name string) e
 	if err != nil {
 		return fmt.Errorf("error listing globalNetworkPolicies (%s)", err)
 	}
-	if 1 != len(globalNetworkPolicies.Items) {
+	if len(globalNetworkPolicies.Items) != 1 {
 		return fmt.Errorf("should have exactly one policies, had %v policies", len(globalNetworkPolicies.Items))
 	}
 
@@ -342,7 +344,7 @@ func testGlobalNetworkSetClient(client calicoclient.Interface, name string) erro
 		return fmt.Errorf("didn't get the same globalNetworkSet back from the server \n%+v\n%+v", globalNetworkSet, globalNetworkSetServer)
 	}
 
-	globalNetworkSets, err = globalNetworkSetClient.List(ctx, metav1.ListOptions{})
+	_, err = globalNetworkSetClient.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("error listing globalNetworkSets (%s)", err)
 	}
@@ -409,7 +411,7 @@ func testNetworkSetClient(client calicoclient.Interface, name string) error {
 
 	updatedNetworkSet := networkSetServer
 	updatedNetworkSet.Labels = map[string]string{"foo": "bar"}
-	networkSetServer, err = networkSetClient.Update(ctx, updatedNetworkSet, metav1.UpdateOptions{})
+	_, err = networkSetClient.Update(ctx, updatedNetworkSet, metav1.UpdateOptions{})
 	if nil != err {
 		return fmt.Errorf("error updating the networkSet '%v' (%v)", networkSet, err)
 	}
@@ -419,7 +421,7 @@ func testNetworkSetClient(client calicoclient.Interface, name string) error {
 	if err != nil {
 		return fmt.Errorf("error listing networkSets (%s)", err)
 	}
-	if 1 != len(networkSets.Items) {
+	if len(networkSets.Items) != 1 {
 		return fmt.Errorf("should have exactly one networkSet, had %v networkSets", len(networkSets.Items))
 	}
 
@@ -439,8 +441,8 @@ func testNetworkSetClient(client calicoclient.Interface, name string) error {
 		return fmt.Errorf("Error on watch")
 	}
 	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		wg.Add(1)
 		defer wg.Done()
 		for e := range wIface.ResultChan() {
 			fmt.Println("Watch object: ", e)
@@ -464,7 +466,9 @@ func TestHostEndpointClient(t *testing.T) {
 		return &v3.HostEndpoint{}
 	})
 	defer shutdownServer()
-	defer deleteHostEndpointClient(client, name)
+	defer func() {
+		_ = deleteHostEndpointClient(client, name)
+	}()
 	rootTestFunc := func() func(t *testing.T) {
 		return func(t *testing.T) {
 			if err := testHostEndpointClient(client, name); err != nil {
@@ -558,11 +562,10 @@ func testHostEndpointClient(client calicoclient.Interface, name string) error {
 			case e := <-w.ResultChan():
 				events = append(events, e)
 			case <-timeout:
-				timeoutErr = fmt.Errorf("timed out wating for events")
+				timeoutErr = fmt.Errorf("timed out waiting for events")
 				return
 			}
 		}
-		return
 	}()
 
 	// Create two HostEndpoints
@@ -632,7 +635,7 @@ func testIPPoolClient(client calicoclient.Interface, name string) error {
 		return fmt.Errorf("didn't get the same ippool back from the server \n%+v\n%+v", ippool, ippoolServer)
 	}
 
-	ippools, err = ippoolClient.List(ctx, metav1.ListOptions{})
+	_, err = ippoolClient.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("error listing ippools (%s)", err)
 	}
@@ -701,7 +704,7 @@ func testIPReservationClient(client calicoclient.Interface, name string) error {
 		return fmt.Errorf("didn't get the same ipreservation back from the server \n%+v\n%+v", ipreservation, ipreservationServer)
 	}
 
-	ipreservations, err = ipreservationClient.List(ctx, metav1.ListOptions{})
+	_, err = ipreservationClient.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("error listing ipreservations (%s)", err)
 	}
@@ -771,7 +774,7 @@ func testBGPConfigurationClient(client calicoclient.Interface, name string) erro
 		return fmt.Errorf("didn't get the same bgpConfig back from server\n%+v\n%+v", bgpConfig, bgpRes)
 	}
 
-	bgpRes, err = bgpConfigClient.Get(ctx, resName, metav1.GetOptions{})
+	_, err = bgpConfigClient.Get(ctx, resName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting bgpConfiguration %s (%s)", resName, err)
 	}
@@ -834,7 +837,7 @@ func testBGPPeerClient(client calicoclient.Interface, name string) error {
 		return fmt.Errorf("didn't get the same bgpPeer back from server\n%+v\n%+v", bgpPeer, bgpRes)
 	}
 
-	bgpRes, err = bgpPeerClient.Get(ctx, resName, metav1.GetOptions{})
+	_, err = bgpPeerClient.Get(ctx, resName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting bgpPeer %s (%s)", resName, err)
 	}
@@ -965,7 +968,7 @@ func testFelixConfigurationClient(client calicoclient.Interface, name string) er
 		return fmt.Errorf("didn't get the same felixConfig back from the server \n%+v\n%+v", felixConfig, felixConfigServer)
 	}
 
-	felixConfigs, err = felixConfigClient.List(ctx, metav1.ListOptions{})
+	_, err = felixConfigClient.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("error listing felixConfigs (%s)", err)
 	}
@@ -1115,15 +1118,14 @@ func testKubeControllersConfigurationClient(client calicoclient.Interface) error
 			case e := <-w.ResultChan():
 				events = append(events, e)
 			case <-timeout:
-				timeoutErr = fmt.Errorf("timed out wating for events")
+				timeoutErr = fmt.Errorf("timed out waiting for events")
 				return
 			}
 		}
-		return
 	}()
 
 	// Create, then delete KubeControllersConfigurations
-	kubeControllersConfigServer, err = kubeControllersConfigClient.Create(ctx, kubeControllersConfig, metav1.CreateOptions{})
+	_, err = kubeControllersConfigClient.Create(ctx, kubeControllersConfig, metav1.CreateOptions{})
 	if nil != err {
 		return fmt.Errorf("error creating the kubeControllersConfig '%v' (%v)", kubeControllersConfig, err)
 	}
@@ -1254,13 +1256,415 @@ func testCalicoNodeStatusClient(client calicoclient.Interface, name string) erro
 		return fmt.Errorf("didn't get the same object back from the server \n%+v\n%+v", caliconodestatus, caliconodestatusNew)
 	}
 
-	caliconodestatusNew, err = caliconodestatusClient.Get(ctx, name, metav1.GetOptions{})
+	_, err = caliconodestatusClient.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting object %s (%s)", name, err)
 	}
 
 	err = caliconodestatusClient.Delete(ctx, name, metav1.DeleteOptions{})
 	if nil != err {
+		return fmt.Errorf("object should be deleted (%s)", err)
+	}
+
+	return nil
+}
+
+// TestIPAMConfigClient exercises the IPAMConfig client.
+func TestIPAMConfigClient(t *testing.T) {
+	const name = "test-ipamconfig"
+	rootTestFunc := func() func(t *testing.T) {
+		return func(t *testing.T) {
+			client, shutdownServer := getFreshApiserverAndClient(t, func() runtime.Object {
+				return &v3.IPAMConfiguration{}
+			})
+			defer shutdownServer()
+			if err := testIPAMConfigClient(client, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if !t.Run(name, rootTestFunc()) {
+		t.Errorf("test-ipamconfig test failed")
+	}
+}
+
+func testIPAMConfigClient(client calicoclient.Interface, name string) error {
+	ipamConfigClient := client.ProjectcalicoV3().IPAMConfigurations()
+	ipamConfig := &v3.IPAMConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+
+		Spec: v3.IPAMConfigurationSpec{
+			StrictAffinity:   true,
+			MaxBlocksPerHost: 28,
+		},
+	}
+	ctx := context.Background()
+
+	_, err := ipamConfigClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing IPAMConfigurations: %s", err)
+	}
+
+	_, err = ipamConfigClient.Create(ctx, ipamConfig, metav1.CreateOptions{})
+	if err == nil {
+		return fmt.Errorf("should not be able to create ipam config %s ", ipamConfig.Name)
+	}
+
+	ipamConfig.Name = "default"
+	ipamConfigNew, err := ipamConfigClient.Create(ctx, ipamConfig, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("error creating the object '%v' (%v)", ipamConfig, err)
+	}
+
+	if ipamConfigNew.Name != ipamConfig.Name {
+		return fmt.Errorf("didn't get the same object back from the server \n%+v\n%+v", ipamConfig, ipamConfigNew)
+	}
+
+	if ipamConfigNew.Spec.StrictAffinity != true || ipamConfig.Spec.MaxBlocksPerHost != 28 {
+		return fmt.Errorf("didn't get the correct object back from the server \n%+v\n%+v", ipamConfig, ipamConfigNew)
+	}
+
+	ipamConfigNew, err = ipamConfigClient.Get(ctx, ipamConfig.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("error getting object %s (%s)", ipamConfig.Name, err)
+	}
+
+	ipamConfigNew.Spec.StrictAffinity = false
+	ipamConfigNew.Spec.MaxBlocksPerHost = 0
+
+	_, err = ipamConfigClient.Update(ctx, ipamConfigNew, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("error updating object %s (%s)", name, err)
+	}
+
+	ipamConfigUpdated, err := ipamConfigClient.Get(ctx, ipamConfig.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("error getting object %s (%s)", ipamConfig.Name, err)
+	}
+
+	if ipamConfigUpdated.Spec.StrictAffinity != false || ipamConfigUpdated.Spec.MaxBlocksPerHost != 0 {
+		return fmt.Errorf("didn't get the correct object back from the server \n%+v\n%+v", ipamConfigUpdated, ipamConfigNew)
+	}
+
+	err = ipamConfigClient.Delete(ctx, ipamConfig.Name, metav1.DeleteOptions{})
+	if err != nil {
+		return fmt.Errorf("object should be deleted (%s)", err)
+	}
+
+	return nil
+}
+
+// TestBlockAffinityClient exercises the BlockAffinity client.
+func TestBlockAffinityClient(t *testing.T) {
+	const name = "test-blockaffinity"
+	rootTestFunc := func() func(t *testing.T) {
+		return func(t *testing.T) {
+			client, shutdownServer := getFreshApiserverAndClient(t, func() runtime.Object {
+				return &v3.BlockAffinity{}
+			})
+			defer shutdownServer()
+			if err := testBlockAffinityClient(client, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if !t.Run(name, rootTestFunc()) {
+		t.Errorf("test-blockaffinity test failed")
+	}
+}
+
+func testBlockAffinityClient(client calicoclient.Interface, name string) error {
+	blockAffinityClient := client.ProjectcalicoV3().BlockAffinities()
+	blockAffinity := &v3.BlockAffinity{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+
+		Spec: v3.BlockAffinitySpec{
+			CIDR:  "10.0.0.0/24",
+			Node:  "node1",
+			State: "pending",
+		},
+	}
+	libV3BlockAffinity := &libapiv3.BlockAffinity{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+
+		Spec: libapiv3.BlockAffinitySpec{
+			CIDR:    "10.0.0.0/24",
+			Node:    "node1",
+			State:   "pending",
+			Deleted: "false",
+		},
+	}
+	ctx := context.Background()
+
+	// Calico libv3 client instantiation in order to get around the API create restrictions
+	// TODO: Currently these tests only run on a Kubernetes datastore since profile creation
+	// does not work in etcd. Figure out how to divide this configuration to etcd once that
+	// is fixed.
+	config := apiconfig.NewCalicoAPIConfig()
+	config.Spec = apiconfig.CalicoAPIConfigSpec{
+		DatastoreType: apiconfig.Kubernetes,
+		EtcdConfig: apiconfig.EtcdConfig{
+			EtcdEndpoints: "http://localhost:2379",
+		},
+		KubeConfig: apiconfig.KubeConfig{
+			Kubeconfig: os.Getenv("KUBECONFIG"),
+		},
+	}
+	apiClient, err := libclient.New(*config)
+	if err != nil {
+		return fmt.Errorf("unable to create Calico lib v3 client: %s", err)
+	}
+
+	_, err = blockAffinityClient.Create(ctx, blockAffinity, metav1.CreateOptions{})
+	if err == nil {
+		return fmt.Errorf("should not be able to create block affinity %s ", blockAffinity.Name)
+	}
+
+	// Create the block affinity using the libv3 client.
+	_, err = apiClient.BlockAffinities().Create(ctx, libV3BlockAffinity, options.SetOptions{})
+	if err != nil {
+		return fmt.Errorf("error creating the object through the Calico v3 API '%v' (%v)", libV3BlockAffinity, err)
+	}
+
+	blockAffinityNew, err := blockAffinityClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("error getting object %s (%s)", name, err)
+	}
+
+	blockAffinityList, err := blockAffinityClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing BlockAffinity (%s)", err)
+	}
+	if blockAffinityList.Items == nil {
+		return fmt.Errorf("items field should not be set to nil")
+	}
+
+	blockAffinityNew.Spec.State = "confirmed"
+
+	_, err = blockAffinityClient.Update(ctx, blockAffinityNew, metav1.UpdateOptions{})
+	if err == nil {
+		return fmt.Errorf("should not be able to update block affinity %s", blockAffinityNew.Name)
+	}
+
+	err = blockAffinityClient.Delete(ctx, name, metav1.DeleteOptions{})
+	if nil == err {
+		return fmt.Errorf("should not be able to delete block affinity %s", blockAffinity.Name)
+	}
+
+	// Test watch
+	w, err := blockAffinityClient.Watch(ctx, v1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error watching block affinities (%s)", err)
+	}
+
+	_, err = apiClient.BlockAffinities().Delete(ctx, name, options.DeleteOptions{ResourceVersion: blockAffinityNew.ResourceVersion})
+	if err != nil {
+		return fmt.Errorf("error deleting the object through the Calico v3 API '%v' (%v)", name, err)
+	}
+
+	// Verify watch
+	var events []watch.Event
+	timeout := time.After(500 * time.Millisecond)
+	var timeoutErr error
+	// watch for 2 events
+	for i := 0; i < 2; i++ {
+		select {
+		case e := <-w.ResultChan():
+			events = append(events, e)
+		case <-timeout:
+			timeoutErr = fmt.Errorf("timed out waiting for events")
+			break
+		}
+	}
+	if timeoutErr != nil {
+		return timeoutErr
+	}
+	if len(events) != 2 {
+		return fmt.Errorf("expected 2 watch events got %d", len(events))
+	}
+
+	return nil
+}
+
+// TestBGPFilterClient exercises the BGPFilter client.
+func TestBGPFilterClient(t *testing.T) {
+	const name = "test-bgpfilter"
+	rootTestFunc := func() func(t *testing.T) {
+		return func(t *testing.T) {
+			client, shutdownServer := getFreshApiserverAndClient(t, func() runtime.Object {
+				return &v3.BGPFilter{}
+			})
+			defer shutdownServer()
+			if err := testBGPFilterClient(client, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if !t.Run(name, rootTestFunc()) {
+		t.Errorf("test-bgpfilter test failed")
+	}
+}
+
+func testBGPFilterClient(client calicoclient.Interface, name string) error {
+	bgpFilterClient := client.ProjectcalicoV3().BGPFilters()
+	r1v4 := v3.BGPFilterRuleV4{
+		CIDR:          "10.10.10.0/24",
+		MatchOperator: v3.In,
+		Source:        v3.BGPFilterSourceRemotePeers,
+		Interface:     "*.calico",
+		Action:        v3.Accept,
+	}
+	r1v6 := v3.BGPFilterRuleV6{
+		CIDR:          "dead:beef:1::/64",
+		MatchOperator: v3.Equal,
+		Source:        v3.BGPFilterSourceRemotePeers,
+		Interface:     "*.calico",
+		Action:        v3.Accept,
+	}
+	r2v4 := v3.BGPFilterRuleV4{
+		CIDR:          "10.10.10.0/24",
+		MatchOperator: v3.In,
+		Source:        v3.BGPFilterSourceRemotePeers,
+		Action:        v3.Accept,
+	}
+	r2v6 := v3.BGPFilterRuleV6{
+		CIDR:          "dead:beef:1::/64",
+		MatchOperator: v3.Equal,
+		Source:        v3.BGPFilterSourceRemotePeers,
+		Action:        v3.Accept,
+	}
+	r3v4 := v3.BGPFilterRuleV4{
+		CIDR:          "10.10.10.0/24",
+		MatchOperator: v3.In,
+		Interface:     "*.calico",
+		Action:        v3.Accept,
+	}
+	r3v6 := v3.BGPFilterRuleV6{
+		CIDR:          "dead:beef:1::/64",
+		MatchOperator: v3.Equal,
+		Interface:     "*.calico",
+		Action:        v3.Accept,
+	}
+	r4v4 := v3.BGPFilterRuleV4{
+		Source:    v3.BGPFilterSourceRemotePeers,
+		Interface: "*.calico",
+		Action:    v3.Accept,
+	}
+	r4v6 := v3.BGPFilterRuleV6{
+		Source:    v3.BGPFilterSourceRemotePeers,
+		Interface: "*.calico",
+		Action:    v3.Accept,
+	}
+	r5v4 := v3.BGPFilterRuleV4{
+		CIDR:          "10.10.10.0/24",
+		MatchOperator: v3.In,
+		Action:        v3.Accept,
+	}
+	r5v6 := v3.BGPFilterRuleV6{
+		CIDR:          "dead:beef:1::/64",
+		MatchOperator: v3.Equal,
+		Action:        v3.Accept,
+	}
+	r6v4 := v3.BGPFilterRuleV4{
+		Source: v3.BGPFilterSourceRemotePeers,
+		Action: v3.Accept,
+	}
+	r6v6 := v3.BGPFilterRuleV6{
+		Source: v3.BGPFilterSourceRemotePeers,
+		Action: v3.Accept,
+	}
+	r7v4 := v3.BGPFilterRuleV4{
+		Interface: "*.calico",
+		Action:    v3.Accept,
+	}
+	r7v6 := v3.BGPFilterRuleV6{
+		Interface: "*.calico",
+		Action:    v3.Accept,
+	}
+	r8v4 := v3.BGPFilterRuleV4{
+		Action: v3.Accept,
+	}
+	r8v6 := v3.BGPFilterRuleV6{
+		Action: v3.Accept,
+	}
+
+	// This test expect equal number of rules in each of ExportV4, ImportV4, ExportV6 and ImportV6.
+	bgpFilter := &v3.BGPFilter{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v3.BGPFilterSpec{
+			ExportV4: []v3.BGPFilterRuleV4{r1v4, r7v4, r6v4, r5v4, r2v4, r8v4},
+			ImportV4: []v3.BGPFilterRuleV4{r2v4, r3v4, r4v4, r7v4, r8v4, r1v4},
+			ExportV6: []v3.BGPFilterRuleV6{r5v6, r1v6, r6v6, r4v6, r8v6, r2v6},
+			ImportV6: []v3.BGPFilterRuleV6{r6v6, r1v6, r3v6, r7v6, r2v6, r4v6},
+		},
+	}
+	ctx := context.Background()
+
+	_, err := bgpFilterClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing BGPFilters: %s", err)
+	}
+
+	bgpFilterNew, err := bgpFilterClient.Create(ctx, bgpFilter, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("error creating the object '%v' (%v)", bgpFilter, err)
+	}
+
+	if bgpFilterNew.Name != bgpFilter.Name {
+		return fmt.Errorf("didn't get the same object back from the server \n%+v\n%+v", bgpFilter, bgpFilterNew)
+	}
+
+	size := len(bgpFilter.Spec.ExportV4)
+	if len(bgpFilterNew.Spec.ExportV4) != size || len(bgpFilterNew.Spec.ImportV4) != size ||
+		len(bgpFilterNew.Spec.ExportV6) != size || len(bgpFilterNew.Spec.ImportV6) != size {
+		return fmt.Errorf("didn't get the correct object back from the server \n%+v\n%+v", bgpFilter, bgpFilterNew)
+	}
+
+	for i := 0; i < size; i++ {
+		if bgpFilterNew.Spec.ExportV4[i] != bgpFilter.Spec.ExportV4[i] {
+			return fmt.Errorf("didn't get the correct object back from the server. Incorrect ExportV4: \n%+v\n%+v",
+				bgpFilter.Spec.ExportV4, bgpFilterNew.Spec.ExportV4)
+		}
+		if bgpFilterNew.Spec.ImportV4[i] != bgpFilter.Spec.ImportV4[i] {
+			return fmt.Errorf("didn't get the correct object back from the server. Incorrect ImportV4: \n%+v\n%+v",
+				bgpFilter.Spec.ImportV4, bgpFilterNew.Spec.ImportV4)
+		}
+		if bgpFilterNew.Spec.ExportV6[i] != bgpFilter.Spec.ExportV6[i] {
+			return fmt.Errorf("didn't get the correct object back from the server. Incorrect ExportV6: \n%+v\n%+v",
+				bgpFilter.Spec.ExportV6, bgpFilterNew.Spec.ExportV6)
+		}
+		if bgpFilterNew.Spec.ImportV6[i] != bgpFilter.Spec.ImportV6[i] {
+			return fmt.Errorf("didn't get the correct object back from the server. Incorrect ImportV6: \n%+v\n%+v",
+				bgpFilter.Spec.ImportV6, bgpFilterNew.Spec.ImportV6)
+		}
+	}
+
+	bgpFilterNew, err = bgpFilterClient.Get(ctx, bgpFilter.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("error getting object %s (%s)", bgpFilter.Name, err)
+	}
+
+	bgpFilterNew.Spec.ExportV4 = nil
+
+	_, err = bgpFilterClient.Update(ctx, bgpFilterNew, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("error updating object %s (%s)", name, err)
+	}
+
+	bgpFilterUpdated, err := bgpFilterClient.Get(ctx, bgpFilter.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("error getting object %s (%s)", bgpFilter.Name, err)
+	}
+
+	if bgpFilterUpdated.Spec.ExportV4 != nil {
+		return fmt.Errorf("didn't get the correct object back from the server \n%+v\n%+v", bgpFilterUpdated, bgpFilterNew)
+	}
+
+	err = bgpFilterClient.Delete(ctx, bgpFilter.Name, metav1.DeleteOptions{})
+	if err != nil {
 		return fmt.Errorf("object should be deleted (%s)", err)
 	}
 

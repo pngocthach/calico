@@ -46,7 +46,8 @@ GENERATED_FILES=proto/felixbackend.pb.go bpf/asm/opcode_string.go
 
 # All Felix go files.
 SRC_FILES:=$(shell find . $(foreach dir,$(NON_FELIX_DIRS) fv,-path ./$(dir) -prune -o) -type f -name '*.go' -print) $(GENERATED_FILES)
-SRC_FILES+=$(shell find bpf -name '*.h')
+# Add Felix cgo files
+SRC_FILES += $(shell find bpf/ -name '*.[ch]')
 FV_SRC_FILES:=$(shell find fv -type f -name '*.go' -print)
 EXTRA_DOCKER_ARGS+=--init -v $(CURDIR)/../pod2daemon:/go/src/github.com/projectcalico/calico/pod2daemon:rw
 
@@ -57,11 +58,11 @@ EXTRA_DOCKER_ARGS+=--init -v $(CURDIR)/../pod2daemon:/go/src/github.com/projectc
 ###############################################################################
 include ../lib.Makefile
 
+# Set the platform correctly for building docker images.
 ifeq ($(ARCH),arm64)
 # Required for eBPF support in ARM64.
 # We need to force ARM64 build image to be used in a crosscompilation run.
 CALICO_BUILD:=$(CALICO_BUILD)-$(ARCH)
-DOCKER_GO_BUILD:=$(DOCKER_RUN) $(CALICO_BUILD)
 endif
 
 FV_ETCDIMAGE?=$(ETCD_IMAGE)
@@ -90,11 +91,10 @@ FV_SLOW_SPEC_THRESH=90
 #
 # We use -B to insert a build ID note into the executable, without which, the
 # RPM build tools complain.
-LDFLAGS=-ldflags "\
-	-X $(PACKAGE_NAME)/buildinfo.GitVersion=$(GIT_DESCRIPTION) \
+LDFLAGS= -X $(PACKAGE_NAME)/buildinfo.GitVersion=$(GIT_DESCRIPTION) \
 	-X $(PACKAGE_NAME)/buildinfo.BuildDate=$(DATE) \
 	-X $(PACKAGE_NAME)/buildinfo.GitRevision=$(GIT_COMMIT) \
-	-B 0x$(BUILD_ID)"
+	-B 0x$(BUILD_ID)
 
 .PHONY: clean
 clean:
@@ -115,6 +115,7 @@ clean:
 	$(DOCKER_GO_BUILD) make -C bpf-apache clean
 	$(DOCKER_GO_BUILD) make -C bpf-gpl clean
 	$(DOCKER_GO_BUILD) make -C $(LIBBPF_CONTAINER_PATH) clean
+	rm -rf bpf-gpl/include/libbpf/src/$(ARCH)
 
 .PHONY: clean-generated
 # Delete (checked-in) generated files.  Intentionally not part of the main clean target since these files are
@@ -126,7 +127,27 @@ clean-generated:
 ###############################################################################
 # Building the binary
 ###############################################################################
-build: bin/calico-felix build-bpf bin/calico-felix.exe
+BUILD_TARGETS:=bin/calico-felix
+
+ifeq ($(ARCH),$(filter $(ARCH),amd64 arm64))
+# Currently CGO can be enabled in ARM64 and AMD64 builds.
+CGO_ENABLED=1
+CGO_LDFLAGS="-L$(LIBBPF_CONTAINER_PATH)/$(ARCH) -lbpf -lelf -lz"
+CGO_CFLAGS="-I$(LIBBPF_CONTAINER_PATH) -I$(BPFGPL_CONTAINER_PATH)"
+FV_RACE_DETECTOR_ENABLED?=true
+BUILD_TARGETS+=build-bpf
+else
+CGO_ENABLED=0
+CGO_LDFLAGS=""
+# Race detection requires CGO enabled.
+FV_RACE_DETECTOR_ENABLED?=false
+endif
+
+ifeq ($(ARCH),amd64)
+BUILD_TARGETS+=bin/calico-felix.exe
+endif
+
+build: $(BUILD_TARGETS)
 build-all: $(addprefix sub-build-,$(VALIDARCHES))
 sub-build-%:
 	$(MAKE) build ARCH=$*
@@ -135,41 +156,33 @@ bin/calico-felix: bin/calico-felix-$(ARCH)
 	ln -f bin/calico-felix-$(ARCH) bin/calico-felix
 
 libbpf: $(LIBBPF_A)
-$(LIBBPF_A): $(shell find bpf-gpl/include/libbpf -type f ! -name "*.a")
+#TODO - Need to investigate further on this optimization
+#$(LIBBPF_A): $(shell find bpf-gpl/include/libbpf -type f ! -name "*.a")
+$(LIBBPF_A):
 	mkdir -p bpf-gpl/include/libbpf/src/$(ARCH)
 	$(MAKE) register ARCH=$(ARCH)
-	$(DOCKER_GO_BUILD) sh -c "make -j 16 -C bpf-gpl/include/libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=$(ARCH)"
-
-# Currently CGO can be enabled in ARM64 and AMD64 builds.
-ifeq ($(ARCH), $(filter $(ARCH),amd64 arm64))
-CGO_ENABLED=1
-CGO_LDFLAGS="-L$(LIBBPF_CONTAINER_PATH)/$(ARCH) -lbpf -lelf -lz"
-CGO_CFLAGS="-I$(LIBBPF_CONTAINER_PATH) -I$(BPFGPL_CONTAINER_PATH)"
-FV_RACE_DETECTOR_ENABLED?=true
-else
-CGO_ENABLED=0
-CGO_LDFLAGS=""
-# Race detection requires CGO enabled.
-FV_RACE_DETECTOR_ENABLED?=false
-endif
+	$(DOCKER_RUN) $(CALICO_BUILD) sh -c "make -j 16 -C bpf-gpl/include/libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=$(ARCH)"
 
 DOCKER_GO_BUILD_CGO=$(DOCKER_RUN) $(TARGET_PLATFORM) -e CGO_ENABLED=$(CGO_ENABLED) -e CGO_LDFLAGS=$(CGO_LDFLAGS) -e CGO_CFLAGS=$(CGO_CFLAGS) $(CALICO_BUILD)
-DOCKER_GO_BUILD_CGO_WINDOWS=$(DOCKER_RUN) $(TARGET_PLATFORM) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD)
 
 bin/calico-felix-$(ARCH): $(LIBBPF_A) $(SRC_FILES)
 	@echo Building felix for $(ARCH) on $(BUILDARCH)
-	mkdir -p bin
-	if [ "$(SEMAPHORE)" != "true" -o ! -e $@ ] ; then \
-	  $(DOCKER_GO_BUILD_CGO) \
-	     sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/cmd/calico-felix"'; \
-	fi
+ifeq ($(FIPS),true)
+	$(call build_cgo_boring_binary, $(PACKAGE_NAME)/cmd/calico-felix, $@)
+else
+ifeq ($(ARCH),$(filter $(ARCH),amd64 arm64))
+	$(call build_cgo_binary, $(PACKAGE_NAME)/cmd/calico-felix, $@)
+else
+	$(call build_binary, $(PACKAGE_NAME)/cmd/calico-felix, $@)
+endif
+endif
 
-bin/calico-felix-race-$(ARCH): $(LIBBPF_A) $(SRC_FILES)
+bin/calico-felix-race-$(ARCH): $(LIBBPF_A) $(SRC_FILES) ../go.mod
 	@echo Building felix with race detector enabled for $(ARCH) on $(BUILDARCH)
 	mkdir -p bin
 	if [ "$(SEMAPHORE)" != "true" -o ! -e $@ ] ; then \
-	  $(DOCKER_GO_BUILD_CGO) \
-	     sh -c 'go build -v -race -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/cmd/calico-felix"'; \
+	  $(DOCKER_GO_BUILD_CGO) sh -c '$(GIT_CONFIG_SSH) \
+	     go build -v -race -o $@ -v -buildvcs=false -ldflags "$(LDFLAGS)" "$(PACKAGE_NAME)/cmd/calico-felix"'; \
 	fi
 
 # Generate the protobuf bindings for go. The proto/felixbackend.pb.go file is included in SRC_FILES
@@ -184,6 +197,8 @@ protobuf proto/felixbackend.pb.go: proto/felixbackend.proto
 
 # We pre-build lots of different variants of the TC programs, defer to the script.
 BPF_GPL_O_FILES:=$(addprefix bpf-gpl/,$(shell bpf-gpl/list-objs))
+BPF_GPL_O_FILES+=bpf-gpl/bin/tc_preamble.o \
+		 bpf-gpl/bin/xdp_preamble.o bpf-gpl/bin/policy_default.o
 
 # There's a one-to-one mapping from UT C files to objects and the same for the apache programs..
 BPF_GPL_UT_O_FILES:=$(BPF_GPL_UT_C_FILES:.c=.o) $(addprefix bpf-gpl/,$(shell bpf-gpl/list-ut-objs))
@@ -192,15 +207,20 @@ BPF_APACHE_O_FILES:=$(addprefix bpf-apache/bin/,$(notdir $(BPF_APACHE_C_FILES:.c
 
 ALL_BPF_PROGS=$(BPF_GPL_O_FILES) $(BPF_APACHE_O_FILES)
 
-
-# Mark the BPF programs phony so we'll always defer to their own makefile.  This is OK as long as
-# we're only depending on the BPF programs from other phony targets.  (Otherwise, we'd do
-# unnecessary rebuilds of anything that depends on the BPF prgrams.)
 .PHONY: build-bpf clean-bpf
-build-bpf:
+build-bpf: $(ALL_BPF_PROGS)
+
+# Mainly defer to the BPF Makefiles but try to guess a superset of the dependencies
+# to avoid unnecessary rebuilds. Note '&:' means "run this target once to produce
+# all target files".
+$(ALL_BPF_PROGS) &: $(shell find bpf-gpl bpf-apache -name '*.[ch]') bpf-gpl/Makefile bpf-apache/Makefile
 	$(MAKE) register ARCH=$(ARCH)
 	$(DOCKER_GO_BUILD) sh -c "make -j 16 -C bpf-apache all && \
 	                          make -j 16 -C bpf-gpl all ut-objs"
+	rm -rf bin/bpf
+	mkdir -p bin/bpf
+	touch -c $(ALL_BPF_PROGS)
+	cp $(ALL_BPF_PROGS) bin/bpf
 
 clean-bpf:
 	rm -f bpf-gpl/*.d bpf-apache/*.d
@@ -229,33 +249,23 @@ image-all: $(addprefix sub-image-,$(VALIDARCHES))
 sub-image-%:
 	$(MAKE) image ARCH=$*
 
+# Note: the felix image is really a "test environment" image.  It doesn't include Felix itself and we don't ship it.
 image: $(FELIX_IMAGE)
 $(FELIX_IMAGE): $(FELIX_IMAGE)-$(ARCH)
-$(FELIX_IMAGE)-$(ARCH): $(FV_BINARY) \
-                        bin/calico-bpf \
-			bin/pktgen \
-			bin/test-connection \
-			bin/test-workload \
-                        build-bpf \
-                        docker-image/calico-felix-wrapper \
-                        docker-image/felix.cfg \
-                        docker-image/Dockerfile* \
-                        register
-	# Reconstruct the bin and bpf directories because we don't want to accidentally add
-	# leftover files (say from a build on another branch) into the docker image.
-	rm -rf docker-image/bin
-	mkdir -p docker-image/bin
-	cp $(FV_BINARY) docker-image/bin/
-	cp bin/calico-bpf docker-image/bin/
-	cp bin/pktgen docker-image/bin/
-	cp bin/test-connection docker-image/bin/
-	cp bin/test-workload docker-image/bin/
-	rm -rf docker-image/bpf
-	mkdir -p docker-image/bpf/bin
-	# Copy only the files we're explicitly expecting (in case we have left overs after switching branch).
-	cp $(ALL_BPF_PROGS) docker-image/bpf/bin
-	$(DOCKER_BUILD) --build-arg FV_BINARY=$(FV_BINARY) -t $(FELIX_IMAGE):latest-$(ARCH) --file ./docker-image/Dockerfile.$(ARCH) docker-image --load;
+
+# Touchfile created when we make the felix image.
+FELIX_CONTAINER_CREATED=.calico_felix.created-$(ARCH)
+FELIX_IMAGE_WITH_TAG=$(FELIX_IMAGE):latest-$(ARCH)
+FELIX_IMAGE_ID=$(shell docker images -q $(FELIX_IMAGE_WITH_TAG))
+$(FELIX_IMAGE)-$(ARCH): $(FELIX_CONTAINER_CREATED)
+$(FELIX_CONTAINER_CREATED): register \
+                            docker-image/calico-felix-wrapper \
+                            docker-image/felix.cfg \
+                            docker-image/Dockerfile \
+                            $(shell test "$(FELIX_IMAGE_ID)" || echo force-rebuild)
+	$(DOCKER_BUILD) -t $(FELIX_IMAGE_WITH_TAG) -f ./docker-image/Dockerfile docker-image
 	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
+	touch $(FELIX_CONTAINER_CREATED)
 
 ###############################################################################
 # Unit Tests
@@ -266,7 +276,7 @@ UT_PACKAGES_TO_SKIP?=fv,k8sfv,bpf/ut
 .PHONY: ut
 ut combined.coverprofile: $(SRC_FILES) $(LIBBPF_A) build-bpf
 	@echo Running Go UTs.
-	$(DOCKER_GO_BUILD) ./utils/run-coverage -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
+	$(DOCKER_RUN) -e $(ACK_GINKGO) $(CALICO_BUILD) ./utils/run-coverage -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
 
 ###############################################################################
 # FV Tests
@@ -274,14 +284,28 @@ ut combined.coverprofile: $(SRC_FILES) $(LIBBPF_A) build-bpf
 fv/fv.test: $(LIBBPF_A) $(SRC_FILES) $(FV_SRC_FILES)
 	# We pre-build the FV test binaries so that we can run them
 	# outside a container and allow them to interact with docker.
-	$(DOCKER_GO_BUILD_CGO) go test $(BUILD_FLAGS) ./$(shell dirname $@) -c --tags fvtests -o $@
+	$(DOCKER_GO_BUILD_CGO) go test ./fv -c --tags fvtests -o $@
 
 REMOTE_DEPS=build-typha
 
 build-typha:
 	make -C ../typha image DEV_REGISTRIES=felix-test
 
-.PHONY: fv
+.PHONY: fv fv-prereqs fv-no-build
+
+# Build everything needed to run the FVs but don't actually run them.  The semaphore job runs
+# this target to build everything so that it can be cached and shared between downstream jobs.
+fv-prereqs: $(REMOTE_DEPS) \
+            $(FELIX_CONTAINER_CREATED) \
+            $(FV_BINARY) \
+            bin/iptables-locker \
+            bin/test-workload \
+            bin/test-connection \
+            bin/calico-bpf \
+            bin/pktgen \
+            build-bpf \
+            fv/fv.test
+
 # runs all of the fv tests
 # to run it in parallel, decide how many parallel engines you will run, and in each one call:
 #	 $(MAKE) fv FV_BATCHES_TO_RUN="<num>" FV_NUM_BATCHES=<num>
@@ -295,9 +319,14 @@ build-typha:
 #	 ...
 #	 $(MAKE) fv FV_BATCHES_TO_RUN="10" FV_NUM_BATCHES=10    # the tenth 1/10
 #	 etc.
-fv fv/latency.log fv/data-races.log: $(REMOTE_DEPS) image bin/iptables-locker bin/test-workload bin/test-connection bin/calico-bpf fv/fv.test
+fv fv/latency.log fv/data-races.log: fv-prereqs
+	$(MAKE) fv-no-prereqs
+
+# The semaphore job runs this target directly to avoid accidental rebuilds.
+fv-no-prereqs:
 	rm -f fv/data-races.log fv/latency.log
 	cd fv && \
+	  $(ACK_GINKGO) \
 	  FV_FELIXIMAGE=$(FV_FELIXIMAGE) \
 	  FV_ETCDIMAGE=$(FV_ETCDIMAGE) \
 	  FV_TYPHAIMAGE=$(FV_TYPHAIMAGE) \
@@ -309,8 +338,10 @@ fv fv/latency.log fv/data-races.log: $(REMOTE_DEPS) image bin/iptables-locker bi
 	  PRIVATE_KEY=`pwd`/private.key \
 	  GINKGO_ARGS='$(GINKGO_ARGS)' \
 	  GINKGO_FOCUS="$(GINKGO_FOCUS)" \
+	  ARCH=$(ARCH) \
 	  FELIX_FV_ENABLE_BPF="$(FELIX_FV_ENABLE_BPF)" \
 	  FV_RACE_DETECTOR_ENABLED=$(FV_RACE_DETECTOR_ENABLED) \
+	  FV_BINARY=$(FV_BINARY) \
 	  FELIX_FV_WIREGUARD_AVAILABLE=`./wireguard-available >/dev/null && echo true || echo false` \
 	  ./run-batches
 	@if [ -e fv/latency.log ]; then \
@@ -329,7 +360,7 @@ check-wireguard:
 fv/win-fv.exe: $(REMOTE_DEPS)
 	mkdir -p bin
 	$(DOCKER_GO_BUILD_CGO) sh -c '$(GIT_CONFIG_SSH) \
-		GOOS=windows CC=x86_64-w64-mingw32-gcc go test --buildmode=exe -mod=mod ./$(shell dirname $@)/winfv -c -o $@'
+		GOOS=windows go test ./fv/winfv -c -o $@'
 
 ###############################################################################
 # K8SFV Tests
@@ -356,15 +387,12 @@ K8SFV_GO_FILES:=$(shell find ./$(K8SFV_DIR) -name prometheus -prune -o -type f -
 # e.g.
 #       $(MAKE) k8sfv-test JUST_A_MINUTE=true USE_TYPHA=true
 #       $(MAKE) k8sfv-test JUST_A_MINUTE=true USE_TYPHA=false
-k8sfv-test: image k8sfv-test-existing-felix
-# Run k8sfv test with whatever is the existing 'calico/felix:latest'
-# container image.  To use some existing Felix version other than
-# 'latest', do 'FELIX_VERSION=<...> make k8sfv-test-existing-felix'.
-k8sfv-test-existing-felix: $(REMOTE_DEPS) bin/k8sfv.test
+k8sfv-test: $(REMOTE_DEPS) $(FELIX_CONTAINER_CREATED) $(FV_BINARY) bin/k8sfv.test
 	FV_ETCDIMAGE=$(FV_ETCDIMAGE) \
 	FV_TYPHAIMAGE=$(FV_TYPHAIMAGE) \
 	FV_FELIXIMAGE=$(FV_FELIXIMAGE) \
 	FV_K8SIMAGE=$(FV_K8SIMAGE) \
+	FV_BINARY=$(FV_BINARY) \
 	CERTS_PATH=$(CERTS_PATH) \
 	PRIVATE_KEY=`pwd`/fv/private.key \
 	k8sfv/run-test
@@ -372,7 +400,7 @@ k8sfv-test-existing-felix: $(REMOTE_DEPS) bin/k8sfv.test
 bin/k8sfv.test: $(K8SFV_GO_FILES)
 	@echo Building $@...
 	$(DOCKER_GO_BUILD) \
-	    sh -c 'go test -c $(BUILD_FLAGS) -o $@ ./k8sfv'
+	    sh -c 'go test -c -o $@ ./k8sfv'
 
 .PHONY: run-prometheus run-grafana stop-prometheus stop-grafana
 run-prometheus: stop-prometheus $(K8SFV_PROMETHEUS_DATA_DIR)
@@ -408,33 +436,23 @@ stop-grafana:
 
 bin/calico-bpf: $(SRC_FILES)
 	@echo Building calico-bpf...
-	mkdir -p bin
-	$(DOCKER_GO_BUILD_CGO) \
-	    sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/cmd/calico-bpf"'
+	$(call build_cgo_binary, "$(PACKAGE_NAME)/cmd/calico-bpf", $@)
 
 bin/pktgen: $(SRC_FILES) $(FV_SRC_FILES)
 	@echo Building pktgen...
-	mkdir -p bin
-	$(DOCKER_GO_BUILD) \
-	    sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/fv/pktgen"'
+	$(call build_binary, "$(PACKAGE_NAME)/fv/pktgen", $@)
 
 bin/iptables-locker: ../go.mod $(shell find iptables -type f -name '*.go' -print)
 	@echo Building iptables-locker...
-	mkdir -p bin
-	$(DOCKER_GO_BUILD) \
-	    sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/fv/iptables-locker"'
+	$(call build_binary, "$(PACKAGE_NAME)/fv/iptables-locker", $@)
 
 bin/test-workload: ../go.mod fv/cgroup/cgroup.go fv/utils/utils.go fv/connectivity/*.go fv/test-workload/*.go
 	@echo Building test-workload...
-	mkdir -p bin
-	$(DOCKER_GO_BUILD) \
-	    sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/fv/test-workload"'
+	$(call build_binary, "$(PACKAGE_NAME)/fv/test-workload", $@)
 
 bin/test-connection: ../go.mod fv/cgroup/cgroup.go fv/utils/utils.go fv/connectivity/*.go fv/test-connection/*.go
 	@echo Building test-connection...
-	mkdir -p bin
-	$(DOCKER_GO_BUILD) \
-	    sh -c 'go build -v -o $@ -v $(BUILD_FLAGS) $(LDFLAGS) "$(PACKAGE_NAME)/fv/test-connection"'
+	$(call build_binary, "$(PACKAGE_NAME)/fv/test-connection", $@)
 
 st:
 	@echo "No STs available"
@@ -465,7 +483,7 @@ cd: cd-common
 # Release
 ###############################################################################
 ## Produces a clean build of release artifacts at the specified version.
-release-build: .release-$(VERSION).created 
+release-build: .release-$(VERSION).created
 .release-$(VERSION).created:
 	$(MAKE) clean build bin/calico-bpf
 	touch $@
@@ -476,37 +494,39 @@ release-build: .release-$(VERSION).created
 .PHONY: ut-no-cover
 ut-no-cover: $(SRC_FILES)
 	@echo Running Go UTs without coverage.
-	$(DOCKER_GO_BUILD) ginkgo -r -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
+	$(DOCKER_GO_BUILD) -e $(ACK_GINKGO) ginkgo -r -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
 
 .PHONY: ut-watch
 ut-watch: $(SRC_FILES)
 	@echo Watching go UTs for changes...
-	$(DOCKER_GO_BUILD) ginkgo watch -r -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
+	$(DOCKER_GO_BUILD) -e $(ACK_GINKGO) ginkgo watch -r -skipPackage $(UT_PACKAGES_TO_SKIP) $(GINKGO_ARGS)
 
 .PHONY: bin/bpf.test
 bin/bpf.test: $(GENERATED_FILES) $(shell find bpf/ -name '*.go')
-	$(DOCKER_GO_BUILD_CGO) go test $(BUILD_FLAGS) ./bpf/ -c -o $@
+	$(DOCKER_GO_BUILD_CGO) go test ./bpf/ -c -o $@
 
 .PHONY: bin/bpf_ut.test
 bin/bpf_ut.test: $(GENERATED_FILES) $(shell find bpf/ -name '*.go')
-	$(DOCKER_GO_BUILD_CGO) go test $(BUILD_FLAGS) ./bpf/ut -c -o $@
+	$(DOCKER_GO_BUILD_CGO) go test ./bpf/ut -c -o $@
 
 # Build debug version of bpf.test for use with the delve debugger.
 .PHONY: bin/bpf_debug.test
 bin/bpf_debug.test: $(GENERATED_FILES) $(shell find bpf/ -name '*.go')
-	$(DOCKER_GO_BUILD_CGO) go test $(BUILD_FLAGS) ./bpf/ut -c -gcflags="-N -l" -o $@
+	$(DOCKER_GO_BUILD_CGO) go test ./bpf/ut -c -gcflags="-N -l" -o $@
 
 .PHONY: ut-bpf
 ut-bpf: $(LIBBPF_A) bin/bpf_ut.test bin/bpf.test build-bpf
 	$(DOCKER_RUN) \
 		--privileged \
 		-e RUN_AS_ROOT=true \
+		-e $(ACK_GINKGO) \
 		$(CALICO_BUILD) sh -c ' \
 		mount bpffs /sys/fs/bpf -t bpf && \
 		cd /go/src/$(PACKAGE_NAME)/bpf/ && \
 		BPF_FORCE_REAL_LIB=true ../bin/bpf.test -test.v -test.run "$(FOCUS)"'
 	$(DOCKER_RUN) \
 		--privileged \
+		-e $(ACK_GINKGO) \
 		-e RUN_AS_ROOT=true \
 		-v `pwd`:/code \
 		-v `pwd`/bpf-gpl/bin:/usr/lib/calico/bpf \
@@ -514,6 +534,19 @@ ut-bpf: $(LIBBPF_A) bin/bpf_ut.test bin/bpf.test build-bpf
 		mount bpffs /sys/fs/bpf -t bpf && \
 		cd /go/src/$(PACKAGE_NAME)/bpf/ut && \
 		../../bin/bpf_ut.test -test.v -test.run "$(FOCUS)"'
+
+.PHONY: bench-bpf
+bench-bpf: $(LIBBPF_A) bin/bpf_ut.test bin/bpf.test build-bpf
+	$(DOCKER_RUN) \
+		--privileged \
+		-e $(ACK_GINKGO) \
+		-e RUN_AS_ROOT=true \
+		-v `pwd`:/code \
+		-v `pwd`/bpf-gpl/bin:/usr/lib/calico/bpf \
+		$(CALICO_BUILD) sh -c ' \
+		mount bpffs /sys/fs/bpf -t bpf && \
+		cd /go/src/$(PACKAGE_NAME)/bpf/ut && \
+		../../bin/bpf_ut.test -test.v -test.bench="$(FOCUS)" -test.run "$(FOCUS)"'
 
 ## Launch a browser with Go coverage stats for the whole project.
 .PHONY: cover-browser
@@ -538,21 +571,10 @@ cover-report: combined.coverprofile
 				   column -t | \
 				   grep -v '100\.0%'"
 
-bin/calico-felix.transfer-url: bin/calico-felix
-	$(DOCKER_GO_BUILD) sh -c 'curl --upload-file bin/calico-felix https://transfer.sh/calico-felix > $@'
-
 # Cross-compile Felix for Windows
 bin/calico-felix.exe: $(SRC_FILES)
 	@echo Building felix for Windows...
-	mkdir -p bin
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
-	   	GOOS=windows go build -v -o $@ -v $(LDFLAGS) "$(PACKAGE_NAME)/cmd/calico-felix" && \
-		( ldd $@ 2>&1 | grep -q "Not a valid dynamic program\|not a dynamic executable" || \
-		( echo "Error: $@ was not statically linked"; false ) )'
-
-.PHONY: patch-script
-patch-script: bin/calico-felix.transfer-url
-	$(DOCKER_GO_BUILD) bash -c 'utils/make-patch-script.sh $$(cat bin/calico-felix.transfer-url)'
+	$(call build_windows_binary, "$(PACKAGE_NAME)/cmd/calico-felix", $@)
 
 ## Generate a diagram of Felix's internal calculation graph.
 docs/calc.pdf: docs/calc.dot

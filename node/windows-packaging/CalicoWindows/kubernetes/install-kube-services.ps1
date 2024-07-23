@@ -20,7 +20,7 @@ param
 # We require the 64-bit version of Powershell, which should live at the following path.
 $powerShellPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $baseDir = "$PSScriptRoot\.."
-$NSSMPath = "$baseDir\nssm-2.24\win64\nssm.exe"
+$NSSMPath = "$baseDir\nssm\win64\nssm.exe"
 $kubePath = "c:\k"
 
 function Install-KubeletService()
@@ -34,7 +34,7 @@ function Install-KubeletService()
     & $NSSMPath set kubelet AppParameters $baseDir\kubernetes\kubelet-service.ps1
     & $NSSMPath set kubelet AppDirectory $baseDir
     & $NSSMPath set kubelet DisplayName "kubelet service"
-    & $NSSMPath set kubelet Description "Kubenetes kubelet node agent."
+    & $NSSMPath set kubelet Description "Kubernetes kubelet node agent."
 
     # Configure it to auto-start by default.
     & $NSSMPath set kubelet Start SERVICE_AUTO_START
@@ -69,7 +69,7 @@ function Install-KubeProxyService()
     & $NSSMPath set kube-proxy AppParameters $baseDir\kubernetes\kube-proxy-service.ps1
     & $NSSMPath set kube-proxy AppDirectory $baseDir
     & $NSSMPath set kube-proxy DisplayName "kube-proxy service"
-    & $NSSMPath set kube-proxy Description "Kubenetes kube-proxy network proxy."
+    & $NSSMPath set kube-proxy Description "Kubernetes kube-proxy network proxy."
 
     # Configure it to auto-start by default.
     & $NSSMPath set kube-proxy Start SERVICE_AUTO_START
@@ -99,7 +99,6 @@ if (($service -ne "") -and ($service -notin "kubelet", "kube-proxy"))
     Exit
 }
 
-Write-Host the param is $service
 if ($service -eq "")
 {
     Install-KubeletService

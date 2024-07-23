@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ package asm
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -29,7 +31,12 @@ import (
 type OpCode uint8
 type Reg int
 
-//noinspection GoUnusedConst
+type FieldOffset struct {
+	Offset int16
+	Field  string
+}
+
+// noinspection GoUnusedConst
 const (
 	// Registers.
 
@@ -64,6 +71,7 @@ const (
 	OpClassJump64   = 0b00000_101 // 0x5 64-bit wide operands (jump target always in offset)
 	OpClassJump32   = 0b00000_110 // 0x6 32-bit wide operands (jump target always in offset)
 	OpClassALU64    = 0b00000_111 // 0x7
+	OpClassMask     = 0b00000_111
 
 	// For memory operations, the upper 3 bits are the mode.
 	MemOpModeImm  = 0b000_00_000
@@ -93,6 +101,11 @@ const (
 	ALUOpMov     = 0b1011_0_000 // 0xb
 	ALUOpAShiftR = 0b1100_0_000 // 0xc
 	ALUOpEndian  = 0b1101_0_000 // 0xd
+
+	OpEndianToBE   = 0x8
+	OpEndianToLE   = 0x0
+	OpEndianFromBE = OpEndianToBE
+	OpEndianFromLE = OpEndianToLE
 
 	// And one bit for the source.
 	ALUSrcImm = 0b0000_0_000 // 0x0
@@ -139,7 +152,7 @@ const (
 	LoadImm64Pt2 OpCode = 0
 
 	// 64-bit comparison operations.  These do a 64-bit ALU operation between
-	// two registers and then do a relative jump ot the offset in the instruction.
+	// two registers and then do a relative jump to the offset in the instruction.
 	// The offset is relative to the next instruction (due to PC auto-increment).
 	JumpEq64  OpCode = OpClassJump64 | ALUSrcReg | JumpOpEq
 	JumpGT64  OpCode = OpClassJump64 | ALUSrcReg | JumpOpGT
@@ -154,7 +167,7 @@ const (
 	JumpSLE64 OpCode = OpClassJump64 | ALUSrcReg | JumpOpSLE
 
 	// 64-bit comparison operations.  These do a 64-bit ALU operation between
-	// a register and the immediate and then do a relative jump ot the offset in
+	// a register and the immediate and then do a relative jump to the offset in
 	// the instruction. The offset is relative to the next instruction (due to
 	// PC auto-increment).
 	JumpEqImm64  OpCode = OpClassJump64 | ALUSrcImm | JumpOpEq
@@ -178,7 +191,7 @@ const (
 	Exit OpCode = OpClassJump64 | ALUSrcImm | JumpOpExit
 
 	// 32-bit comparison operations.  These do a 32-bit ALU operation between
-	// two registers and then do a relative jump ot the offset in the instruction.
+	// two registers and then do a relative jump to the offset in the instruction.
 	// The offset is relative to the next instruction (due to PC auto-increment).
 	JumpEq32  OpCode = OpClassJump32 | ALUSrcReg | JumpOpEq
 	JumpGT32  OpCode = OpClassJump32 | ALUSrcReg | JumpOpGT
@@ -193,7 +206,7 @@ const (
 	JumpSLE32 OpCode = OpClassJump32 | ALUSrcReg | JumpOpSLE
 
 	// 32-bit comparison operations.  These do a 32-bit ALU operation between
-	// a register and the immediate and then do a relative jump ot the offset in
+	// a register and the immediate and then do a relative jump to the offset in
 	// the instruction. The offset is relative to the next instruction (due to
 	// PC auto-increment).
 	JumpEqImm32  OpCode = OpClassJump32 | ALUSrcImm | JumpOpEq
@@ -242,7 +255,7 @@ const (
 	AShiftR32 OpCode = OpClassALU32 | ALUSrcReg | ALUOpAShiftR
 	Endian32  OpCode = OpClassALU32 | ALUSrcReg | ALUOpEndian
 
-	// 64-bit ALU operations between a register and immediate value.  Note: immediate is only
+	// 64-bit ALU operations between a register and immediate value. Note: immediate is only
 	// 32-bit.
 	AddImm64     OpCode = OpClassALU64 | ALUSrcImm | ALUOpAdd
 	SubImm64     OpCode = OpClassALU64 | ALUSrcImm | ALUOpSub
@@ -274,24 +287,38 @@ const (
 	EndianImm32  OpCode = OpClassALU32 | ALUSrcImm | ALUOpEndian
 )
 
-const insnSize = 8
+var (
+	SkbuffOffsetLen     = FieldOffset{0 * 4, "skb->len"}
+	SkbuffOffsetData    = FieldOffset{19 * 4, "skb->data"}
+	SkbuffOffsetDataEnd = FieldOffset{20 * 4, "skb->data_end"}
+)
 
-type Insn [insnSize]uint8
+const InstructionSize = 8
 
+// Insn represents one 8-byte instruction.
+type Insn struct {
+	Instruction [InstructionSize]uint8 `json:"inst"`
+	Labels      []string               `json:"labels,omitempty"`
+	Comments    []string               `json:"comments,omitempty"`
+	Annotation  string                 `json:"annotation,omitempty"`
+}
+
+// Insns represents a series of BPF instructions.
 type Insns []Insn
 
 func (ns Insns) AsBytes() []byte {
-	bs := make([]byte, 0, len(ns)*insnSize)
+	bs := make([]byte, 0, len(ns)*InstructionSize)
 	for _, n := range ns {
-		bs = append(bs, n[:]...)
+		bs = append(bs, n.Instruction[:]...)
 	}
 	return bs
 }
 
 func MakeInsn(opcode OpCode, dst, src Reg, offset int16, imm int32) Insn {
-	insn := [8]uint8{uint8(opcode), uint8(src<<4 | dst), 0, 0, 0, 0, 0, 0}
-	binary.LittleEndian.PutUint16(insn[2:4], uint16(offset))
-	binary.LittleEndian.PutUint32(insn[4:], uint32(imm))
+	insn := Insn{}
+	insn.Instruction = [8]uint8{uint8(opcode), uint8(src<<4 | dst), 0, 0, 0, 0, 0, 0}
+	binary.LittleEndian.PutUint16(insn.Instruction[2:4], uint16(offset))
+	binary.LittleEndian.PutUint32(insn.Instruction[4:], uint32(imm))
 	return insn
 }
 
@@ -300,154 +327,216 @@ func (n Insn) String() string {
 }
 
 func (n Insn) OpCode() OpCode {
-	return OpCode(n[0])
+	return OpCode(n.Instruction[0])
 }
 
 func (n Insn) Dst() Reg {
-	return Reg(n[1] & 0xf)
+	return Reg(n.Instruction[1] & 0xf)
 }
 
 func (n Insn) Src() Reg {
-	return Reg((n[1] >> 4) & 0xf)
+	return Reg((n.Instruction[1] >> 4) & 0xf)
 }
 
 func (n Insn) Off() int16 {
-	return int16(binary.LittleEndian.Uint16(n[2:4]))
+	return int16(binary.LittleEndian.Uint16(n.Instruction[2:4]))
 }
 
 func (n Insn) Imm() int32 {
-	return int32(binary.LittleEndian.Uint32(n[4:8]))
+	return int32(binary.LittleEndian.Uint32(n.Instruction[4:8]))
 }
 
+func (n Insn) IsNoOp() bool {
+	return n.OpCode() == Mov64 && n.Dst() == n.Src()
+}
+
+func (n Insn) OpClass() OpCode {
+	return n.OpCode() & OpClassMask
+}
+
+// Block is a "builder" object for a block of BPF instructions.  After
+// creating a new Block, call the instruction-named methods to add
+// instructions to the block and then call Assemble() to resolve the
+// bytecode.
+//
+// Block automatically skips unreachable instructions as they are added (this
+// is an optimisation to remove the need for a second pass over the code).
+// this assumes that all reachable instructions are reachable via *forward*
+// jumps.
+//
+// Block supports forwards jumps, including jumps that are longer than
+// a single eBPF jump allows.  It injects "trampoline" jump blocks where
+// needed.  Backwards jumps should also work but long backwards jumps are
+// not supported (there is no trampoline injection).
 type Block struct {
-	insns            Insns
-	fixUps           []fixUp
-	labelToInsnIdx   map[string]int
-	insnIdxToLabels  map[int][]string
-	inUseJumpTargets set.Set
+	insns              Insns
+	fixUps             map[string][]fixUp
+	labelToInsnIdx     map[string]int
+	insnIdxToLabels    map[int][]string
+	insnIdxToComments  map[int][]string
+	inUseJumpTargets   set.Set[string]
+	policyDebugEnabled bool
+	trampolinesEnabled bool
+	trampolineIdx      int
+	lastTrampolineAddr int
+	deferredErr        error
+	NumJumps           int
 }
 
-func NewBlock() *Block {
+func NewBlock(policyDebugEnabled bool) *Block {
 	return &Block{
-		labelToInsnIdx:   map[string]int{},
-		insnIdxToLabels:  map[int][]string{},
-		inUseJumpTargets: set.New(),
+		labelToInsnIdx:     map[string]int{},
+		insnIdxToLabels:    map[int][]string{},
+		inUseJumpTargets:   set.New[string](),
+		insnIdxToComments:  map[int][]string{},
+		policyDebugEnabled: policyDebugEnabled,
+		fixUps:             map[string][]fixUp{},
+		trampolinesEnabled: true,
 	}
 }
 
 type fixUp struct {
-	label       string
 	origInsnIdx int
 }
 
+func (b *Block) NoOp() {
+	b.Mov64(R0, R0)
+}
+
+func (b *Block) FromBE(dst Reg, size int32) {
+	b.add(OpClassALU32|ALUOpEndian|OpEndianFromBE, dst, 0, 0, size, "")
+}
+
 func (b *Block) And32(dst, src Reg) {
-	b.add(And32, dst, src, 0, 0)
+	b.add(And32, dst, src, 0, 0, "")
 }
 
 func (b *Block) AndImm32(dst Reg, imm int32) {
-	b.add(AndImm32, dst, 0, 0, imm)
+	b.add(AndImm32, dst, 0, 0, imm, "")
 }
 
 func (b *Block) AndImm64(dst Reg, imm int32) {
-	b.add(AndImm64, dst, 0, 0, imm)
+	b.add(AndImm64, dst, 0, 0, imm, "")
 }
 
 func (b *Block) ShiftRImm64(dst Reg, imm int32) {
-	b.add(ShiftRImm64, dst, 0, 0, imm)
+	b.add(ShiftRImm64, dst, 0, 0, imm, "")
 }
 
 // LoadImm64 loads a 64-bit immediate into a register.  Double-length instruction.
 func (b *Block) LoadImm64(dst Reg, imm int64) {
 	// LoadImm64 is the only double-length instruction.
-	b.add(LoadImm64, dst, 0, 0, int32(imm))
-	b.add(LoadImm64Pt2, 0, 0, 0, int32(imm>>32))
+	b.add(LoadImm64, dst, 0, 0, int32(imm), "")
+	b.add(LoadImm64Pt2, 0, 0, 0, int32(imm>>32), "")
 }
 
 // LoadMapFD special variant of LoadImm64 for loading map FDs.
 func (b *Block) LoadMapFD(dst Reg, fd uint32) {
 	// Have to use LoadImm64 with the special pseudo-register even though FDs are only 32 bits.
-	b.add(LoadImm64, dst, RPseudoMapFD, 0, int32(fd))
-	b.add(LoadImm64Pt2, 0, 0, 0, 0)
+	b.add(LoadImm64, dst, RPseudoMapFD, 0, int32(fd), "")
+	b.add(LoadImm64Pt2, 0, 0, 0, 0, "")
 }
 
-func (b *Block) Load8(dst Reg, ptrReg Reg, offset int16) {
-	b.add(LoadReg8, dst, ptrReg, offset, 0)
+func (b *Block) Load8(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(LoadReg8, ptrReg, dst, fo, 0)
+	b.add(LoadReg8, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Load16(dst Reg, ptrReg Reg, offset int16) {
-	b.add(LoadReg16, dst, ptrReg, offset, 0)
+func (b *Block) Load16(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(LoadReg16, ptrReg, dst, fo, 0)
+	b.add(LoadReg16, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Load32(dst Reg, ptrReg Reg, offset int16) {
-	b.add(LoadReg32, dst, ptrReg, offset, 0)
+func (b *Block) Load32(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(LoadReg32, ptrReg, dst, fo, 0)
+	b.add(LoadReg32, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Load64(dst Reg, ptrReg Reg, offset int16) {
-	b.add(LoadReg64, dst, ptrReg, offset, 0)
+func (b *Block) Load64(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(LoadReg64, ptrReg, dst, fo, 0)
+	b.add(LoadReg64, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Store8(dst Reg, ptrReg Reg, offset int16) {
-	b.add(StoreReg8, dst, ptrReg, offset, 0)
+func (b *Block) Load(dst Reg, ptrReg Reg, fo FieldOffset, size OpCode) {
+	ins := OpClassLoadReg | MemOpModeMem | size
+	annotation := b.buildAnnotation(ins, ptrReg, dst, fo, 0)
+	b.add(ins, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Store16(dst Reg, ptrReg Reg, offset int16) {
-	b.add(StoreReg16, dst, ptrReg, offset, 0)
+func (b *Block) Store8(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(StoreReg8, ptrReg, dst, fo, 0)
+	b.add(StoreReg8, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Store32(dst Reg, ptrReg Reg, offset int16) {
-	b.add(StoreReg32, dst, ptrReg, offset, 0)
+func (b *Block) Store16(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(StoreReg16, ptrReg, dst, fo, 0)
+	b.add(StoreReg16, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) Store64(dst Reg, ptrReg Reg, offset int16) {
-	b.add(StoreReg64, dst, ptrReg, offset, 0)
+func (b *Block) Store32(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(StoreReg32, ptrReg, dst, fo, 0)
+	b.add(StoreReg32, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) LoadStack8(dst Reg, offset int16) {
-	b.Load8(dst, R10, offset)
+func (b *Block) Store64(dst Reg, ptrReg Reg, fo FieldOffset) {
+	annotation := b.buildAnnotation(StoreReg64, ptrReg, dst, fo, 0)
+	b.add(StoreReg64, dst, ptrReg, fo.Offset, 0, annotation)
 }
 
-func (b *Block) LoadStack16(dst Reg, offset int16) {
-	b.Load16(dst, R10, offset)
+func (b *Block) LoadStack8(dst Reg, fo FieldOffset) {
+	b.Load8(dst, R10, fo)
 }
 
-func (b *Block) LoadStack32(dst Reg, offset int16) {
-	b.Load32(dst, R10, offset)
+func (b *Block) LoadStack16(dst Reg, fo FieldOffset) {
+	b.Load16(dst, R10, fo)
 }
 
-func (b *Block) LoadStack64(dst Reg, offset int16) {
-	b.Load64(dst, R10, offset)
+func (b *Block) LoadStack32(dst Reg, fo FieldOffset) {
+	b.Load32(dst, R10, fo)
+}
+
+func (b *Block) LoadStack64(dst Reg, fo FieldOffset) {
+	b.Load64(dst, R10, fo)
 }
 
 func (b *Block) StoreStack8(src Reg, offset int16) {
-	b.add(StoreReg8, R10, src, offset, 0)
+	b.add(StoreReg8, R10, src, offset, 0, "")
 }
 
 func (b *Block) StoreStack16(src Reg, offset int16) {
-	b.add(StoreReg16, R10, src, offset, 0)
+	b.add(StoreReg16, R10, src, offset, 0, "")
 }
 
 func (b *Block) StoreStack32(src Reg, offset int16) {
-	b.add(StoreReg32, R10, src, offset, 0)
+	b.add(StoreReg32, R10, src, offset, 0, "")
 }
 
 func (b *Block) StoreStack64(src Reg, offset int16) {
-	b.add(StoreReg64, R10, src, offset, 0)
+	b.add(StoreReg64, R10, src, offset, 0, "")
 }
 
 func (b *Block) Mov64(dst, src Reg) {
-	b.add(Mov64, dst, src, 0, 0)
+	b.add(Mov64, dst, src, 0, 0, "")
 }
 
 func (b *Block) MovImm64(dst Reg, imm int32) {
-	b.add(MovImm64, dst, 0, 0, imm)
+	b.add(MovImm64, dst, 0, 0, imm, "")
 }
 
 func (b *Block) MovImm32(dst Reg, imm int32) {
-	b.add(MovImm32, dst, 0, 0, imm)
+	b.add(MovImm32, dst, 0, 0, imm, "")
+}
+
+func (b *Block) Add64(dst, src Reg) {
+	b.add(Add64, dst, src, 0, 0, "")
 }
 
 func (b *Block) AddImm64(dst Reg, imm int32) {
-	b.add(AddImm64, dst, 0, 0, imm)
+	b.add(AddImm64, dst, 0, 0, imm, "")
+}
+
+func (b *Block) ShiftLImm64(dst Reg, imm int32) {
+	b.add(ShiftLImm64, dst, 0, 0, imm, "")
 }
 
 func (b *Block) Jump(label string) {
@@ -502,6 +591,10 @@ func (b *Block) JumpEqImm32(ra Reg, imm int32, label string) {
 	b.addWithOffsetFixup(JumpEqImm32, ra, 0, label, imm)
 }
 
+func (b *Block) JumpNEImm32(ra Reg, imm int32, label string) {
+	b.addWithOffsetFixup(JumpNEImm32, ra, 0, label, imm)
+}
+
 func (b *Block) JumpLE32(ra, rb Reg, label string) {
 	b.addWithOffsetFixup(JumpLE32, ra, rb, label, 0)
 }
@@ -519,17 +612,22 @@ func (b *Block) JumpGT32(ra, rb Reg, label string) {
 }
 
 func (b *Block) Call(helperID Helper) {
-	b.add(Call, 0, 0, 0, int32(helperID))
+	b.add(Call, 0, 0, 0, int32(helperID), b.buildAnnotation(Call, 0, 0, FieldOffset{}, int32(helperID)))
 }
 
 func (b *Block) Exit() {
-	b.add(Exit, 0, 0, 0, 0)
+	b.add(Exit, 0, 0, 0, 0, "")
 }
 
-func (b *Block) add(opcode OpCode, dst, src Reg, offset int16, imm int32) Insn {
+func (b *Block) add(opcode OpCode, dst, src Reg, offset int16, imm int32, annotation string) Insn {
 	insn := MakeInsn(opcode, dst, src, offset, imm)
+	insn.Annotation = annotation
 	b.addInsn(insn)
 	return insn
+}
+
+func (b *Block) Instr(opcode OpCode, dst, src Reg, offset int16, imm int32, annotation string) Insn {
+	return b.add(opcode, dst, src, offset, imm, annotation)
 }
 
 func (b *Block) addWithOffsetFixup(opcode OpCode, dst, src Reg, offsetLabel string, imm int32) Insn {
@@ -538,16 +636,114 @@ func (b *Block) addWithOffsetFixup(opcode OpCode, dst, src Reg, offsetLabel stri
 	return insn
 }
 
+func (b *Block) InstrWithOffsetFixup(opcode OpCode, dst, src Reg, offsetLabel string, imm int32) Insn {
+	return b.addWithOffsetFixup(opcode, dst, src, offsetLabel, imm)
+}
+
 func (b *Block) addInsn(insn Insn) {
 	b.addInsnWithOffsetFixup(insn, "")
 }
 
+func (b *Block) buildAnnotation(opcode OpCode, src, dst Reg, fo FieldOffset, imm int32) string {
+	if !b.policyDebugEnabled {
+		return ""
+	}
+	cast := ""
+	switch opcode {
+	case StoreReg8, LoadReg8, StoreImm8:
+		cast = "u8"
+	case StoreReg16, LoadReg16, StoreImm16:
+		cast = "u16"
+	case StoreReg32, LoadReg32, StoreImm32:
+		cast = "u32"
+	case StoreReg64, LoadReg64, StoreImm64, LoadImm64:
+		cast = "u64"
+	}
+
+	regStr := ""
+	switch opcode {
+	case StoreReg8, StoreReg16, StoreReg32, StoreReg64:
+		regStr = fmt.Sprintf("*(%s *) (%s + %d) /* %s */ = %s", cast, dst, fo.Offset, fo.Field, src)
+	case LoadReg8, LoadReg16, LoadReg32, LoadReg64:
+		regStr = fmt.Sprintf("%s = *(%s *)(%s + %d) /* %s */", dst, cast, src, fo.Offset, fo.Field)
+	case StoreImm8, StoreImm16, StoreImm32, StoreImm64:
+		regStr = fmt.Sprintf("*(%s *) (%s + %d) /* %s */ = %d", cast, dst, fo.Offset, fo.Field, imm)
+	case Call:
+		regStr = fmt.Sprintf("call %s", HelperString[imm])
+	}
+	return regStr
+}
+
 type OffsetFixer func(origInsn Insn) Insn
 
+// Maximum jump distance is math.MaxInt16, we need to start writing the
+// trampoline before we reach that distance so that the whole trampoline fits
+// within the jump. Since we have at most a handful of labels outstanding,
+// (1-2 for a rule, one to jump to accept/deny/end-of-tier) this seems like
+// it should be enough.
+const trampolineHeadroom = 100
+const trampolineInterval = math.MaxInt16 - trampolineHeadroom
+
 func (b *Block) addInsnWithOffsetFixup(insn Insn, targetLabel string) {
-	insnLabel := strings.Join(b.insnIdxToLabels[len(b.insns)], ",")
-	if !b.nextInsnReachble() {
-		log.Debugf("Asm: %v UU:    %v [UNREACHABLE]", insnLabel, insn)
+	b.maybeWriteTrampoline(insn)
+
+	b.addInsnWithOffsetFixupNoTrampoline(insn, targetLabel)
+}
+
+func (b *Block) maybeWriteTrampoline(nextInsn Insn) {
+	if len(b.insns)-b.lastTrampolineAddr < trampolineInterval {
+		return
+	}
+	if nextInsn.OpCode() == LoadImm64Pt2 {
+		// LoadImm64 is a 2-part instruction, we must not split it.
+		return
+	}
+	b.writeTrampoline()
+}
+
+func (b *Block) writeTrampoline() {
+	b.lastTrampolineAddr = len(b.insns)
+
+	if len(b.fixUps) == 0 {
+		return
+	}
+
+	// Find all the outstanding labels and add a jump for them.
+	labels := make([]string, 0, len(b.fixUps))
+	for label := range b.fixUps {
+		labels = append(labels, label)
+	}
+	// Sort for determinism.
+	sort.Strings(labels)
+
+	// Trampoline is written in the middle of other instructions, do an
+	// unconditional jump past the trampoline for the main execution flow.
+	// Using JumpNoTrampoline to avoid recursion here!
+	endLabel := fmt.Sprintf("skip-trampoline-%d", b.trampolineIdx)
+	b.trampolineIdx++
+	b.JumpNoTrampoline(endLabel)
+	for _, label := range labels {
+		b.LabelNextInsn(label)
+		b.JumpNoTrampoline(label)
+	}
+	b.LabelNextInsn(endLabel)
+}
+
+func (b *Block) JumpNoTrampoline(endLabel string) {
+	insn := MakeInsn(JumpA, 0, 0, 0, 0)
+	b.addInsnWithOffsetFixupNoTrampoline(insn, endLabel)
+}
+
+func (b *Block) addInsnWithOffsetFixupNoTrampoline(insn Insn, targetLabel string) {
+	var insnLabel string
+	debug := log.IsLevelEnabled(log.DebugLevel)
+	if debug {
+		insnLabel = strings.Join(b.insnIdxToLabels[len(b.insns)], ",")
+	}
+	if !b.nextInsnReachable() {
+		if debug {
+			log.Debugf("Asm: %v UU:    %v [UNREACHABLE]", insnLabel, insn)
+		}
 		for _, l := range b.insnIdxToLabels[len(b.insns)] {
 			delete(b.labelToInsnIdx, l)
 		}
@@ -558,11 +754,21 @@ func (b *Block) addInsnWithOffsetFixup(insn Insn, targetLabel string) {
 	if targetLabel != "" {
 		comment = " -> " + targetLabel
 	}
-	log.Debugf("Asm: %v %d:    %v%s", insnLabel, len(b.insns), insn, comment)
+	if debug {
+		log.Debugf("Asm: %v %d:    %v%s", insnLabel, len(b.insns), insn, comment)
+	}
 	b.insns = append(b.insns, insn)
 	if targetLabel != "" {
+		if b.policyDebugEnabled {
+			b.insns[len(b.insns)-1].Annotation = fmt.Sprintf("goto %s", targetLabel)
+		}
 		b.inUseJumpTargets.Add(targetLabel)
-		b.fixUps = append(b.fixUps, fixUp{label: targetLabel, origInsnIdx: len(b.insns) - 1})
+		b.fixUps[targetLabel] = append(b.fixUps[targetLabel], fixUp{origInsnIdx: len(b.insns) - 1})
+	}
+	if insn.OpClass() == OpClassJump64 || insn.OpClass() == OpClassJump32 {
+		// Track number of jumps written, useful for estimating how complex
+		// the verifier will think the program is.
+		b.NumJumps++
 	}
 }
 
@@ -570,39 +776,127 @@ func (b *Block) TargetIsUsed(label string) bool {
 	return b.inUseJumpTargets.Contains(label)
 }
 
+// UnresolvedJumpTargets returns a slice containing the names of all target
+// labels that have been used in a jump but don't currently have a labeled
+// instruction to jump to.
+func (b *Block) UnresolvedJumpTargets() []string {
+	var out []string
+	for t := range b.fixUps {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (b *Block) Assemble() (Insns, error) {
-	for _, f := range b.fixUps {
-		labelIdx, ok := b.labelToInsnIdx[f.label]
+	if b.deferredErr != nil {
+		return nil, b.deferredErr
+	}
+
+	for label := range b.fixUps {
+		err := b.applyFixUps(label)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if b.policyDebugEnabled {
+		for idx := range b.insns {
+			if labels, ok := b.insnIdxToLabels[idx]; ok {
+				b.insns[idx].Labels = append(b.insns[idx].Labels, labels...)
+			}
+			if comments, ok := b.insnIdxToComments[idx]; ok {
+				b.insns[idx].Comments = append(b.insns[idx].Comments, comments...)
+			}
+		}
+	}
+
+	return b.insns, nil
+}
+
+func (b *Block) applyFixUps(targetLabel string) error {
+	for _, f := range b.fixUps[targetLabel] {
+		labelIdx, ok := b.labelToInsnIdx[targetLabel]
 		if !ok {
-			return nil, fmt.Errorf("missing label: %s", f.label)
+			return fmt.Errorf("missing label: %s", targetLabel)
 		}
 		// Offset is relative to the next instruction since the PC is auto-incremented.
 		offset := labelIdx - f.origInsnIdx - 1
-		binary.LittleEndian.PutUint16(b.insns[f.origInsnIdx][2:4], uint16(offset))
+		if offset == -1 {
+			// This case is made more likely by the trampoline machinery
+			// since it's what we'd hit if a trampoline was generated but
+			// then the intended jump target was never added.
+			return fmt.Errorf("calculated jump offset (%d) to label %s would jump to same instruction", offset, targetLabel)
+		}
+		if offset > math.MaxInt16 || offset < math.MinInt16 {
+			return fmt.Errorf("calculated jump offset (%d) to label %s would exceed jump range", offset, targetLabel)
+		}
+		binary.LittleEndian.PutUint16(b.insns[f.origInsnIdx].Instruction[2:4], uint16(offset))
 	}
-	return b.insns, nil
+	delete(b.fixUps, targetLabel)
+	return nil
 }
 
 func (b *Block) LabelNextInsn(label string) {
 	b.labelToInsnIdx[label] = len(b.insns)
 	b.insnIdxToLabels[len(b.insns)] = append(b.insnIdxToLabels[len(b.insns)], label)
+
+	// Eagerly apply fixUps now so that we can re-use the same label names
+	// when making trampolines.
+	err := b.applyFixUps(label)
+	if err != nil {
+		log.WithError(err).Error("Failed to apply fix-ups in BPF assembler; program generation will fail")
+		// Log a deferred error to be returned by Assemble().  This saves adding
+		// error checks throughout the policy program builder, for example.
+		if b.deferredErr == nil {
+			b.deferredErr = fmt.Errorf("failed to apply fix-ups when adding label %q @ %d: %w", label, len(b.insns), err)
+		}
+	}
 }
 
-func (b *Block) nextInsnReachble() bool {
+func (b *Block) AddComment(comment string) {
+	if !b.policyDebugEnabled {
+		return
+	}
+	b.insnIdxToComments[len(b.insns)] = append(b.insnIdxToComments[len(b.insns)], comment)
+}
+
+func (b *Block) AddCommentF(comment string, args ...any) {
+	if !b.policyDebugEnabled {
+		return
+	}
+	comment = fmt.Sprintf(comment, args...)
+	b.insnIdxToComments[len(b.insns)] = append(b.insnIdxToComments[len(b.insns)], comment)
+}
+
+func (b *Block) nextInsnReachable() bool {
 	if len(b.insns) == 0 {
 		return true // First instruction is always reachable.
 	}
-	for _, l := range b.insnIdxToLabels[len(b.insns)] {
-		if b.inUseJumpTargets.Contains(l) {
-			return true // Previous instruction jumps to this one, we're reachable.
-		}
-	}
 	lastInsn := b.insns[len(b.insns)-1]
-	switch lastInsn.OpCode() {
-	case JumpA, Exit:
-		// Previous instruction jumps or returns and it doesn't jump here so we're not reachable.
+	lastOpCode := lastInsn.OpCode()
+	if lastOpCode == JumpA /*Unconditional jump*/ || lastOpCode == Exit {
+		// Previous instruction doesn't fall through to this one, need
+		// to check if something else jumps here...
+		for _, l := range b.insnIdxToLabels[len(b.insns)] {
+			if b.inUseJumpTargets.Contains(l) {
+				return true // Previous instruction jumps to this one, we're reachable.
+			}
+		}
 		return false
-	default:
-		return true
 	}
+	return true
+}
+
+func (b *Block) ReserveInstructionCapacity(n int) {
+	if cap(b.insns) >= n {
+		return
+	}
+	newInsns := make(Insns, len(b.insns), n)
+	copy(newInsns, b.insns)
+	b.insns = newInsns
+}
+
+func (b *Block) SetTrampolinesEnabled(en bool) {
+	b.trampolinesEnabled = en
 }

@@ -71,7 +71,7 @@ type Config struct {
 // datastore-facing part of Felix via the Send/RecvMessage methods, which operate on the
 // protobuf-defined API objects.
 //
-// Architecture
+// # Architecture
 //
 // The Windows dataplane driver is organised around a main event loop, which handles
 // update events from the datastore and dataplane.
@@ -88,11 +88,11 @@ type Config struct {
 // we refer back to the caches to recalculate the sets of rules which need to be sent to HNS. As the
 // HNS API surface is enhanced, we may be able to optimize and remove some or all of these caches.
 //
-// Requirements on the API
+// # Requirements on the API
 //
 // The dataplane does not do consistency checks on the incoming data. It expects to be told about
 // dependent resources before they are needed and for their lifetime to exceed that of the resources
-// that depend on them.  For example, it is important the the datastore layer send an IP set create
+// that depend on them.  For example, it is important the datastore layer send an IP set create
 // event before it sends a rule that references that IP set.
 type WindowsDataplane struct {
 	// the channel which we receive messages from felix
@@ -130,8 +130,9 @@ type WindowsDataplane struct {
 }
 
 const (
-	healthName     = "win_dataplane"
+	healthName     = "WindowsDataplaneMainLoop"
 	healthInterval = 10 * time.Second
+	healthTimeout  = 90 * time.Second
 )
 
 // Interface for Managers. Each Manager is responsible for processing updates from felix and
@@ -181,7 +182,7 @@ func NewWinDataplaneDriver(hns hns.API, config Config) *WindowsDataplane {
 	}
 	dp.policySets = policysets.NewPolicySets(hns, ipsc, policysets.FileReader(policysets.StaticFileName))
 
-	dp.RegisterManager(common.NewIPSetsManager(ipSetsV4, config.MaxIPSetSize))
+	dp.RegisterManager(common.NewIPSetsManager("ipv4", ipSetsV4, config.MaxIPSetSize))
 	dp.RegisterManager(newPolicyManager(dp.policySets))
 	dp.endpointMgr = newEndpointManager(hns, dp.policySets)
 	dp.RegisterManager(dp.endpointMgr)
@@ -205,7 +206,7 @@ func NewWinDataplaneDriver(hns hns.API, config Config) *WindowsDataplane {
 		config.HealthAggregator.RegisterReporter(
 			healthName,
 			&health.HealthReport{Live: true, Ready: true},
-			healthInterval*2,
+			healthTimeout,
 		)
 	}
 
@@ -332,7 +333,7 @@ func (d *WindowsDataplane) loopUpdatingDataplane() {
 }
 
 // Applies any pending changes to the dataplane by giving each of the managers a chance to
-// complete their deffered work. If the operation fails, then this will also set up a
+// complete their deferred work. If the operation fails, then this will also set up a
 // rescheduling kick so that the apply can be reattempted.
 func (d *WindowsDataplane) apply() {
 	// Unset the needs-sync flag, a rescheduling kick will reset it later if something failed

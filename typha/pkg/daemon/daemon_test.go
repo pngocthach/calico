@@ -15,21 +15,20 @@
 package daemon_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
-	. "github.com/projectcalico/calico/typha/pkg/daemon"
-	"github.com/projectcalico/calico/typha/pkg/discovery"
-
-	"context"
-	"fmt"
-	"io/ioutil"
-	"os"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	. "github.com/projectcalico/calico/typha/pkg/daemon"
+	"github.com/projectcalico/calico/typha/pkg/discovery"
+	"github.com/projectcalico/calico/typha/pkg/syncproto"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -98,7 +97,7 @@ var _ = Describe("Daemon", func() {
 
 		BeforeEach(func() {
 			var err error
-			configFile, err = ioutil.TempFile("", "typha")
+			configFile, err = os.CreateTemp("", "typha")
 			Expect(err).NotTo(HaveOccurred())
 
 			_, err = configFile.Write(configContents)
@@ -136,7 +135,7 @@ var _ = Describe("Daemon", func() {
 
 			It("should create the server components", func() {
 				d.CreateServer()
-				Expect(d.SyncerPipelines).To(HaveLen(4))
+				Expect(d.CachesBySyncerType).To(HaveLen(syncproto.NumSyncerTypes))
 				for _, p := range d.SyncerPipelines {
 					Expect(p.SyncerToValidator).ToNot(BeNil())
 					Expect(p.Syncer).ToNot(BeNil())
@@ -167,7 +166,7 @@ var _ = Describe("Daemon", func() {
 				addr := fmt.Sprintf("127.0.0.1:%d", port)
 				cbs := fvtests.NewRecorder()
 				client := syncclient.New(
-					[]discovery.Typha{{Addr: addr}},
+					discovery.New(discovery.WithAddrOverride(addr)),
 					"",
 					"",
 					"",
@@ -175,11 +174,14 @@ var _ = Describe("Daemon", func() {
 					nil,
 				)
 				clientCxt, clientCancelFn := context.WithCancel(context.Background())
+				recorderCtx, recorderCancelFn := context.WithCancel(context.Background())
 				defer func() {
 					clientCancelFn()
 					client.Finished.Wait()
+					recorderCancelFn()
 				}()
 				err := client.Start(clientCxt)
+				go cbs.Loop(recorderCtx)
 				Expect(err).NotTo(HaveOccurred())
 
 				// Send in an update at the top of the processing pipeline.
@@ -326,6 +328,11 @@ func (b *mockDatastore) WorkloadEndpoints() clientv3.WorkloadEndpointInterface {
 	panic("not implemented")
 }
 
+// BGPFilter returns an interface for managing BGP peer resources.
+func (b *mockDatastore) BGPFilter() clientv3.BGPFilterInterface {
+	panic("not implemented")
+}
+
 // BGPPeers returns an interface for managing BGP peer resources.
 func (b *mockDatastore) BGPPeers() clientv3.BGPPeerInterface {
 	panic("not implemented")
@@ -363,6 +370,16 @@ func (b *mockDatastore) KubeControllersConfiguration() clientv3.KubeControllersC
 
 // CalicoNodeStatus returns an interface for managing the Calico node status resources.
 func (b *mockDatastore) CalicoNodeStatus() clientv3.CalicoNodeStatusInterface {
+	panic("not implemented")
+}
+
+// IPAMConfig returns an interface for managing the IPAMConfig resources.
+func (b *mockDatastore) IPAMConfig() clientv3.IPAMConfigInterface {
+	panic("not implemented")
+}
+
+// BlockAffinities returns an interface for managing the block affinity resources.
+func (b *mockDatastore) BlockAffinities() clientv3.BlockAffinityInterface {
 	panic("not implemented")
 }
 

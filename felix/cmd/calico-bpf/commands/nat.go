@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-
-	"github.com/projectcalico/calico/felix/bpf"
 
 	"github.com/docopt/docopt-go"
 	"github.com/pkg/errors"
@@ -47,7 +45,7 @@ func init() {
 // conntrackCmd represents the conntrack command
 var natCmd = &cobra.Command{
 	Use:   "nat",
-	Short: "Nanipulates network address translation (nat)",
+	Short: "Manipulates network address translation (nat)",
 	Long: "nat manipulates network address translation (nat), " +
 		"which implements the bpf-based replacement for kube-proxy",
 }
@@ -83,14 +81,13 @@ var natDelCmd = &cobra.Command{
 }
 
 func dumpAff(cmd *cobra.Command) (err error) {
-	mc := &bpf.MapContext{}
-	affMap, err := nat.LoadAffinityMap(nat.AffinityMap(mc))
+	affMap, err := nat.LoadAffinityMap(nat.AffinityMap())
 	if err != nil {
 		return err
 	}
 
 	for k, v := range affMap {
-		cmd.Printf("%-40s %s", k, v)
+		cmd.Printf("%-40s %s\n", k, v)
 	}
 
 	cmd.Printf("\n")
@@ -99,26 +96,44 @@ func dumpAff(cmd *cobra.Command) (err error) {
 }
 
 func dump(cmd *cobra.Command) error {
-	mc := &bpf.MapContext{}
-	natMap, err := nat.LoadFrontendMap(nat.FrontendMap(mc))
-	if err != nil {
-		return err
-	}
+	if ipv6 != nil && *ipv6 {
+		natMap, err := nat.LoadFrontendMapV6(nat.FrontendMapV6())
+		if err != nil {
+			return err
+		}
 
-	back, err := nat.LoadBackendMap(nat.BackendMap(mc))
-	if err != nil {
-		return err
-	}
+		back, err := nat.LoadBackendMapV6(nat.BackendMapV6())
+		if err != nil {
+			return err
+		}
 
-	dumpNice(cmd.Printf, natMap, back)
+		dumpNice[nat.FrontendKeyV6, nat.BackendValueV6](cmd.Printf, natMap, back)
+	} else {
+		natMap, err := nat.LoadFrontendMap(nat.FrontendMap())
+		if err != nil {
+			return err
+		}
+
+		back, err := nat.LoadBackendMap(nat.BackendMap())
+		if err != nil {
+			return err
+		}
+
+		dumpNice[nat.FrontendKey, nat.BackendValue](cmd.Printf, natMap, back)
+	}
 	return nil
 }
 
 type printfFn func(format string, i ...interface{})
 
-func dumpNice(printf printfFn, natMap nat.MapMem, back nat.BackendMapMem) {
+func dumpNice[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf printfFn,
+	natMap map[FK]nat.FrontendValue, back map[nat.BackendKey]BV) {
 	for nk, nv := range natMap {
-		count := nv.Count()
+		valCount := nv.Count()
+		count := int(valCount)
+		if valCount == nat.BlackHoleCount {
+			count = -1
+		}
 		local := nv.LocalCount()
 		id := nv.ID()
 		flags := nv.FlagsAsString()
@@ -127,14 +142,19 @@ func dumpNice(printf printfFn, natMap nat.MapMem, back nat.BackendMapMem) {
 		}
 		printf("%s port %d proto %d id %d count %d local %d%s\n",
 			nk.Addr(), nk.Port(), nk.Proto(), id, count, local, flags)
-		for i := uint32(0); i < count; i++ {
+		for i := 0; i < count; i++ {
 			bk := nat.NewNATBackendKey(id, uint32(i))
 			bv, ok := back[bk]
 			printf("\t%d:%d\t ", id, i)
 			if !ok {
 				printf("is missing\n")
 			} else {
-				printf("%s:%d\n", bv.Addr(), bv.Port())
+				fmtStr := "%s:%d\n"
+				// Use "[]" with IPv6 addresses
+				if bv.Addr().To4() == nil {
+					fmtStr = "[%s]:%d\n"
+				}
+				printf(fmtStr, bv.Addr(), bv.Port())
 			}
 		}
 	}
@@ -227,7 +247,7 @@ func (cmd *natFrontend) ArgsSet(c *cobra.Command, args []string) error {
 }
 
 func (cmd *natFrontend) RunSet(c *cobra.Command, _ []string) {
-	natMap := nat.FrontendMap(&bpf.MapContext{})
+	natMap := nat.FrontendMap()
 	if err := natMap.Open(); err != nil {
 		log.WithError(err).Error("Failed to access NATMap")
 	}
@@ -273,7 +293,7 @@ func (cmd *natFrontend) ArgsDel(c *cobra.Command, args []string) error {
 }
 
 func (cmd *natFrontend) RunDel(c *cobra.Command, _ []string) {
-	natMap := nat.FrontendMap(&bpf.MapContext{})
+	natMap := nat.FrontendMap()
 	if err := natMap.Open(); err != nil {
 		log.WithError(err).Error("Failed to access NATMap")
 	}
@@ -358,8 +378,7 @@ func (cmd *natBackend) ArgsSet(c *cobra.Command, args []string) error {
 }
 
 func (cmd *natBackend) RunSet(c *cobra.Command, _ []string) {
-	mc := &bpf.MapContext{}
-	m := nat.BackendMap(mc)
+	m := nat.BackendMap()
 	if err := m.Open(); err != nil {
 		log.WithError(err).Error("Failed to access NATMap")
 	}
@@ -405,8 +424,7 @@ func (cmd *natBackend) ArgsDel(c *cobra.Command, args []string) error {
 }
 
 func (cmd *natBackend) RunDel(c *cobra.Command, _ []string) {
-	mc := &bpf.MapContext{}
-	m := nat.BackendMap(mc)
+	m := nat.BackendMap()
 	if err := m.Open(); err != nil {
 		log.WithError(err).Error("Failed to access NATMap")
 	}

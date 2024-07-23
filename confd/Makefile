@@ -11,9 +11,7 @@ include ../lib.Makefile
 
 ###############################################################################
 
-test: ut test-kdd test-etcd
-
-LDFLAGS=-ldflags "-X $(PACKAGE_NAME)/pkg/buildinfo.GitVersion=$(GIT_DESCRIPTION)"
+LDFLAGS=-X $(PACKAGE_NAME)/pkg/buildinfo.GitVersion=$(GIT_DESCRIPTION)
 
 # All go files.
 SRC_FILES:=$(shell find . -name '*.go' -not -path "./vendor/*" )
@@ -27,21 +25,18 @@ clean:
 ###############################################################################
 # Building the binary
 ###############################################################################
-build: bin/confd
+build: bin/confd-$(ARCH)
 build-all: $(addprefix sub-build-,$(VALIDARCHES))
 sub-build-%:
 	$(MAKE) build ARCH=$*
 
 bin/confd-$(ARCH): $(SRC_FILES)
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'go build -v -i -o $@ $(LDFLAGS) "$(PACKAGE_NAME)" && \
-		( ldd bin/confd-$(ARCH) 2>&1 | grep -q -e "Not a valid dynamic program" \
-			-e "not a dynamic executable" || \
-		     ( echo "Error: bin/confd was not statically linked"; false ) )'
-
-bin/confd: bin/confd-$(ARCH)
-ifeq ($(ARCH),amd64)
-	ln -f bin/confd-$(ARCH) bin/confd
+ifeq ($(FIPS),true)
+	$(call build_cgo_boring_binary, $(PACKAGE_NAME), $@)
+else
+	$(call build_binary, $(PACKAGE_NAME), $@)
 endif
+	ln -sf confd-$(ARCH) bin/confd
 
 ###############################################################################
 # Unit Tests
@@ -50,9 +45,11 @@ endif
 # checking them.
 UPDATE_EXPECTED_DATA?=false
 
+test: ut test-kdd test-etcd
+
 .PHONY: test-kdd
 ## Run template tests against KDD
-test-kdd: bin/confd bin/kubectl bin/bird bin/bird6 bin/calico-node bin/calicoctl bin/typha run-k8s-apiserver
+test-kdd: bin/confd-$(ARCH) bin/kubectl bin/bird bin/bird6 bin/calico-node bin/calicoctl bin/typha run-k8s-apiserver
 	-git clean -fx etc/calico/confd
 	mkdir -p tests/logs
 	docker run --rm --net=host \
@@ -85,7 +82,7 @@ test-kdd: bin/confd bin/kubectl bin/bird bin/bird6 bin/calico-node bin/calicoctl
 
 .PHONY: test-etcd
 ## Run template tests against etcd
-test-etcd: bin/confd bin/etcdctl bin/bird bin/bird6 bin/calico-node bin/kubectl bin/calicoctl run-etcd run-k8s-apiserver
+test-etcd: bin/confd-$(ARCH) bin/etcdctl bin/bird bin/bird6 bin/calico-node bin/kubectl bin/calicoctl run-etcd run-k8s-apiserver
 	-git clean -fx etc/calico/confd
 	mkdir -p tests/logs
 	docker run --rm --net=host \
@@ -107,7 +104,7 @@ ut:
 
 
 bin/kubectl:
-	curl -sSf -L --retry 5 https://storage.googleapis.com/kubernetes-release/release/$(KUBECTL_VERSION)/bin/linux/$(ARCH)/kubectl -o $@
+	curl -sSf -L --retry 5 https://storage.googleapis.com/kubernetes-release/release/$(K8S_VERSION)/bin/linux/$(ARCH)/kubectl -o $@
 	chmod +x $@
 
 bin/bird bin/bird6:

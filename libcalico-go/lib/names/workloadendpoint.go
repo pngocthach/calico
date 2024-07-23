@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"strings"
 
+	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
@@ -40,10 +42,10 @@ import (
 // NameMatches() method.  This is necessary because a prefix match may return endpoints
 // that do not exactly match the required identifiers.  For example, suppose you are
 // querying endpoints with node=node1, orch=k8s, pod=pod and endpoints is wild carded:
-// -  The name prefix would be `node1-k8s-pod-`
-// -  A list query using that prefix would also return endpoints with, for example,
-//    a pod call "pod-1", because the name of the endpoint might be `node1-k8s-pod--1-eth0`
-//    which matches the required name prefix.
+//   - The name prefix would be `node1-k8s-pod-`
+//   - A list query using that prefix would also return endpoints with, for example,
+//     a pod call "pod-1", because the name of the endpoint might be `node1-k8s-pod--1-eth0`
+//     which matches the required name prefix.
 //
 // The Node and Orchestrator are always required for both prefix and non-prefix name
 // construction.
@@ -267,4 +269,29 @@ func ParseWorkloadEndpointName(wepName string) (WorkloadEndpointIdentifiers, err
 		}
 	}
 	return weid, nil
+}
+
+func ConvertWorkloadEndpointV3KeyToV1Key(v3key model.ResourceKey) (model.WorkloadEndpointKey, error) {
+	parts := ExtractDashSeparatedParms(v3key.Name, 4)
+	if len(parts) != 4 || v3key.Namespace == "" {
+		return model.WorkloadEndpointKey{}, errors.New("not enough information provided to create v1 Workload Endpoint Key")
+	}
+	return model.WorkloadEndpointKey{
+		Hostname:       parts[0],
+		OrchestratorID: parts[1],
+		WorkloadID:     v3key.Namespace + "/" + parts[2],
+		EndpointID:     parts[3],
+	}, nil
+}
+
+func IdentifiersForV3WorkloadEndpoint(res *v3.WorkloadEndpoint) WorkloadEndpointIdentifiers {
+	wepids := WorkloadEndpointIdentifiers{
+		Node:         res.Spec.Node,
+		Orchestrator: res.Spec.Orchestrator,
+		Endpoint:     res.Spec.Endpoint,
+		Workload:     res.Spec.Workload,
+		Pod:          res.Spec.Pod,
+		ContainerID:  res.Spec.ContainerID,
+	}
+	return wepids
 }

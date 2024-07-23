@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -121,7 +120,7 @@ Description:
 
 	// Make sure that the datastore is locked. Since the call to EnsureInitialized
 	// should initialize it to unlocked, lock it before we continue.
-	locked, err := checkLocked(ctx, client)
+	locked, err := common.CheckLocked(ctx, client)
 	if err != nil {
 		return fmt.Errorf("Error while checking if datastore was locked: %s", err)
 	} else if !locked {
@@ -188,7 +187,7 @@ func splitImportFile(filename string) ([]byte, []byte, []byte, error) {
 		fname = os.Stdin.Name()
 	}
 
-	b, err := ioutil.ReadFile(fname)
+	b, err := os.ReadFile(fname)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -305,7 +304,7 @@ func updateClusterInfo(ctx context.Context, c client.Interface, clusterInfoJson 
 
 func updateV3Resources(cfg *apiconfig.CalicoAPIConfig, data []byte) error {
 	// Create tempfile so the v3 resources can be created using Apply
-	tempfile, err := ioutil.TempFile("", "v3migration")
+	tempfile, err := os.CreateTemp("", "v3migration")
 	if err != nil {
 		return fmt.Errorf("Error while creating temporary v3 migration file: %s\n", err)
 	}
@@ -316,7 +315,7 @@ func updateV3Resources(cfg *apiconfig.CalicoAPIConfig, data []byte) error {
 	}
 
 	// Create a tempfile for the config so QPS will be overwritten
-	tempConfigFile, err := ioutil.TempFile("", "qpsconfig")
+	tempConfigFile, err := os.CreateTemp("", "qpsconfig")
 	if err != nil {
 		return fmt.Errorf("Error while creating temporary v3 migration config file: %s\n", err)
 	}
@@ -417,7 +416,7 @@ func applyV3(args map[string]interface{}) error {
 				// Check that the error is for a Node
 				if key, ok := e.Identifier.(model.ResourceKey); ok {
 					if key.Kind == libapiv3.KindNode {
-						fmt.Printf("[WARNING] Attempted to import node %v from etcd that references a non-existent Kubernetes node. Skipping that node. Non-Kubernetes nodes are not supported in the Kubernetes datastore and will be skipped.", e.Identifier)
+						fmt.Printf("[WARNING] Attempted to import node %v from etcd that references a nonexistent Kubernetes node. Skipping that node. Non-Kubernetes nodes are not supported in the Kubernetes datastore and will be skipped.", e.Identifier)
 						continue
 					}
 				}

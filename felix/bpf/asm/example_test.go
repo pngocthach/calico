@@ -17,12 +17,12 @@ package asm_test
 import (
 	"fmt"
 
-	"github.com/projectcalico/calico/felix/bpf"
 	. "github.com/projectcalico/calico/felix/bpf/asm"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 )
 
 func ExampleBlock() {
-	b := NewBlock()
+	b := NewBlock(false)
 	b.MovImm64(R1, 10)         // R1 = 10
 	b.MovImm64(R2, 20)         // R2 = 20
 	b.JumpLE64(1, 2, "target") // if R1 < R2 jump to label "target"
@@ -60,9 +60,9 @@ func ExampleBlock() {
 
 func ExampleBlock_Call() {
 	// Made up map file descriptor, this needs to be loaded form the kernel.
-	var mapFD bpf.MapFD = 5
+	var mapFD maps.FD = 5
 
-	b := NewBlock()
+	b := NewBlock(false)
 
 	// Store 64-bit 0 on the stack at offset -8 (stack grows down).
 	b.MovImm64(R1, 0)

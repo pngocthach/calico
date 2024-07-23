@@ -2,7 +2,6 @@ package config
 
 import (
 	"flag"
-	"io/ioutil"
 	"os"
 
 	"github.com/BurntSushi/toml"
@@ -12,6 +11,8 @@ import (
 	"github.com/projectcalico/calico/confd/pkg/resource/template"
 
 	"github.com/projectcalico/calico/typha/pkg/syncclientutils"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 var (
@@ -61,7 +62,7 @@ func init() {
 // It returns an error if any.
 func InitConfig(ignoreFlags bool) (*Config, error) {
 	if configFile == "" {
-		if _, err := os.Stat(defaultConfigFile); !os.IsNotExist(err) {
+		if _, err := os.Stat(winutils.GetHostPath(defaultConfigFile)); !os.IsNotExist(err) {
 			configFile = defaultConfigFile
 		}
 	}
@@ -72,7 +73,7 @@ func InitConfig(ignoreFlags bool) (*Config, error) {
 	// have independent settings, so honour CONFD_ also.  Longer-term it would be nice to
 	// coalesce around CALICO_, so support that as well.
 	config := Config{
-		ConfDir:  "/etc/confd",
+		ConfDir:  winutils.GetHostPath("/etc/confd"),
 		Interval: 600,
 		Prefix:   "",
 		Typha:    syncclientutils.ReadTyphaConfig([]string{"CONFD_", "FELIX_", "CALICO_"}),
@@ -82,7 +83,7 @@ func InitConfig(ignoreFlags bool) (*Config, error) {
 		log.Info("Skipping confd config file.")
 	} else {
 		log.Info("Loading " + configFile)
-		configBytes, err := ioutil.ReadFile(configFile)
+		configBytes, err := os.ReadFile(winutils.GetHostPath(configFile))
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +124,7 @@ type ConfigVisitor struct {
 func (c *ConfigVisitor) setConfigFromFlag(f *flag.Flag) {
 	switch f.Name {
 	case "confdir":
-		c.config.ConfDir = confdir
+		c.config.ConfDir = winutils.GetHostPath(confdir)
 	case "interval":
 		c.config.Interval = interval
 	case "noop":

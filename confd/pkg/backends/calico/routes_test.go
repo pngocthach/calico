@@ -12,6 +12,10 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
 
 const (
@@ -22,13 +26,19 @@ const (
 	// Range and specific IP for external IP test.
 	externalIPRange2 = "172.217.3.5/32"
 	externalIP2      = "172.217.3.5"
+
+	// Specific IP for loadbalancer IP test.
+	loadBalancerIP1 = "172.217.4.10"
 )
 
 func addEndpointSubset(ep *v1.Endpoints, nodename string) {
 	ep.Subsets = append(ep.Subsets, v1.EndpointSubset{
 		Addresses: []v1.EndpointAddress{
-			v1.EndpointAddress{
-				NodeName: &nodename}}})
+			{
+				NodeName: &nodename,
+			},
+		},
+	})
 }
 
 func buildSimpleService() (svc *v1.Service, ep *v1.Endpoints) {
@@ -40,7 +50,8 @@ func buildSimpleService() (svc *v1.Service, ep *v1.Endpoints) {
 			ClusterIP:             "127.0.0.1",
 			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 			ExternalIPs:           []string{externalIP1, externalIP2},
-		}}
+		},
+	}
 	ep = &v1.Endpoints{
 		ObjectMeta: meta,
 	}
@@ -56,7 +67,30 @@ func buildSimpleService2() (svc *v1.Service, ep *v1.Endpoints) {
 			ClusterIP:             "127.0.0.5",
 			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 			ExternalIPs:           []string{externalIP1, externalIP2},
-		}}
+		},
+	}
+	ep = &v1.Endpoints{
+		ObjectMeta: meta,
+	}
+	return
+}
+
+func buildSimpleService3() (svc *v1.Service, ep *v1.Endpoints) {
+	meta := metav1.ObjectMeta{Namespace: "foo", Name: "lb"}
+	svc = &v1.Service{
+		ObjectMeta: meta,
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ClusterIP:             "127.0.0.10",
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			LoadBalancerIP:        loadBalancerIP1,
+		},
+		Status: v1.ServiceStatus{
+			LoadBalancer: v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{IP: loadBalancerIP1}},
+			},
+		},
+	}
 	ep = &v1.Endpoints{
 		ObjectMeta: meta,
 	}
@@ -69,7 +103,6 @@ var _ = Describe("RouteGenerator", func() {
 	var expectedSvc2RouteMap map[string]bool
 
 	BeforeEach(func() {
-
 		_, ipNet1, _ := net.ParseCIDR("104.244.42.129/32")
 		_, ipNet2, _ := net.ParseCIDR("172.217.3.0/24")
 
@@ -82,15 +115,20 @@ var _ = Describe("RouteGenerator", func() {
 		expectedSvc2RouteMap["172.217.3.5/32"] = true
 
 		rg = &routeGenerator{
-			nodeName:                "foobar",
-			svcIndexer:              cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil),
-			epIndexer:               cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil),
-			svcRouteMap:             make(map[string]map[string]bool),
-			routeAdvertisementCount: make(map[string]int),
+			nodeName:                   "foobar",
+			svcIndexer:                 cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil),
+			epIndexer:                  cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil),
+			svcRouteMap:                make(map[string]map[string]bool),
+			routeAdvertisementRefCount: make(map[string]int),
 			client: &client{
-				cache:        make(map[string]string),
-				syncedOnce:   true,
-				clusterCIDRs: []string{"10.0.0.0/16"},
+				cache:                    make(map[string]string),
+				syncedOnce:               true,
+				clusterCIDRs:             []string{"10.0.0.0/16"},
+				programmedRouteRefCount:  make(map[string]int),
+				ExternalIPRouteIndex:     NewRouteIndex(),
+				ClusterIPRouteIndex:      NewRouteIndex(),
+				LoadBalancerIPRouteIndex: NewRouteIndex(),
+
 				externalIPs: []string{
 					ipNet1.String(),
 					ipNet2.String(),
@@ -194,23 +232,29 @@ var _ = Describe("RouteGenerator", func() {
 
 	Describe("resourceInformerHandlers", func() {
 		var (
-			svc, svc2 *v1.Service
-			ep, ep2   *v1.Endpoints
+			svc, svc2, svc3 *v1.Service
+			ep, ep2, ep3    *v1.Endpoints
 		)
 
 		BeforeEach(func() {
 			svc, ep = buildSimpleService()
 			svc2, ep2 = buildSimpleService2()
+			svc3, ep3 = buildSimpleService3()
 
 			addEndpointSubset(ep, rg.nodeName)
 			addEndpointSubset(ep2, rg.nodeName)
+			addEndpointSubset(ep3, rg.nodeName)
 			err := rg.epIndexer.Add(ep)
 			Expect(err).NotTo(HaveOccurred())
 			err = rg.epIndexer.Add(ep2)
 			Expect(err).NotTo(HaveOccurred())
+			err = rg.epIndexer.Add(ep3)
+			Expect(err).NotTo(HaveOccurred())
 			err = rg.svcIndexer.Add(svc)
 			Expect(err).NotTo(HaveOccurred())
 			err = rg.svcIndexer.Add(svc2)
+			Expect(err).NotTo(HaveOccurred())
+			err = rg.svcIndexer.Add(svc3)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
@@ -220,8 +264,8 @@ var _ = Describe("RouteGenerator", func() {
 			rg.onSvcAdd(svc)
 			Expect(rg.client.cacheRevision).To(Equal(initRevision + 2))
 			Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-			Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-			Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+			Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+			Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 			Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 			Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 
@@ -232,8 +276,8 @@ var _ = Describe("RouteGenerator", func() {
 			rg.onEPAdd(ep)
 			Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 			Expect(rg.svcRouteMap["foo/bar"]).To(BeEmpty())
-			Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-			Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+			Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+			Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 			Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal(""))
 			Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal(""))
 			Expect(rg.client.cache).To(Equal(map[string]string{}))
@@ -251,8 +295,8 @@ var _ = Describe("RouteGenerator", func() {
 			rg.onEPAdd(ep)
 			Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 			Expect(rg.svcRouteMap["foo/bar"]).To(BeEmpty())
-			Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-			Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+			Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+			Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 			Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal(""))
 			Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal(""))
 			Expect(rg.client.cache).To(Equal(map[string]string{}))
@@ -270,21 +314,21 @@ var _ = Describe("RouteGenerator", func() {
 			rg.onEPAdd(ep)
 			Expect(rg.client.cacheRevision).To(Equal(initRevision + 6))
 			Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-			Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-			Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+			Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+			Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 			Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 			Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 		})
 
 		Context("onSvc[Add|Delete]", func() {
-			It("should add the service's cluster IP and whitelisted external IPs into the svcRouteMap", func() {
+			It("should add the service's cluster IP and approved external IPs into the svcRouteMap", func() {
 				// add
 				initRevision := rg.client.cacheRevision
 				rg.onSvcAdd(svc)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 2))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 
@@ -293,8 +337,8 @@ var _ = Describe("RouteGenerator", func() {
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("172.217.3.5/32"))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("127.0.0.1/32"))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/172.217.3.5-32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.1-32"))
 			})
@@ -304,23 +348,29 @@ var _ = Describe("RouteGenerator", func() {
 				initRevision := rg.client.cacheRevision
 				rg.onSvcAdd(svc)
 				rg.onSvcAdd(svc2)
-				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
+				Expect(rg.client.cacheRevision).To(Equal(initRevision + 3))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
 				Expect(rg.svcRouteMap["foo/rem"]).To(Equal(expectedSvc2RouteMap))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["127.0.0.5/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(2))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.5/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(2))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.5-32"]).To(Equal("127.0.0.5/32"))
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 
+				// We expect the client refcounter to have a single reference for each generated route, as
+				// the route generator deduplicates route updates itself for duplicate service IPs.
+				Expect(rg.client.programmedRouteRefCount["/calico/staticroutes/127.0.0.5-32"]).To(Equal(1))
+				Expect(rg.client.programmedRouteRefCount["/calico/staticroutes/127.0.0.1-32"]).To(Equal(1))
+				Expect(rg.client.programmedRouteRefCount["/calico/staticroutes/172.217.3.5-32"]).To(Equal(1))
+
 				// delete one of the services, and make sure the duplicate route is still advertised
 				// and we handle the counting logic correctly
 				rg.onSvcDelete(svc2)
-				Expect(rg.client.cacheRevision).To(Equal(initRevision + 5))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["127.0.0.5/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
 				Expect(rg.svcRouteMap["foo/rem"]).ToNot(HaveKey("127.0.0.5/32"))
 				Expect(rg.svcRouteMap["foo/rem"]).ToNot(HaveKey("172.217.3.5/32"))
@@ -328,51 +378,61 @@ var _ = Describe("RouteGenerator", func() {
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.5-32"))
 
+				// The client refcount should be updated as well.
+				Expect(rg.client.programmedRouteRefCount["/calico/staticroutes/127.0.0.1-32"]).To(Equal(1))
+				Expect(rg.client.programmedRouteRefCount["/calico/staticroutes/172.217.3.5-32"]).To(Equal(1))
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey("/calico/staticroutes/127.0.0.5-32"))
+
 				// delete the other service and check that both routes are withdrawn and their counts are 0
 				rg.onSvcDelete(svc)
-				Expect(rg.client.cacheRevision).To(Equal(initRevision + 7))
+				Expect(rg.client.cacheRevision).To(Equal(initRevision + 6))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("172.217.3.5/32"))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("127.0.0.1/32"))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/172.217.3.5-32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.1-32"))
+
+				// The client refcount should be updated as well.
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey("/calico/staticroutes/127.0.0.1-32"))
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey("/calico/staticroutes/172.217.3.5-32"))
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey("/calico/staticroutes/127.0.0.5-32"))
 			})
 		})
 
 		Context("onSvcUpdate", func() {
-			It("should add the service's cluster IP and whitelisted external IPs into the svcRouteMap and then remove them for unsupported service type", func() {
+			It("should add the service's cluster IP and approved external IPs into the svcRouteMap and then remove them for unsupported service type", func() {
 				initRevision := rg.client.cacheRevision
 				rg.onSvcUpdate(nil, svc)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 2))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 
-				// set to unsupport service type
+				// set to unsupported service type
 				svc.Spec.Type = v1.ServiceTypeExternalName
 				rg.onSvcUpdate(nil, svc)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("172.217.3.5/32"))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("127.0.0.1-32"))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/172.217.3.5-32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.1-32"))
 			})
 		})
 
 		Context("onEp[Add|Delete]", func() {
-			It("should add the service's cluster IP and whitelisted external IPs into the svcRouteMap", func() {
+			It("should add the service's cluster IP and approved external IPs into the svcRouteMap", func() {
 				// add
 				initRevision := rg.client.cacheRevision
 				rg.onEPAdd(ep)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 2))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 
@@ -380,31 +440,31 @@ var _ = Describe("RouteGenerator", func() {
 				rg.onEPDelete(ep)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 				Expect(rg.svcRouteMap).ToNot(HaveKey("foo/bar"))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.1-32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/172.217.3.5-32"))
 			})
 		})
 
 		Context("onEpDelete", func() {
-			It("should add the service's cluster IP and whitelisted external IPs into the svcRouteMap and then remove it for unsupported service type", func() {
+			It("should add the service's cluster IP and approved external IPs into the svcRouteMap and then remove it for unsupported service type", func() {
 				initRevision := rg.client.cacheRevision
 				rg.onEPUpdate(nil, ep)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 2))
 				Expect(rg.svcRouteMap["foo/bar"]).To(Equal(expectedSvcRouteMap))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(1))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(1))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(1))
 				Expect(rg.client.cache["/calico/staticroutes/172.217.3.5-32"]).To(Equal("172.217.3.5/32"))
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(Equal("127.0.0.1/32"))
 
-				// set to unsupport service type
+				// set to unsupported service type
 				svc.Spec.Type = v1.ServiceTypeExternalName
 				rg.onEPUpdate(nil, ep)
 				Expect(rg.client.cacheRevision).To(Equal(initRevision + 4))
 				Expect(rg.svcRouteMap["foo/bar"]).ToNot(HaveKey("172.217.3.5/32"))
-				Expect(rg.routeAdvertisementCount["127.0.0.1/32"]).To(Equal(0))
-				Expect(rg.routeAdvertisementCount["172.217.3.5/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["127.0.0.1/32"]).To(Equal(0))
+				Expect(rg.routeAdvertisementRefCount["172.217.3.5/32"]).To(Equal(0))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/172.217.3.5-32"))
 				Expect(rg.client.cache).ToNot(HaveKey("/calico/staticroutes/127.0.0.1-32"))
 			})
@@ -448,6 +508,143 @@ var _ = Describe("RouteGenerator", func() {
 				// We should no longer see cluster CIDRs to be advertised.
 				Expect(rg.client.cache["/calico/staticroutes/127.0.0.1-32"]).To(BeEmpty())
 			})
+
+			// This test simulates a situation where BGPConfiguration has a /32 route that exactly matches
+			// a Service route, resulting in two references to said route. It asserts that when the BGPConfiguration
+			// is modified to remove that route, the service entry is still properly advertised.
+			It("should handle duplicate prefixes BGPConfiguration and Service generated routes", func() {
+				// Create a /32 CIDR for the services first externalIP.
+				externalIPRangeSingle := fmt.Sprintf("%s/32", externalIP1)
+				key := "/calico/staticroutes/" + externalIP1 + "-32"
+
+				// Trigger programming of valid routes from the route generator for any known services.
+				// We don't have a BGPConfiguration update yet, so we shouldn't receive any routes.
+				By("Resyncing routes at start of test")
+				rg.resyncKnownRoutes()
+				Expect(rg.client.cache[key]).To(Equal(""))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(0))
+
+				// Simulate an event from the syncer which sets the External IP range containing only the service's externalIP.
+				By("onExternalIPsUpdate to include /32 route")
+				rg.client.onExternalIPsUpdate([]string{externalIPRangeSingle})
+
+				// Expect that we advertise the /32 given to us via BGPConfiguration.
+				Expect(rg.client.cache[key]).To(Equal(externalIP1 + "/32"))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(1))
+
+				// Trigger programming of routes from the route generator again. This time, the service's externalIP
+				// will be allowed by BGPConfiguration and so it should be programmed.
+				By("Resyncing routes from route generator")
+				rg.resyncKnownRoutes()
+
+				// Expect that we continue to advertise the route, but the refcount should indicate a route received
+				// from both the RouteGenerator and BGPConfiguration.
+				Expect(rg.client.cache[key]).To(Equal(externalIP1 + "/32"))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(2))
+
+				// Simulate an event from the syncer which updates the range. It still includes the original IP,
+				// to ensure we don't trigger the route generator to withdraw its route.
+				By("onExternalIPsUpdate to include /16 route")
+				rg.client.onExternalIPsUpdate([]string{externalIPRange1})
+				rg.resyncKnownRoutes()
+
+				// The route should still exist, since the RouteGenerator's route is still valid. However,
+				// its reference count should be decremented back to one.
+				Expect(rg.client.cache[key]).To(Equal(externalIP1 + "/32"))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(1))
+
+				// Revert the BGPConfiguration change.
+				By("onExternalIPsUpdate to include /32 route again")
+				rg.client.onExternalIPsUpdate([]string{externalIPRangeSingle})
+				rg.resyncKnownRoutes()
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(2))
+
+				// Now, remove both services (since both contribute externalIP). Ensure that the route is still programmed
+				// (via BGPConfiguration), but the ref count should once again drop to 1.
+				By("Deleting svc")
+				rg.onSvcDelete(svc)
+				By("Deleting svc2")
+				rg.onSvcDelete(svc2)
+				Expect(rg.client.cache[key]).To(Equal(externalIP1 + "/32"))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(1))
+
+				// Finally, remove BGPConfiguration. It should withdraw the route
+				// and delete the refcount entry.
+				rg.client.onExternalIPsUpdate([]string{})
+				Expect(rg.client.cache).NotTo(HaveKey(key))
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey(key))
+			})
+
+			// This test simulates a situation where BGPConfiguration has a /32 route that exactly matches
+			// a LoadBalancer with ExternalTrafficPolicy set to Local. The route should only be advertised
+			// when the Service is created, and not when the BGPConfiguration is created.
+			It("should handle /32 routes for LoadBalancerIPs", func() {
+				// BeforeEach creates a service. Remove it before the test, since we want to start
+				// this test without the service in place. svc3 is a LoadBalancer service with external traffic
+				// policy of Local.
+				err := rg.epIndexer.Delete(ep3)
+				Expect(err).NotTo(HaveOccurred())
+				err = rg.svcIndexer.Delete(svc3)
+				Expect(err).NotTo(HaveOccurred())
+
+				// The key we expect to be used for the LB IP.
+				key := "/calico/staticroutes/" + loadBalancerIP1 + "-32"
+
+				// Trigger programming of valid routes from the route generator for any known services.
+				// We don't have a BGPConfiguration update or services yet, so we shouldn't receive any routes.
+				By("Resyncing routes at start of test")
+				rg.resyncKnownRoutes()
+				Expect(rg.client.cache[key]).To(Equal(""))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(0))
+
+				// Simulate an event from the syncer which sets the LoadBalancer IP range containing only the service's loadBalancerIP.
+				// We use a /32 route to trigger the situation under test.
+				loadBalancerIPRangeSingle := fmt.Sprintf("%s/32", loadBalancerIP1)
+				By("onLoadBalancerIPsUpdate to include /32 route")
+				rg.client.onLoadBalancerIPsUpdate([]string{loadBalancerIPRangeSingle})
+				rg.resyncKnownRoutes()
+
+				// No routes should be advertised yet.
+				Expect(rg.client.cache[key]).To(Equal(""))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(0))
+
+				// Now add the service.
+				err = rg.epIndexer.Add(ep3)
+				Expect(err).NotTo(HaveOccurred())
+				err = rg.svcIndexer.Add(svc3)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Expect that we advertise the /32 LB IP from the Service.
+				By("Resyncing routes from route generator")
+				rg.resyncKnownRoutes()
+				Expect(rg.client.cache[key]).To(Equal(loadBalancerIP1 + "/32"))
+				Expect(rg.client.programmedRouteRefCount[key]).To(Equal(1))
+
+				// Finally, remove BGPConfiguration. It should withdraw the route
+				// and delete the refcount entry.
+				rg.client.onLoadBalancerIPsUpdate([]string{})
+				rg.resyncKnownRoutes()
+				Expect(rg.client.cache).NotTo(HaveKey(key))
+				Expect(rg.client.programmedRouteRefCount).NotTo(HaveKey(key))
+			})
 		})
+	})
+})
+
+var _ = Describe("Update BGP Config Cache", func() {
+	c := &client{cache: make(map[string]string)}
+
+	It("should update cache value when IgnoredInterfaces is set in BGPConfiguration", func() {
+		By("No value cached")
+		Expect(c.cache["/calico/bgp/v1/global/ignored_interfaces"]).To(BeEmpty())
+
+		By("After updating")
+		res := &apiv3.BGPConfiguration{
+			Spec: apiv3.BGPConfigurationSpec{
+				IgnoredInterfaces: []string{"iface-1", "iface-2"},
+			},
+		}
+		c.getIgnoredInterfacesKVPair(res, model.GlobalBGPConfigKey{})
+		Expect(c.cache["/calico/bgp/v1/global/ignored_interfaces"]).To(Equal("iface-1,iface-2"))
 	})
 })

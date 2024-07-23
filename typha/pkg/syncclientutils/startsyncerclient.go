@@ -20,7 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/dedupebuffer"
 	"github.com/projectcalico/calico/typha/pkg/discovery"
 	"github.com/projectcalico/calico/typha/pkg/syncclient"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
@@ -39,25 +39,38 @@ func MustStartSyncerClientIfTyphaConfigured(
 	myVersion, myHostname, myInfo string,
 	cbs api.SyncerCallbacks,
 ) bool {
-	typhaAddr, err := discovery.DiscoverTyphaAddrs(
+	discoverer := discovery.New(
 		discovery.WithAddrOverride(typhaConfig.Addr),
 		discovery.WithInClusterKubeClient(), /* defer creation of a client until its needed. */
 		discovery.WithKubeService(typhaConfig.K8sNamespace, typhaConfig.K8sServiceName),
 	)
+	typhaAddrs, err := discoverer.LoadTyphaAddrs()
 	if err != nil {
 		log.WithError(err).Fatal("Typha discovery enabled but discovery failed.")
 	}
-	if len(typhaAddr) == 0 {
+	if !discoverer.TyphaEnabled() {
 		log.Debug("Typha is not configured")
 		return false
 	}
 
+	var dedupeBuf *dedupebuffer.DedupeBuffer
+	if db, ok := cbs.(*dedupebuffer.DedupeBuffer); ok {
+		log.Debug("Callback is already a dedupe buffer.")
+		dedupeBuf = db
+	} else {
+		// Include a de-duplicating buffer to avoid putting backpressure on the
+		// Typha client.
+		log.Debug("Inserting dedupe buffer ahead of callbacks.")
+		dedupeBuf = dedupebuffer.New()
+		go dedupeBuf.SendToSinkForever(cbs)
+	}
+
 	// Use a remote Syncer, via the Typha server.
-	log.WithField("addr", typhaAddr).Info("Connecting to Typha.")
+	log.WithField("addr", typhaAddrs).Info("Connecting to Typha.")
 	typhaConnection := syncclient.New(
-		typhaAddr,
+		discoverer,
 		myVersion, myHostname, myInfo,
-		cbs,
+		dedupeBuf,
 		&syncclient.Options{
 			SyncerType:   syncerType,
 			ReadTimeout:  typhaConfig.ReadTimeout,

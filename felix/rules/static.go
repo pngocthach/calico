@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
+	"github.com/projectcalico/calico/felix/iptables"
 	. "github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -205,6 +206,46 @@ func (r *DefaultRuleRenderer) StaticFilterOutputForwardEndpointMarkChain() *Chai
 	}
 }
 
+func FilterInputChainAllowWG(ipVersion uint8, r Config, allowAction iptables.Action) []Rule {
+	var inputRules []Rule
+
+	if ipVersion == 4 && r.WireguardEnabled {
+		// When Wireguard is enabled, auto-allow Wireguard traffic from other nodes.  Without this,
+		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
+		// connectivity problems.
+		inputRules = append(inputRules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.WireguardListeningPort)).
+					DestAddrType(AddrTypeLocal),
+				Action:  allowAction,
+				Comment: []string{"Allow incoming IPv4 Wireguard packets"},
+			},
+			// Note that we do not need a drop rule for Wireguard because it already has the peering and allowed IPs
+			// baked into the crypto routing table.
+		)
+	}
+
+	if ipVersion == 6 && r.WireguardEnabledV6 {
+		// When Wireguard is enabled, auto-allow Wireguard traffic from other nodes.  Without this,
+		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
+		// connectivity problems.
+		inputRules = append(inputRules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.WireguardListeningPortV6)).
+					DestAddrType(AddrTypeLocal),
+				Action:  allowAction,
+				Comment: []string{"Allow incoming IPv6 Wireguard packets"},
+			},
+			// Note that we do not need a drop rule for Wireguard because it already has the peering and allowed IPs
+			// baked into the crypto routing table.
+		)
+	}
+
+	return inputRules
+}
+
 func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 	var inputRules []Rule
 
@@ -222,14 +263,14 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 			},
 			Rule{
 				Match:   Match().ProtocolNum(ProtoIPIP),
-				Action:  DropAction{},
-				Comment: []string{"Drop IPIP packets from non-Calico hosts"},
+				Action:  r.IptablesFilterDenyAction(),
+				Comment: []string{fmt.Sprintf("%s IPIP packets from non-Calico hosts", r.IptablesFilterDenyAction())},
 			},
 		)
 	}
 
 	if ipVersion == 4 && r.VXLANEnabled {
-		// VXLAN is enabled, filter incoming VXLAN packets that match our VXLAN port to ensure they
+		// IPv4 VXLAN is enabled, filter incoming VXLAN packets that match our VXLAN port to ensure they
 		// come from a recognised host and are going to a local address on the host.
 		inputRules = append(inputRules,
 			Rule{
@@ -238,20 +279,41 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 					SourceIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllVXLANSourceNets)).
 					DestAddrType(AddrTypeLocal),
 				Action:  r.filterAllowAction,
-				Comment: []string{"Allow VXLAN packets from whitelisted hosts"},
+				Comment: []string{"Allow IPv4 VXLAN packets from allowed hosts"},
 			},
 			Rule{
 				Match: Match().ProtocolNum(ProtoUDP).
 					DestPorts(uint16(r.Config.VXLANPort)).
 					DestAddrType(AddrTypeLocal),
 				Action:  DropAction{},
-				Comment: []string{"Drop VXLAN packets from non-whitelisted hosts"},
+				Comment: []string{"Drop IPv4 VXLAN packets from non-allowed hosts"},
 			},
 		)
 	}
 
-	// Note that we do not need to do this filtering for wireguard because it already has the peering and allowed IPs
-	// baked into the crypto routing table.
+	if ipVersion == 6 && r.VXLANEnabledV6 {
+		// IPv6 VXLAN is enabled, filter incoming VXLAN packets that match our VXLAN port to ensure they
+		// come from a recognised host and are going to a local address on the host.
+		inputRules = append(inputRules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.Config.VXLANPort)).
+					SourceIPSet(r.IPSetConfigV6.NameForMainIPSet(IPSetIDAllVXLANSourceNets)).
+					DestAddrType(AddrTypeLocal),
+				Action:  r.filterAllowAction,
+				Comment: []string{"Allow IPv6 VXLAN packets from allowed hosts"},
+			},
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.Config.VXLANPort)).
+					DestAddrType(AddrTypeLocal),
+				Action:  r.IptablesFilterDenyAction(),
+				Comment: []string{fmt.Sprintf("%s IPv6 VXLAN packets from non-allowed hosts", r.IptablesFilterDenyAction())},
+			},
+		)
+	}
+
+	inputRules = append(inputRules, FilterInputChainAllowWG(ipVersion, r.Config, r.filterAllowAction)...)
 
 	if r.KubeIPVSSupportEnabled {
 		// Check if packet belongs to forwarded traffic. (e.g. part of an ipvs connection).
@@ -306,10 +368,10 @@ func (r *DefaultRuleRenderer) filterInputChain(ipVersion uint8) *Chain {
 	}
 }
 
-func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain {
+func ICMPv6Filter(action iptables.Action) []Rule {
 	var rules []Rule
 
-	// For IPv6, we need to white-list certain ICMP traffic from workloads in order to to act
+	// For IPv6, we need to allow certain ICMP traffic from workloads in order to act
 	// as a router.  Note: we do this before the policy chains, so we're bypassing the egress
 	// rules for this traffic.  While that might be unexpected, it makes sure that the user
 	// doesn't cut off their own connectivity in subtle ways that they shouldn't have to worry
@@ -323,15 +385,23 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 	//        unsolicited router advertisement.
 	// - 135: neighbor solicitation.
 	// - 136: neighbor advertisement.
+	for _, icmpType := range []uint8{130, 131, 132, 133, 135, 136} {
+		rules = append(rules, Rule{
+			Match: Match().
+				ProtocolNum(ProtoICMPv6).
+				ICMPV6Type(icmpType),
+			Action: action,
+		})
+	}
+
+	return rules
+}
+
+func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain {
+	var rules []Rule
+
 	if ipVersion == 6 {
-		for _, icmpType := range []uint8{130, 131, 132, 133, 135, 136} {
-			rules = append(rules, Rule{
-				Match: Match().
-					ProtocolNum(ProtoICMPv6).
-					ICMPV6Type(icmpType),
-				Action: r.filterAllowAction,
-			})
-		}
+		rules = ICMPv6Filter(r.filterAllowAction)
 	}
 
 	if r.OpenStackSpecialCasesEnabled {
@@ -342,7 +412,7 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 			// TODO(smc) Long-term, it'd be nice if the OpenStack plugin programmed a policy to
 			// do this instead.
 			log.WithField("ip", r.OpenStackMetadataIP).Info(
-				"OpenStack metadata IP specified, installing whitelist rule.")
+				"OpenStack metadata IP specified, installing special-case rule.")
 			rules = append(rules, Rule{
 				Match: Match().
 					Protocol("tcp").
@@ -352,7 +422,7 @@ func (r *DefaultRuleRenderer) filterWorkloadToHostChain(ipVersion uint8) *Chain 
 			})
 		}
 
-		// Again, for OpenStack compatibility, white-list certain protocols.
+		// Again, for OpenStack compatibility, allow certain protocols.
 		// TODO(smc) Long-term, it'd be nice if the OpenStack plugin programmed a policy to
 		// do this instead.
 		dhcpSrcPort := uint16(68)
@@ -423,13 +493,15 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 					Protocol(protoPort.Protocol).
 					DestPorts(protoPort.Port).
 					SourceNet(protoPort.Net)
+			} else {
+				continue // don't add the rule
 			}
 		}
 		rules = append(rules, rule)
 	}
 
 	if table == "raw" {
-		// We're in the raw table, before conntrack, so we need to whitelist response traffic.
+		// We're in the raw table, before conntrack, so we need to allow response traffic.
 		// Otherwise, it could fall through to some doNotTrack policy and half of the connection
 		// would get untracked.  If we ACCEPT here then the traffic falls through to the filter
 		// table, where it'll only be accepted if there's a conntrack entry.
@@ -452,6 +524,8 @@ func (r *DefaultRuleRenderer) failsafeInChain(table string, ipVersion uint8) *Ch
 						Protocol(protoPort.Protocol).
 						SourcePorts(protoPort.Port).
 						SourceNet(protoPort.Net)
+				} else {
+					continue // don't add the rule
 				}
 			}
 			rules = append(rules, rule)
@@ -486,13 +560,15 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 					Protocol(protoPort.Protocol).
 					DestPorts(protoPort.Port).
 					DestNet(protoPort.Net)
+			} else {
+				continue // don't add the rule
 			}
 		}
 		rules = append(rules, rule)
 	}
 
 	if table == "raw" {
-		// We're in the raw table, before conntrack, so we need to whitelist response traffic.
+		// We're in the raw table, before conntrack, so we need to allow response traffic.
 		// Otherwise, it could fall through to some doNotTrack policy and half of the connection
 		// would get untracked.  If we ACCEPT here then the traffic falls through to the filter
 		// table, where it'll only be accepted if there's a conntrack entry.
@@ -514,7 +590,9 @@ func (r *DefaultRuleRenderer) failsafeOutChain(table string, ipVersion uint8) *C
 					rule.Match = Match().
 						Protocol(protoPort.Protocol).
 						SourcePorts(protoPort.Port).
-						SourceNet(protoPort.Net)
+						DestNet(protoPort.Net)
+				} else {
+					continue // don't add the rule
 				}
 			}
 			rules = append(rules, rule)
@@ -683,7 +761,7 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 	}
 
 	if ipVersion == 4 && r.VXLANEnabled {
-		// When VXLAN is enabled, auto-allow VXLAN traffic to other Calico nodes.  Without this,
+		// When IPv4 VXLAN is enabled, auto-allow VXLAN traffic to other Calico nodes.  Without this,
 		// it's too easy to make a host policy that blocks VXLAN traffic, resulting in very confusing
 		// connectivity problems.
 		rules = append(rules,
@@ -693,14 +771,60 @@ func (r *DefaultRuleRenderer) filterOutputChain(ipVersion uint8) *Chain {
 					SrcAddrType(AddrTypeLocal, false).
 					DestIPSet(r.IPSetConfigV4.NameForMainIPSet(IPSetIDAllVXLANSourceNets)),
 				Action:  r.filterAllowAction,
-				Comment: []string{"Allow VXLAN packets to other whitelisted hosts"},
+				Comment: []string{"Allow IPv4 VXLAN packets to other allowed hosts"},
 			},
 		)
 	}
 
-	// TODO(rlb): For wireguard, we add the destination port to the failsafes. We may want to revisit this so that we
-	// only include nodes that support wireguard. This will tie in with whether or not we want to include external
-	// wireguard destinations.
+	if ipVersion == 6 && r.VXLANEnabledV6 {
+		// When IPv6 VXLAN is enabled, auto-allow VXLAN traffic to other Calico nodes.  Without this,
+		// it's too easy to make a host policy that blocks VXLAN traffic, resulting in very confusing
+		// connectivity problems.
+		rules = append(rules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.Config.VXLANPort)).
+					SrcAddrType(AddrTypeLocal, false).
+					DestIPSet(r.IPSetConfigV6.NameForMainIPSet(IPSetIDAllVXLANSourceNets)),
+				Action:  r.filterAllowAction,
+				Comment: []string{"Allow IPv6 VXLAN packets to other allowed hosts"},
+			},
+		)
+	}
+
+	if ipVersion == 4 && r.WireguardEnabled {
+		// When Wireguard is enabled, auto-allow Wireguard traffic to other Calico nodes.  Without this,
+		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
+		// connectivity problems.
+		rules = append(rules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.Config.WireguardListeningPort)).
+					// Note that we do not need to limit the destination hosts to Calico nodes because allowed peers are
+					// programmed separately
+					SrcAddrType(AddrTypeLocal, false),
+				Action:  r.filterAllowAction,
+				Comment: []string{"Allow outgoing IPv4 Wireguard packets"},
+			},
+		)
+	}
+
+	if ipVersion == 6 && r.WireguardEnabledV6 {
+		// When Wireguard is enabled, auto-allow Wireguard traffic to other Calico nodes.  Without this,
+		// it's too easy to make a host policy that blocks Wireguard traffic, resulting in very confusing
+		// connectivity problems.
+		rules = append(rules,
+			Rule{
+				Match: Match().ProtocolNum(ProtoUDP).
+					DestPorts(uint16(r.Config.WireguardListeningPortV6)).
+					// Note that we do not need to limit the destination hosts to Calico nodes because allowed peers are
+					// programmed separately
+					SrcAddrType(AddrTypeLocal, false),
+				Action:  r.filterAllowAction,
+				Comment: []string{"Allow outgoing IPv6 Wireguard packets"},
+			},
+		)
+	}
 
 	// Apply host endpoint policy to traffic that has not been DNAT'd.  In the DNAT case we
 	// can't correctly apply policy here because the packet's OIF is still the OIF from a
@@ -793,10 +917,18 @@ func (r *DefaultRuleRenderer) StaticNATPostroutingChains(ipVersion uint8) []*Cha
 	if ipVersion == 4 && r.VXLANEnabled && len(r.VXLANTunnelAddress) > 0 {
 		tunnelIfaces = append(tunnelIfaces, "vxlan.calico")
 	}
+	if ipVersion == 6 && r.VXLANEnabledV6 && len(r.VXLANTunnelAddressV6) > 0 {
+		tunnelIfaces = append(tunnelIfaces, "vxlan-v6.calico")
+	}
 	if ipVersion == 4 && r.WireguardEnabled && len(r.WireguardInterfaceName) > 0 {
 		// Wireguard is assigned an IP dynamically and without restarting Felix. Just add the interface if we have
 		// wireguard enabled.
 		tunnelIfaces = append(tunnelIfaces, r.WireguardInterfaceName)
+	}
+	if ipVersion == 6 && r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0 {
+		// Wireguard is assigned an IP dynamically and without restarting Felix. Just add the interface if we have
+		// wireguard enabled.
+		tunnelIfaces = append(tunnelIfaces, r.WireguardInterfaceNameV6)
 	}
 
 	for _, tunnel := range tunnelIfaces {
@@ -999,61 +1131,36 @@ func (r *DefaultRuleRenderer) StaticRawTableChains(ipVersion uint8) []*Chain {
 }
 
 func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
-	wgEncryptHost, bypassHostConntrack, enforceRPF bool) []*Chain {
+	wgEncryptHost, bypassHostConntrack bool) []*Chain {
 
-	var rawRules, rpfRules []Rule
+	var rawRules []Rule
 
-	if enforceRPF {
+	if ((r.WireguardEnabled && len(r.WireguardInterfaceName) > 0) || (r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0)) && wgEncryptHost {
+		// Set a mark on packets coming from any interface except for lo, wireguard, or pod veths to ensure the RPF
+		// check allows it.
+		log.Debug("Adding Wireguard iptables rule chain")
 		rawRules = append(rawRules, Rule{
-			Action: JumpAction{Target: RPFChain},
+			Match:  nil,
+			Action: JumpAction{Target: ChainSetWireguardIncomingMark},
 		})
-
-		// Do not RPF check what is marked as to be skipped by RPF check.
-		rpfRules = []Rule{
-			{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenBypassSkipRPF, tcdefs.MarkSeenBypassSkipRPFMask),
-				Action:  ReturnAction{},
-				Comment: []string{"Skip RPF if requested"},
-			},
-			{
-				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenBypassForward, tcdefs.MarkSeenBypassForwardMask),
-				Action:  ReturnAction{},
-				Comment: []string{"Skip RPF on packets returning from tunnel to the client"},
-			},
-		}
-
-		// For anything we approved for forward, permit accept_local as it is
-		// traffic encapped for NodePort, ICMP replies etc. - stuff we trust.
-		rpfRules = append(rpfRules, Rule{
-			Match:  Match().MarkMatchesWithMask(tcdefs.MarkSeenBypassForward, tcdefs.MarksMask).RPFCheckPassed(true),
-			Action: ReturnAction{},
-		})
-
-		// Do the full RPF check and dis-allow accept_local for anything else.
-		rpfRules = append(rpfRules, RPFilter(ipVersion, tcdefs.MarkSeen, tcdefs.MarkSeenMask,
-			r.OpenStackSpecialCasesEnabled, false)...)
-
-		if r.WireguardEnabled && len(r.WireguardInterfaceName) > 0 && wgEncryptHost {
-			// Set a mark on packets coming from any interface except for lo, wireguard, or pod veths to ensure the RPF
-			// check allows it.
-			log.Debug("Adding Wireguard iptables rule chain")
-			rawRules = append(rawRules, Rule{
-				Match:  nil,
-				Action: JumpAction{Target: ChainSetWireguardIncomingMark},
-			})
-		}
 	}
 
 	rawRules = append(rawRules,
-		Rule{
-			Match:  Match().NotDestAddrType(AddrTypeLocal),
-			Action: GotoAction{Target: ChainRawUntrackedFlows},
-		},
 		Rule{
 			// Return, i.e. no-op, if bypass mark is not set.
 			Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenBypass, 0xffffffff),
 			Action:  GotoAction{Target: ChainRawBPFUntrackedPolicy},
 			Comment: []string{"Jump to target for packets with Bypass mark"},
+		},
+		Rule{
+			Match:   Match().DestAddrType(AddrTypeLocal),
+			Action:  SetMaskedMarkAction{Mark: tcdefs.MarkSeenSkipFIB, Mask: tcdefs.MarkSeenSkipFIB},
+			Comment: []string{"Mark traffic towards the host - it is TRACKed"},
+		},
+		Rule{
+			Match:   Match().NotDestAddrType(AddrTypeLocal),
+			Action:  GotoAction{Target: ChainRawUntrackedFlows},
+			Comment: []string{"Check if forwarded traffic needs to be TRACKed"},
 		},
 	)
 
@@ -1062,43 +1169,54 @@ func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
 		Rules: rawRules,
 	}
 
+	// BPF Untracked Flow Rules:
+	var bpfUntrackedFlowRules []Rule
+	if bypassHostConntrack {
+		// Iterate all BPF interfaces forced to track packets and append rule.
+		for _, interfaceName := range r.BPFForceTrackPacketsFromIfaces {
+			if len(interfaceName) > 0 {
+				bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
+					Rule{
+						Match:   Match().InInterface(interfaceName),
+						Action:  ReturnAction{},
+						Comment: []string{"Track interface " + interfaceName},
+					},
+				)
+			}
+		}
+
+		bpfUntrackedFlowRules = append(bpfUntrackedFlowRules,
+			Rule{
+				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenSkipFIB, tcdefs.MarkSeenSkipFIB),
+				Action:  ReturnAction{},
+				Comment: []string{"MarkSeenSkipFIB Mark"},
+			},
+			Rule{
+				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenFallThrough, tcdefs.MarkSeenFallThroughMask),
+				Action:  ReturnAction{},
+				Comment: []string{"MarkSeenFallThrough Mark"},
+			},
+			Rule{
+				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
+				Action:  ReturnAction{},
+				Comment: []string{"MarkSeenMASQ Mark"},
+			},
+			Rule{
+				Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenNATOutgoing, tcdefs.MarkSeenNATOutgoingMask),
+				Action:  ReturnAction{},
+				Comment: []string{"MarkSeenNATOutgoing Mark"},
+			},
+			Rule{
+				Action: NoTrackAction{},
+			},
+		)
+	}
 	bpfUntrackedFlowChain := &Chain{
 		Name:  ChainRawUntrackedFlows,
-		Rules: []Rule{},
+		Rules: bpfUntrackedFlowRules,
 	}
 
-	if bypassHostConntrack {
-		bpfUntrackedFlowChain = &Chain{
-			Name: ChainRawUntrackedFlows,
-			Rules: []Rule{
-				Rule{
-					Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenSkipFIB, tcdefs.MarkSeenSkipFIB),
-					Action:  ReturnAction{},
-					Comment: []string{"MarkSeenSkipFIB Mark"},
-				},
-				Rule{
-					Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenFallThrough, tcdefs.MarkSeenFallThroughMask),
-					Action:  ReturnAction{},
-					Comment: []string{"MarkSeenFallThrough Mark"},
-				},
-				Rule{
-					Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenMASQ, tcdefs.MarkSeenMASQMask),
-					Action:  ReturnAction{},
-					Comment: []string{"MarkSeenMASQ Mark"},
-				},
-				Rule{
-					Match:   Match().MarkMatchesWithMask(tcdefs.MarkSeenNATOutgoing, tcdefs.MarkSeenNATOutgoingMask),
-					Action:  ReturnAction{},
-					Comment: []string{"MarkSeenNATOutgoing Mark"},
-				},
-				Rule{
-					Action: NoTrackAction{},
-				},
-			},
-		}
-	}
-
-	xdpUntrakedPoliciesChain := &Chain{
+	xdpUntrackedPoliciesChain := &Chain{
 		Name: ChainRawBPFUntrackedPolicy,
 		Rules: []Rule{
 			// At this point we know bypass mark is set, which means that the packet has
@@ -1123,23 +1241,14 @@ func (r *DefaultRuleRenderer) StaticBPFModeRawChains(ipVersion uint8,
 
 	chains := []*Chain{
 		rawPreroutingChain,
-		xdpUntrakedPoliciesChain,
+		xdpUntrackedPoliciesChain,
 		bpfUntrackedFlowChain,
 		r.failsafeOutChain("raw", ipVersion),
 		r.WireguardIncomingMarkChain(),
 	}
 
-	if enforceRPF {
-		chains = append(chains, &Chain{
-			Name:  RPFChain,
-			Rules: rpfRules,
-		})
-	}
-
-	if ipVersion == 4 {
-		chains = append(chains,
-			r.StaticRawOutputChain(tcdefs.MarkSeenBypass))
-	}
+	chains = append(chains,
+		r.StaticRawOutputChain(tcdefs.MarkSeenBypass))
 
 	return chains
 }
@@ -1154,7 +1263,7 @@ func (r *DefaultRuleRenderer) StaticRawPreroutingChain(ipVersion uint8) *Chain {
 	)
 
 	// Set a mark on encapsulated packets coming from WireGuard to ensure the RPF check allows it
-	if ipVersion == 4 && r.WireguardEnabled && len(r.WireguardInterfaceName) > 0 && r.Config.WireguardEncryptHostTraffic {
+	if ((r.WireguardEnabled && len(r.WireguardInterfaceName) > 0) || (r.WireguardEnabledV6 && len(r.WireguardInterfaceNameV6) > 0)) && r.Config.WireguardEncryptHostTraffic {
 		log.Debug("Adding Wireguard iptables rule")
 		rules = append(rules, Rule{
 			Match:  nil,
@@ -1183,7 +1292,7 @@ func (r *DefaultRuleRenderer) StaticRawPreroutingChain(ipVersion uint8) *Chain {
 	// usually spoof but privileged containers and VMs can.
 	//
 	rules = append(rules,
-		RPFilter(ipVersion, markFromWorkload, markFromWorkload, r.OpenStackSpecialCasesEnabled, false)...)
+		RPFilter(ipVersion, markFromWorkload, markFromWorkload, r.OpenStackSpecialCasesEnabled, false, r.IptablesFilterDenyAction())...)
 
 	rules = append(rules,
 		// Send non-workload traffic to the untracked policy chains.
@@ -1203,7 +1312,7 @@ func (r *DefaultRuleRenderer) StaticRawPreroutingChain(ipVersion uint8) *Chain {
 }
 
 // RPFilter returns rules that implement RPF
-func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, acceptLocal bool) []Rule {
+func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, acceptLocal bool, dropActionOverride Action) []Rule {
 	rules := make([]Rule, 0, 2)
 
 	// For OpenStack, allow DHCP v4 packets with source 0.0.0.0.  These must be allowed before
@@ -1240,7 +1349,7 @@ func RPFilter(ipVersion uint8, mark, mask uint32, openStackSpecialCasesEnabled, 
 
 	rules = append(rules, Rule{
 		Match:  Match().MarkMatchesWithMask(mark, mask).RPFCheckFailed(acceptLocal),
-		Action: DropAction{},
+		Action: dropActionOverride,
 	})
 
 	return rules
@@ -1261,6 +1370,10 @@ func (r *DefaultRuleRenderer) WireguardIncomingMarkChain() *Chain {
 		},
 		{
 			Match:  Match().InInterface(r.WireguardInterfaceName),
+			Action: ReturnAction{},
+		},
+		{
+			Match:  Match().InInterface(r.WireguardInterfaceNameV6),
 			Action: ReturnAction{},
 		},
 	}

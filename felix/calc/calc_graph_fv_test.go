@@ -69,9 +69,11 @@ var baseTests = []StateList{
 
 	// Tests of policy ordering.  Each state has one tier but we shuffle
 	// the order of the policies within it.
-	{localEp1WithOneTierPolicy123,
+	{
+		localEp1WithOneTierPolicy123,
 		localEp1WithOneTierPolicy321,
-		localEp1WithOneTierPolicyAlpha},
+		localEp1WithOneTierPolicyAlpha,
+	},
 
 	// Test mutating the profile list of some endpoints.
 	{localEpsWithNonMatchingProfile, localEpsWithProfile},
@@ -80,12 +82,14 @@ var baseTests = []StateList{
 	{hostEp1WithPolicy, hostEp2WithPolicy, hostEp1WithIngressPolicy, hostEp1WithEgressPolicy},
 
 	// Network set tests.
-	{hostEp1WithPolicy,
+	{
+		hostEp1WithPolicy,
 		hostEp1WithPolicyAndANetworkSet,
 		hostEp1WithPolicyAndANetworkSetMatchingBEqB,
 		hostEp2WithPolicy,
 		hostEp1WithPolicyAndANetworkSet,
-		hostEp1WithPolicyAndTwoNetworkSets},
+		hostEp1WithPolicyAndTwoNetworkSets,
+	},
 
 	// Untracked policy on its own.
 	{hostEp1WithUntrackedPolicy},
@@ -102,7 +106,7 @@ var baseTests = []StateList{
 	// foo="".
 	{withProfileTagInherit, localEpsWithTagInheritProfile},
 	// But if there's an explicit label, it overrides the tag.
-	{localEpsWithTagOverriddenProfile, withProfileTagOverriden},
+	{localEpsWithTagOverriddenProfile, withProfileTagOverridden},
 
 	// Named ports. Simple cases.
 	{localEp1WithNamedPortPolicy},
@@ -140,7 +144,8 @@ var baseTests = []StateList{
 		// Then change inherited label on EP2 to stop the match.
 		localEpsAndNamedPortPolicyNoLongerMatchingInheritedLabelOnEP2,
 		// Ditto for EP1.  Now matches none of the EPs.
-		localEpsAndNamedPortPolicyNoLongerMatchingInheritedLabelOnEP1},
+		localEpsAndNamedPortPolicyNoLongerMatchingInheritedLabelOnEP1,
+	},
 	// This scenario introduces ports with duplicate names.
 	{
 		// Start with endpoints and policy.
@@ -164,9 +169,11 @@ var baseTests = []StateList{
 
 	// Repro of a particular named port index update failure case.  The inherited profile was
 	// improperly cleaned up, so, when it was added back in again we ended up with multiple copies.
-	{localEpsWithTagInheritProfile,
+	{
+		localEpsWithTagInheritProfile,
 		localEp1WithPolicy,
-		localEpsWithProfile},
+		localEpsWithProfile,
+	},
 
 	// A long, fairly random sequence of updates.
 	{
@@ -215,7 +222,8 @@ var baseTests = []StateList{
 	},
 
 	// And another.
-	{localEpsWithProfile,
+	{
+		localEpsWithProfile,
 		localEp1WithOneTierPolicy123,
 		localEpsWithNonMatchingProfile,
 		localEpsWithTagInheritProfile,
@@ -242,6 +250,18 @@ var baseTests = []StateList{
 		withServiceAccountPolicy,
 		withHttpMethodPolicy,
 		withNonALPPolicy,
+	},
+
+	// Always programmed policies.
+	{
+		withPolicyAlways,
+		localEp1WithPolicyAlways,
+	},
+	{
+		withPolicy,
+		localEp1WithPolicyAlways,
+		withPolicyAlways,
+		localEp1WithPolicyOnDemand,
 	},
 
 	// VXLAN tests.
@@ -394,9 +414,33 @@ var baseTests = []StateList{
 		endpointSliceActive,
 	},
 	{
+		// Service NetworkPolicy test updating endpoint slices.
+		endpointSliceActiveNewIPs,
+		endpointSliceActiveNewIPs2,
+		endpointSliceActiveNewIPs,
+	},
+	{
+		// Service NetworkPolicy test overlapping two endpoint slices with same IPs.
+		endpointSliceActiveNewIPs,
+		endpointSliceOverlap,
+		endpointSlice2OnlyActiveNewIPs2,
+	},
+	{
 		encapWithIPIPPool,
 		encapWithVXLANPool,
 		encapWithIPIPAndVXLANPool,
+	},
+	{
+		endpointSliceActiveSpecNoPorts,
+	},
+	{
+		// This case repros an aliasing bug where having an ingress rule and an egress rule for the
+		// same selector resulted in collision at cleanup time.
+		endpointSliceActiveSpecNoPorts,
+		endpointSliceActiveSpecPortsAndNoPorts,
+		endpointSliceActiveSpecNoPorts,
+		endpointSliceActiveSpecPortsAndNoPorts,
+		endpointSliceActiveNewIPs,
 	},
 
 	// IPv6 VXLAN tests.
@@ -481,6 +525,11 @@ var baseTests = []StateList{
 
 		vxlanV4V6WithV6MAC,
 		vxlanV4V6WithBlock,
+	},
+	{
+		wireguardV4,
+		wireguardV6,
+		wireguardV4V6,
 	},
 }
 
@@ -577,7 +626,7 @@ var _ = Describe("Async calculation graph state sequencing tests:", func() {
 					conf.SetUseNodeResourceUpdates(test.UsesNodeResources())
 					conf.RouteSource = test.RouteSource()
 					outputChan := make(chan interface{})
-					conf.Encapsulation = config.Encapsulation{VXLANEnabled: true}
+					conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
 					asyncGraph := NewAsyncCalcGraph(conf, []chan<- interface{}{outputChan}, nil)
 					// And a validation filter, with a channel between it
 					// and the async graph.
@@ -660,6 +709,15 @@ func expectCorrectDataplaneState(mockDataplane *mock.MockDataplane, state State)
 	Expect(mockDataplane.ActiveVTEPs()).To(Equal(state.ExpectedVTEPs),
 		"Active VTEPs were incorrect after moving to state: %v",
 		state.Name)
+	Expect(mockDataplane.ActiveWireguardEndpoints()).To(Equal(state.ExpectedWireguardEndpoints),
+		"Active IPv4 Wireguard Endpoints were incorrect after moving to state: %v",
+		state.Name)
+	Expect(mockDataplane.ActiveWireguardV6Endpoints()).To(Equal(state.ExpectedWireguardV6Endpoints),
+		"Active IPv6 Wireguard Endpoints were incorrect after moving to state: %v",
+		state.Name)
+	Expect(mockDataplane.ActiveHostMetadataV4V6()).To(Equal(state.ExpectedHostMetadataV4V6),
+		"Active Host MetadataV4V6 were incorrect after moving to state: %v",
+		state.Name)
 	// Comparing stringified versions of the routes here so that, on failure, we get much more readable output.
 	Expect(stringifyRoutes(mockDataplane.ActiveRoutes())).To(Equal(stringifyRoutes(state.ExpectedRoutes)),
 		"Active routes were incorrect after moving to state: %v",
@@ -684,9 +742,9 @@ func expectCorrectDataplaneState(mockDataplane *mock.MockDataplane, state State)
 		state.Name)
 }
 
-func stringifyRoutes(routes set.Set) []string {
+func stringifyRoutes(routes set.Set[proto.RouteUpdate]) []string {
 	out := make([]string, 0, routes.Len())
-	routes.Iter(func(item interface{}) error {
+	routes.Iter(func(item proto.RouteUpdate) error {
 		out = append(out, fmt.Sprintf("%+v", item))
 		return nil
 	})
@@ -722,19 +780,24 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 		mockDataplane = mock.NewMockDataplane()
 		eventBuf = NewEventSequencer(mockDataplane)
 		eventBuf.Callback = mockDataplane.OnEvent
-		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true}
-		calcGraph = NewCalculationGraph(eventBuf, conf)
+		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
+		calcGraph = NewCalculationGraph(eventBuf, conf, func() {})
 		statsCollector := NewStatsCollector(func(stats StatsUpdate) error {
 			log.WithField("stats", stats).Info("Stats update")
 			lastStats = stats
 			return nil
 		})
 		statsCollector.RegisterWith(calcGraph)
-		validationFilter = NewValidationFilter(calcGraph.AllUpdDispatcher, conf)
+		validationFilter = NewValidationFilter(calcGraph, conf)
 		sentInSync = false
 		lastState = empty
 		state = empty
 	})
+
+	flush := func() {
+		calcGraph.Flush()
+		eventBuf.Flush()
+	}
 
 	// iterStates iterates through the states in turn,
 	// executing the expectation function after each
@@ -754,11 +817,11 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 							validationFilter.OnStatusUpdated(api.InSync)
 							sentInSync = true
 						}
-						eventBuf.Flush()
+						flush()
 					}
 					if flushStrategy == afterEachKVAndDupe {
 						validationFilter.OnUpdates([]api.Update{kv})
-						eventBuf.Flush()
+						flush()
 					}
 				}
 				_, _ = fmt.Fprintln(GinkgoWriter, "       -- <<FLUSH>>")
@@ -767,7 +830,7 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 						validationFilter.OnStatusUpdated(api.InSync)
 						sentInSync = true
 					}
-					eventBuf.Flush()
+					flush()
 				}
 				if flushStrategy == afterEachState ||
 					flushStrategy == afterEachKV ||
@@ -778,7 +841,7 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 			}
 			if flushStrategy == atEnd {
 				validationFilter.OnStatusUpdated(api.InSync)
-				eventBuf.Flush()
+				flush()
 				expectation()
 			}
 		}
@@ -804,14 +867,13 @@ func doStateSequenceTest(expandedTest StateList, flushStrategy flushStrategy) {
 }
 
 var _ = Describe("calc graph with health state", func() {
-
 	It("should be constructable", func() {
 		// Create the calculation graph.
 		conf := config.New()
 		conf.FelixHostname = localHostname
 		outputChan := make(chan interface{})
 		healthAggregator := health.NewHealthAggregator()
-		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true}
+		conf.Encapsulation = config.Encapsulation{VXLANEnabled: true, VXLANEnabledV6: true}
 		asyncGraph := NewAsyncCalcGraph(conf, []chan<- interface{}{outputChan}, healthAggregator)
 		Expect(asyncGraph).NotTo(BeNil())
 	})

@@ -23,6 +23,8 @@ from __future__ import print_function
 
 import logging
 import os
+import shutil
+import subprocess
 import unittest
 
 import eventlet
@@ -35,25 +37,35 @@ from networking_calico import etcdv3
 
 _log = logging.getLogger(__name__)
 
-ETCD_IMAGE = "quay.io/coreos/etcd:v3.3.11"
-
 
 class TestFVEtcdutils(unittest.TestCase):
     def setUp(self):
         super(TestFVEtcdutils, self).setUp()
         self.etcd_server_running = False
-        os.system("docker pull " + ETCD_IMAGE)
+        self.normal_api_paths = etcdv3._possible_etcd_api_paths
+
+        # Add in an invalid API path so as to make sure to test the failure
+        # handling logic even when most installations support '/v3/'.
+        etcdv3._possible_etcd_api_paths = ['/invalid/'] + self.normal_api_paths
 
     def tearDown(self):
+        # Restore normal etcd API paths in case they are relevant to other test
+        # files.  (In practice I don't think they are; this is the only test
+        # file that connects to a real etcd server.)
+        etcdv3._possible_etcd_api_paths = self.normal_api_paths
+
         self.stop_etcd_server()
         etcdv3._client = None
         super(TestFVEtcdutils, self).tearDown()
 
     def start_etcd_server(self):
-        os.system("docker run -d --rm --net=host --name etcd" +
-                  " " + ETCD_IMAGE + " etcd" +
-                  " --advertise-client-urls http://127.0.0.1:2379" +
-                  " --listen-client-urls http://0.0.0.0:2379")
+        shutil.rmtree(".default.etcd", ignore_errors=True)
+        shutil.rmtree("default.etcd", ignore_errors=True)
+        self.etcd = subprocess.Popen([
+            "/usr/local/bin/etcd",
+            "--advertise-client-urls", "http://127.0.0.1:2379",
+            "--listen-client-urls", "http://0.0.0.0:2379"
+        ])
         self.etcd_server_running = True
 
     def wait_etcd_ready(self):
@@ -61,6 +73,7 @@ class TestFVEtcdutils(unittest.TestCase):
         ready = False
         for ii in range(10):
             try:
+                _log.warning("Try connecting to etcd server...")
                 etcdv3.get_status()
                 ready = True
                 break
@@ -71,7 +84,8 @@ class TestFVEtcdutils(unittest.TestCase):
 
     def stop_etcd_server(self):
         if self.etcd_server_running:
-            os.system("docker kill etcd")
+            self.etcd.kill()
+            self.etcd.wait()
         self.etcd_server_running = False
 
     def test_must_update(self):

@@ -17,6 +17,7 @@ package calc
 import (
 	"reflect"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/dispatcher"
@@ -40,8 +41,8 @@ type FelixSender interface {
 }
 
 type PolicyMatchListener interface {
-	OnPolicyMatch(policyKey model.PolicyKey, endpointKey interface{})
-	OnPolicyMatchStopped(policyKey model.PolicyKey, endpointKey interface{})
+	OnPolicyMatch(policyKey model.PolicyKey, endpointKey model.Key)
+	OnPolicyMatchStopped(policyKey model.PolicyKey, endpointKey model.Key)
 }
 
 // ActiveRulesCalculator calculates the set of policies and profiles (i.e. the rules) that
@@ -54,7 +55,7 @@ type PolicyMatchListener interface {
 //
 // When looking at policies, the ActiveRules calculator is only interested in the selector
 // attached to the policy itself (which determines the set of endpoints that it applies to).
-// The rules in a policy may also contain selectors; those are are ignored here; they are
+// The rules in a policy may also contain selectors; those are ignored here; they are
 // mapped to IP sets by the RuleScanner.
 type ActiveRulesCalculator struct {
 	// Caches of all known policies/profiles.
@@ -62,11 +63,11 @@ type ActiveRulesCalculator struct {
 	allProfileRules map[string]*model.ProfileRules
 
 	// Caches for ALP policies for stat collector.
-	allALPPolicies set.Set
+	allALPPolicies set.Set[model.PolicyKey]
 
 	// Policy/profile ID to matching endpoint sets.
-	policyIDToEndpointKeys  multidict.IfaceToIface
-	profileIDToEndpointKeys multidict.IfaceToIface
+	policyIDToEndpointKeys  multidict.Multidict[any, any]
+	profileIDToEndpointKeys multidict.Multidict[string, any]
 
 	// Label index, matching policy selectors against local endpoints.
 	labelIndex *labelindex.InheritIndex
@@ -78,12 +79,13 @@ type ActiveRulesCalculator struct {
 	datastoreInSync bool
 	// Set containing the names of any profiles that were missing during the resync.  Used to
 	// log out those profiles at the end of the resync.
-	missingProfiles set.Set
+	missingProfiles set.Set[string]
 
 	// Callback objects.
 	RuleScanner           ruleScanner
 	PolicyMatchListener   PolicyMatchListener
 	OnPolicyCountsChanged func(numPolicies, numProfiles, numALPPolicies int)
+	OnAlive               func()
 }
 
 func NewActiveRulesCalculator() *ActiveRulesCalculator {
@@ -92,12 +94,12 @@ func NewActiveRulesCalculator() *ActiveRulesCalculator {
 		allPolicies:     make(map[model.PolicyKey]*model.Policy),
 		allProfileRules: make(map[string]*model.ProfileRules),
 
-		allALPPolicies: set.New(),
+		allALPPolicies: set.New[model.PolicyKey](),
 
 		// Policy/profile ID to matching endpoint sets.
-		policyIDToEndpointKeys:  multidict.NewIfaceToIface(),
-		profileIDToEndpointKeys: multidict.NewIfaceToIface(),
-		missingProfiles:         set.New(),
+		policyIDToEndpointKeys:  multidict.New[any, any](),
+		profileIDToEndpointKeys: multidict.New[string, any](),
+		missingProfiles:         set.New[string](),
 
 		// Cache of profile IDs by local endpoint.
 		endpointKeyToProfileIDs: NewEndpointKeyToProfileIDMap(),
@@ -116,6 +118,10 @@ func (arc *ActiveRulesCalculator) RegisterWith(localEndpointDispatcher, allUpdDi
 	allUpdDispatcher.Register(model.ResourceKey{}, arc.OnUpdate)
 	allUpdDispatcher.RegisterStatusHandler(arc.OnStatusUpdate)
 }
+
+// forceProgrammedDummyKey is a special value used in place of an endpoint key
+// when recording that the policy is force-programmed.
+const forceProgrammedDummyKey = "PolicyAlwaysProgrammed"
 
 func (arc *ActiveRulesCalculator) OnUpdate(update api.Update) (_ bool) {
 	switch key := update.Key.(type) {
@@ -170,21 +176,42 @@ func (arc *ActiveRulesCalculator) OnUpdate(update api.Update) (_ bool) {
 		// Update the policy/profile counts.
 		arc.updateStats()
 	case model.PolicyKey:
+		oldPolicy := arc.allPolicies[key]
+		oldPolicyWasForceProgrammed := policyForceProgrammed(oldPolicy)
 		if update.Value != nil {
 			log.Debugf("Updating ARC for policy %v", key)
 			policy := update.Value.(*model.Policy)
-			if reflect.DeepEqual(arc.allPolicies[key], policy) {
+			if reflect.DeepEqual(oldPolicy, policy) {
 				log.WithField("key", update.Key).Debug("No-op policy change; ignoring.")
 				return
 			}
 			arc.allPolicies[key] = policy
+
+			// If the policy transitions to be force-programmed, simulate
+			// a match with a dummy endpoint key.
+			newPolicyForceProgrammed := policyForceProgrammed(policy)
+			if !oldPolicyWasForceProgrammed && newPolicyForceProgrammed {
+				log.Debugf("Policy %v force-programmed.", key)
+				arc.onMatchStarted(key, forceProgrammedDummyKey)
+			}
+
 			// Update the index, which will call us back if the selector no
-			// longer matches.
+			// longer matches.  Note: we can't skip this even if the
+			// policy is force-programmed because we're also responsible
+			// for propagating the notification to the policy resolver.
 			sel, err := selector.Parse(policy.Selector)
 			if err != nil {
 				log.WithError(err).Panic("Failed to parse selector")
 			}
 			arc.labelIndex.UpdateSelector(key, sel)
+
+			// If the policy transitions to not be force-programmed,
+			// remove the dummy match.  We do this after adding the
+			// selector into the index to avoid flapping.
+			if oldPolicyWasForceProgrammed && !newPolicyForceProgrammed {
+				log.Debugf("Policy %v no longer force-programmed.", key)
+				arc.onMatchStopped(key, forceProgrammedDummyKey)
+			}
 
 			if arc.policyIDToEndpointKeys.ContainsKey(key) {
 				// If we get here, the selector still matches something,
@@ -202,6 +229,10 @@ func (arc *ActiveRulesCalculator) OnUpdate(update api.Update) (_ bool) {
 		} else {
 			log.Debugf("Removing policy %v from ARC", key)
 			delete(arc.allPolicies, key)
+			if oldPolicyWasForceProgrammed {
+				log.Debugf("Policy %v being deleted, was force-programmed.", key)
+				arc.onMatchStopped(key, forceProgrammedDummyKey)
+			}
 			arc.labelIndex.DeleteSelector(key)
 			// No need to call updatePolicy() because we'll have got a matchStopped
 			// callback.
@@ -221,6 +252,18 @@ func (arc *ActiveRulesCalculator) OnUpdate(update api.Update) (_ bool) {
 	return
 }
 
+func policyForceProgrammed(policy *model.Policy) bool {
+	if policy == nil {
+		return false
+	}
+	for _, v := range policy.PerformanceHints {
+		if v == v3.PerfHintAssumeNeededOnEveryNode {
+			return true
+		}
+	}
+	return false
+}
+
 func (arc *ActiveRulesCalculator) updateStats() {
 	if arc.OnPolicyCountsChanged == nil {
 		return
@@ -234,8 +277,8 @@ func (arc *ActiveRulesCalculator) OnStatusUpdate(status api.SyncStatus) {
 		if arc.missingProfiles.Len() > 0 {
 			// Log out any profiles that were missing during the resync.  We defer
 			// this until now because we may hear about profiles or endpoints first.
-			arc.missingProfiles.Iter(func(item interface{}) error {
-				log.WithField("profileID", item).Warning(
+			arc.missingProfiles.Iter(func(profileID string) error {
+				log.WithField("profileID", profileID).Warning(
 					"End of resync: local endpoints refer to missing " +
 						"or invalid profile, profile's rules replaced " +
 						"with drop rules.")
@@ -266,7 +309,7 @@ func (arc *ActiveRulesCalculator) updateEndpointProfileIDs(key model.Key, profil
 	for id := range removedIDs {
 		arc.profileIDToEndpointKeys.Discard(id, key)
 		if !arc.profileIDToEndpointKeys.ContainsKey(id) {
-			// No endpoint refers to this ID any more.  Clean it
+			// No endpoint refers to this ID anymore.  Clean it
 			// up.
 			arc.sendProfileUpdate(id)
 		}
@@ -281,10 +324,12 @@ func (arc *ActiveRulesCalculator) onMatchStarted(selID, labelId interface{}) {
 		// Policy wasn't active before, tell the listener.  The policy
 		// must be in allPolicies because we can only match on a policy
 		// that we've seen.
-		log.Debugf("Policy %v now matches a local endpoint", polKey)
+		log.Debugf("Policy %v now active", polKey)
 		arc.sendPolicyUpdate(polKey)
 	}
-	arc.PolicyMatchListener.OnPolicyMatch(polKey, labelId)
+	if labelId, ok := labelId.(model.Key); ok {
+		arc.PolicyMatchListener.OnPolicyMatch(polKey, labelId)
+	}
 }
 
 func (arc *ActiveRulesCalculator) onMatchStopped(selID, labelId interface{}) {
@@ -293,10 +338,12 @@ func (arc *ActiveRulesCalculator) onMatchStopped(selID, labelId interface{}) {
 	if !arc.policyIDToEndpointKeys.ContainsKey(selID) {
 		// Policy no longer active.
 		polKey := selID.(model.PolicyKey)
-		log.Debugf("Policy %v no longer matches a local endpoint", polKey)
+		log.Debugf("Policy %v no longer active", polKey)
 		arc.sendPolicyUpdate(polKey)
 	}
-	arc.PolicyMatchListener.OnPolicyMatchStopped(polKey, labelId)
+	if labelId, ok := labelId.(model.Key); ok {
+		arc.PolicyMatchListener.OnPolicyMatchStopped(polKey, labelId)
+	}
 }
 
 var (

@@ -1,20 +1,22 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package calc
 
 import (
 	"fmt"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -73,9 +75,9 @@ type RuleScanner struct {
 	ipSetsByUID map[string]*IPSetData
 	// rulesIDToUIDs maps from policy/profile ID to the set of IP set UIDs that are
 	// referenced by that policy/profile.
-	rulesIDToUIDs multidict.IfaceToString
+	rulesIDToUIDs multidict.Multidict[any, string]
 	// uidsToRulesIDs maps from IP set UID to the set of policy/profile IDs that use it.
-	uidsToRulesIDs multidict.StringToIface
+	uidsToRulesIDs multidict.Multidict[string, any]
 
 	OnIPSetActive   func(ipSet *IPSetData)
 	OnIPSetInactive func(ipSet *IPSetData)
@@ -102,6 +104,24 @@ type IPSetData struct {
 	// cachedUID holds the calculated unique ID of this IP set, or "" if it hasn't been calculated
 	// yet.
 	cachedUID string
+}
+
+func (d *IPSetData) String() string {
+	var parts []string
+	if d.Selector != nil {
+		parts = append(parts, fmt.Sprintf("selector:%q", d.Selector.String()))
+	}
+	if d.NamedPort != "" {
+		parts = append(parts, fmt.Sprintf("namedPort:%s(%s)", d.NamedPort, d.NamedPortProtocol.String()))
+	}
+	if d.Service != "" {
+		parts = append(parts, fmt.Sprintf("service:%q", d.Service))
+	}
+	if d.ServiceIncludePorts {
+		parts = append(parts, "serviceIncludePorts=true")
+	}
+	parts = append(parts, fmt.Sprintf("uniqueID:%q", d.UniqueID()))
+	return "IPSetData{" + strings.Join(parts, ", ") + "}"
 }
 
 func (d *IPSetData) UniqueID() string {
@@ -146,33 +166,47 @@ func (d *IPSetData) DataplaneProtocolType() proto.IPSetUpdate_IPSetType {
 func NewRuleScanner() *RuleScanner {
 	calc := &RuleScanner{
 		ipSetsByUID:    make(map[string]*IPSetData),
-		rulesIDToUIDs:  multidict.NewIfaceToString(),
-		uidsToRulesIDs: multidict.NewStringToIface(),
+		rulesIDToUIDs:  multidict.New[any, string](),
+		uidsToRulesIDs: multidict.New[string, any](),
 	}
 	return calc
 }
 
 func (rs *RuleScanner) OnProfileActive(key model.ProfileRulesKey, profile *model.ProfileRules) {
-	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false, false, "")
+	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnProfileActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnProfileInactive(key model.ProfileRulesKey) {
-	rs.updateRules(key, nil, nil, false, false, "")
+	rs.updateRules(key, nil, nil, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnProfileInactive(key)
 }
 
 func (rs *RuleScanner) OnPolicyActive(key model.PolicyKey, policy *model.Policy) {
-	parsedRules := rs.updateRules(key, policy.InboundRules, policy.OutboundRules, policy.DoNotTrack, policy.PreDNAT, policy.Namespace)
+	parsedRules := rs.updateRules(
+		key,
+		policy.InboundRules,
+		policy.OutboundRules,
+		policy.DoNotTrack,
+		policy.PreDNAT,
+		policy.Namespace,
+		selector.Normalise(policy.Selector),
+	)
 	rs.RulesUpdateCallbacks.OnPolicyActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnPolicyInactive(key model.PolicyKey) {
-	rs.updateRules(key, nil, nil, false, false, "")
+	rs.updateRules(key, nil, nil, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnPolicyInactive(key)
 }
 
-func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Rule, untracked, preDNAT bool, origNamespace string) (parsedRules *ParsedRules) {
+func (rs *RuleScanner) updateRules(
+	key interface{},
+	inbound, outbound []model.Rule,
+	untracked, preDNAT bool,
+	origNamespace string,
+	origSelector string,
+) (parsedRules *ParsedRules) {
 	log.Debugf("Scanning rules (%v in, %v out) for key %v",
 		len(inbound), len(outbound), key)
 	// Extract all the new selectors/named ports.
@@ -200,15 +234,16 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 		}
 	}
 	parsedRules = &ParsedRules{
-		Namespace:     origNamespace,
-		InboundRules:  parsedInbound,
-		OutboundRules: parsedOutbound,
-		Untracked:     untracked,
-		PreDNAT:       preDNAT,
+		Namespace:        origNamespace,
+		InboundRules:     parsedInbound,
+		OutboundRules:    parsedOutbound,
+		Untracked:        untracked,
+		PreDNAT:          preDNAT,
+		OriginalSelector: origSelector,
 	}
 
 	// Figure out which IP sets are new.
-	addedUids := set.New()
+	addedUids := set.New[string]()
 	for uid := range currentUIDToIPSet {
 		log.Debugf("Checking if UID %v is new.", uid)
 		if !rs.rulesIDToUIDs.Contains(key, uid) {
@@ -218,7 +253,7 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 	}
 
 	// Figure out which IP sets are no-longer in use.
-	removedUids := set.New()
+	removedUids := set.New[string]()
 	rs.rulesIDToUIDs.Iter(key, func(uid string) {
 		if _, ok := currentUIDToIPSet[uid]; !ok {
 			log.Debugf("Removed UID: %v", uid)
@@ -227,8 +262,7 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 	})
 
 	// Add the new into the index, triggering events as we discover newly-active IP sets.
-	addedUids.Iter(func(item interface{}) error {
-		uid := item.(string)
+	addedUids.Iter(func(uid string) error {
 		rs.rulesIDToUIDs.Put(key, uid)
 		if !rs.uidsToRulesIDs.ContainsKey(uid) {
 			ipSet := currentUIDToIPSet[uid]
@@ -242,8 +276,7 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 	})
 
 	// And remove the old, triggering events as we clean up unused IP sets.
-	removedUids.Iter(func(item interface{}) error {
-		uid := item.(string)
+	removedUids.Iter(func(uid string) error {
 		rs.rulesIDToUIDs.Discard(key, uid)
 		rs.uidsToRulesIDs.Discard(uid, key)
 		if !rs.uidsToRulesIDs.ContainsKey(uid) {
@@ -277,6 +310,8 @@ type ParsedRules struct {
 
 	// PreDNAT is true if these rules should be applied before any DNAT.
 	PreDNAT bool
+
+	OriginalSelector string
 }
 
 // ParsedRule is like a backend.model.Rule, except the selector matches and named ports are

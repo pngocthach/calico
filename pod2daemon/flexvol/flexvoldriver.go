@@ -15,16 +15,15 @@
 // Flexvolume driver that is invoked by kubelet when a pod installs a flexvolume drive
 // of type nodeagent/uds
 // This driver communicates to the nodeagent using either
-//   * (Default) writing credentials of workloads to a file or
-//   * gRPC message defined at protos/nodeagementmgmt.proto,
-// to shares the properties of the pod with nodeagent.
+//   - (Default) writing credentials of workloads to a file or
+//   - gRPC message defined at protos/nodeagementmgmt.proto,
 //
+// to shares the properties of the pod with nodeagent.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log/syslog"
 	"os"
 	"os/exec"
@@ -62,7 +61,7 @@ type InitResponse struct {
 }
 
 // ConfigurationOptions may be used to setup the driver.
-// These are optional and most users will not depened on them and will instead use the defaults.
+// These are optional and most users will not depend on them and will instead use the defaults.
 type ConfigurationOptions struct {
 	// Version of the Kubernetes cluster on which the driver is running.
 	K8sVersion string `json:"k8s_version,omitempty"`
@@ -227,8 +226,8 @@ func doMount(destinationDir string, ninputs *creds.Credentials, workloadPath str
 		return err
 	}
 
-	newDestianationDir := destinationDir + "/nodeagent"
-	err = os.MkdirAll(newDestianationDir, 0777)
+	newDestinationDir := destinationDir + "/nodeagent"
+	err = os.MkdirAll(newDestinationDir, 0777)
 	if err != nil {
 		cmd := exec.Command("/bin/umount", destinationDir)
 		e := cmd.Run()
@@ -243,7 +242,7 @@ func doMount(destinationDir string, ninputs *creds.Credentials, workloadPath str
 	}
 
 	// Do a bind mount
-	cmd := exec.Command("/bin/mount", "--bind", newDir, newDestianationDir)
+	cmd := exec.Command("/bin/mount", "--bind", newDir, newDestinationDir)
 	err = cmd.Run()
 	if err != nil {
 		cmd = exec.Command("/bin/umount", destinationDir)
@@ -411,7 +410,7 @@ func addCredentialFile(ninputs *creds.Credentials) error {
 	}
 
 	credsFileTmp := strings.Join([]string{configuration.NodeAgentManagementHomeDir, ninputs.UID + ".json"}, "/")
-	_ = ioutil.WriteFile(credsFileTmp, attrs, 0644)
+	_ = os.WriteFile(credsFileTmp, attrs, 0644)
 
 	// Move it to the right location now.
 	credsFile := strings.Join([]string{configuration.NodeAgentCredentialsHomeDir, ninputs.UID + ".json"}, "/")
@@ -434,7 +433,7 @@ func initConfiguration() {
 		return
 	}
 
-	bytes, err := ioutil.ReadFile(CONFIG_FILE)
+	bytes, err := os.ReadFile(CONFIG_FILE)
 	if err != nil {
 		logError("initConfiguration", "", fmt.Sprintf("Not able to read %s: %s\n", CONFIG_FILE, err.Error()), syslogOnlyTrue)
 		return

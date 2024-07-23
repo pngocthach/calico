@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -36,6 +37,7 @@ import (
 	"github.com/ishidawataru/sctp"
 	reuse "github.com/libp2p/go-reuseport"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/fv/cgroup"
 	"github.com/projectcalico/calico/felix/fv/connectivity"
@@ -45,7 +47,7 @@ import (
 const usage = `test-connection: test connection to some target, for Felix FV testing.
 
 Usage:
-  test-connection <namespace-path> <ip-address> <port> [--source-ip=<source_ip>] [--source-port=<source>] [--protocol=<protocol>] [--duration=<seconds>] [--loop-with-file=<file>] [--sendlen=<bytes>] [--recvlen=<bytes>] [--log-pongs] [--stdin]
+  test-connection <namespace-path> <ip-address> <port> [--source-ip=<source_ip>] [--source-port=<source>] [--protocol=<protocol>] [--duration=<seconds>] [--loop-with-file=<file>] [--sendlen=<bytes>] [--recvlen=<bytes>] [--log-pongs] [--stdin] [--timeout=<seconds>]
 
 Options:
   --source-ip=<source_ip>  Source IP to use for the connection [default: 0.0.0.0].
@@ -58,6 +60,7 @@ Options:
   --sendlen=<bytes>        How many additional bytes to send
   --recvlen=<bytes>        Tell the other side to send this many additional bytes
   --stdin                  Read and send data from stdin
+  --timeout=<seconds>      Exit after timeout if pong not received
 
 If connection is successful, test-connection exits successfully.
 
@@ -148,9 +151,20 @@ func main() {
 		log.WithError(err).Fatal("Invalid --stdin")
 	}
 
+	var timeout time.Duration
+
+	if toval := arguments["--timeout"]; toval != nil {
+		timeoutSecs, err := strconv.ParseFloat(toval.(string), 64)
+		if err != nil {
+			// panic on error
+			log.WithField("timeout", timeout).Fatal("Invalid --timeout argument")
+		}
+		timeout = time.Duration(timeoutSecs * float64(time.Second))
+	}
+
 	log.Infof("Test connection from namespace %v IP %v port %v to IP %v port %v proto %v "+
-		"max duration %d seconds, logging pongs (%v), stdin %v",
-		namespacePath, sourceIpAddress, sourcePort, ipAddress, port, protocol, seconds, logPongs, stdin)
+		"max duration %d seconds, timeout %v logging pongs (%v), stdin %v",
+		namespacePath, sourceIpAddress, sourcePort, ipAddress, port, protocol, seconds, timeout, logPongs, stdin)
 
 	if loopFile == "" {
 		// I found that configuring the timeouts on all the network calls was a bit fiddly.  Since
@@ -168,7 +182,7 @@ func main() {
 		// Test connection from wherever we are already running.
 		if err == nil {
 			err = tryConnect(ipAddress, port, sourceIpAddress, sourcePort, protocol,
-				seconds, loopFile, sendLen, recvLen, logPongs, stdin)
+				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout)
 		}
 	} else {
 		// Get the specified network namespace (representing a workload).
@@ -187,7 +201,7 @@ func main() {
 				return e
 			}
 			return tryConnect(ipAddress, port, sourceIpAddress, sourcePort, protocol,
-				seconds, loopFile, sendLen, recvLen, logPongs, stdin)
+				seconds, loopFile, sendLen, recvLen, logPongs, stdin, timeout)
 		})
 	}
 
@@ -241,6 +255,7 @@ type protocolDriver interface {
 	Send(msg []byte) error
 	Receive() ([]byte, error)
 	Close() error
+	SetReadDeadline(t time.Time) error
 
 	MTU() (int, error)
 }
@@ -338,7 +353,7 @@ func NewTestConn(remoteIpAddr, remotePort, sourceIpAddr, sourcePort, protocol st
 }
 
 func tryConnect(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol string,
-	seconds int, loopFile string, sendLen, recvLen int, logPongs, stdin bool) error {
+	seconds int, loopFile string, sendLen, recvLen int, logPongs, stdin bool, timeout time.Duration) error {
 
 	tc, err := NewTestConn(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol,
 		time.Duration(seconds)*time.Second, sendLen, recvLen, stdin)
@@ -393,11 +408,11 @@ func tryConnect(remoteIPAddr, remotePort, sourceIPAddr, sourcePort, protocol str
 	}
 
 	if loopFile != "" {
-		return tc.tryLoopFile(loopFile, logPongs)
+		return tc.tryLoopFile(loopFile, logPongs, timeout)
 	}
 
 	if tc.config.ConnType == connectivity.ConnectionTypePing {
-		return tc.tryConnectOnceOff()
+		return tc.tryConnectOnceOff(timeout)
 	}
 
 	return tc.tryConnectWithPacketLoss()
@@ -411,7 +426,7 @@ func (tc *testConn) GetTestMessage(sequence int) connectivity.Request {
 	return req
 }
 
-func (tc *testConn) tryLoopFile(loopFile string, logPongs bool) error {
+func (tc *testConn) tryLoopFile(loopFile string, logPongs bool, timeout time.Duration) error {
 	req := tc.GetTestMessage(0)
 	msg, err := json.Marshal(req)
 	if err != nil {
@@ -420,18 +435,50 @@ func (tc *testConn) tryLoopFile(loopFile string, logPongs bool) error {
 
 	ls := newLoopState(loopFile)
 	var lastResponse connectivity.Response
+
+	var retryStart time.Time
+	var zeroTime time.Time
+
 	for {
 		err = tc.protocol.Send(msg)
 		if err != nil {
 			log.WithError(err).Fatal("Failed to send")
 		}
 		tc.stat.totalReq++
-		respRaw, err := tc.protocol.Receive()
-		if err != nil {
-			log.WithError(err).Fatal("Failed to receive")
+
+		var respRaw []byte
+
+		if timeout > 0 {
+			if err := tc.protocol.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+				return err
+			}
+			if retryStart == zeroTime {
+				retryStart = time.Now()
+			}
 		}
-		if logPongs {
-			fmt.Println("PONG")
+		var err error
+		respRaw, err = tc.protocol.Receive()
+		if err == nil {
+			if logPongs {
+				fmt.Println("PONG")
+			}
+			retryStart = zeroTime
+		} else if os.IsTimeout(err) {
+			fmt.Printf("receive timeout\n")
+			if timeout > 0 {
+				if time.Since(retryStart) > timeout {
+					log.WithError(err).Fatalf("Failed to receive after %+v", timeout)
+				} else {
+					continue
+				}
+			}
+			if !ls.Next() {
+				break
+			}
+			continue
+		} else {
+			fmt.Printf("err = %+v\n", err)
+			log.WithError(err).Fatal("Failed to receive")
 		}
 
 		var resp connectivity.Response
@@ -474,8 +521,22 @@ func (tc *testConn) sendErrorResp(err error) {
 	res.PrintToStdout()
 }
 
-func (tc *testConn) tryConnectOnceOff() error {
+func (tc *testConn) tryConnectOnceOff(timeout time.Duration) error {
 	log.Info("Doing single-shot test...")
+	if timeout != 0 {
+		done := make(chan struct{})
+		defer func() {
+			close(done)
+		}()
+		go func() {
+			select {
+			case <-done:
+				return
+			case <-time.After(timeout):
+				log.Fatalf("Timed out after %.1fs", timeout.Seconds())
+			}
+		}()
+	}
 
 	if tc.stdin {
 		var buf bytes.Buffer
@@ -565,8 +626,6 @@ func (tc *testConn) tryConnectWithPacketLoss() error {
 
 	var wg sync.WaitGroup
 
-	conn := tc.protocol.(*connectedUDP).conn
-
 	var lastResponse connectivity.Response
 
 	// Start a reader
@@ -593,7 +652,10 @@ func (tc *testConn) tryConnectWithPacketLoss() error {
 				return
 			default:
 				// Deadline is point of time. Have to set it in the loop for each read.
-				_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				if err := tc.protocol.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+					log.WithError(err).Warn("Failed to set read deadline.")
+					continue
+				}
 				respRaw, err := tc.protocol.Receive()
 
 				if e, ok := err.(net.Error); ok && e.Timeout() {
@@ -749,6 +811,10 @@ type connectedUDP struct {
 	useReadFrom bool
 }
 
+func (d *connectedUDP) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+
 func (d *connectedUDP) Close() error {
 	if d.conn == nil {
 		return nil
@@ -858,6 +924,10 @@ func (d *unconnectedUDP) MTU() (int, error) {
 	return 0, nil
 }
 
+func (d *unconnectedUDP) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+
 // connectedSCTP abstracts an SCTP stream.
 type connectedSCTP struct {
 	sourcePort   string
@@ -928,6 +998,10 @@ func (d *rawIP) MTU() (int, error) {
 	return 0, nil
 }
 
+func (d *rawIP) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+
 func (d *connectedSCTP) Connect() error {
 	lip, err := net.ResolveIPAddr("ip", "::")
 	if err != nil {
@@ -988,6 +1062,100 @@ func (d *connectedSCTP) MTU() (int, error) {
 	return 0, nil
 }
 
+func (d *connectedSCTP) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+
+type tcpConn6 struct {
+	s int
+}
+
+func (c *tcpConn6) Read(b []byte) (n int, err error) {
+	return unix.Read(c.s, b)
+}
+
+func (c *tcpConn6) Write(b []byte) (n int, err error) {
+	return unix.Write(c.s, b)
+}
+
+func (c *tcpConn6) Close() error {
+	return unix.Close(c.s)
+}
+
+func (c *tcpConn6) LocalAddr() net.Addr {
+	return nil
+}
+
+func (c *tcpConn6) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (c *tcpConn6) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *tcpConn6) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *tcpConn6) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *tcpConn6) SyscallConn() (syscall.RawConn, error) {
+	return &tcpConn6Raw{s: c.s}, nil
+}
+
+type tcpConn6Raw struct {
+	s int
+}
+
+func (c *tcpConn6Raw) Control(f func(fd uintptr)) error {
+	f(uintptr(c.s))
+	return nil
+}
+
+func (c *tcpConn6Raw) Read(f func(fd uintptr) (done bool)) error {
+	panic("not implemented")
+}
+
+func (c *tcpConn6Raw) Write(f func(fd uintptr) (done bool)) error {
+	panic("not implemented")
+}
+
+func tcpForceV6(ip net.IP, port int) (net.Conn, error) {
+	s, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM, unix.IPPROTO_TCP)
+	if err != nil {
+		return nil, err
+	}
+
+	err = unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	err = unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	saddr := unix.SockaddrInet6{
+		Port: port,
+	}
+
+	copy(saddr.Addr[:], ip.To16())
+
+	saddr.Addr[10] = 0xff
+	saddr.Addr[11] = 0xff
+
+	err = unix.Connect(s, &saddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tcpConn6{s: s}, nil
+}
+
 // connectedTCP abstracts an SCTP stream.
 type connectedTCP struct {
 	localAddr  string
@@ -1004,10 +1172,34 @@ func (d *connectedTCP) Connect() error {
 	// another call to this program, the original port is in post-close wait
 	// state and bind fails.  The reuse library implements a Dial() that sets
 	// these options.
-	conn, err := reuse.Dial("tcp", d.localAddr, d.remoteAddr)
-	if err != nil {
-		return err
+
+	var conn net.Conn
+
+	if strings.Contains(d.remoteAddr, "[") {
+		addr, port, _ := net.SplitHostPort(d.remoteAddr)
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			return fmt.Errorf("ip %s is invalid", addr)
+		}
+		if ip.To4() != nil {
+			// We want to force ipv6 on ipv4 address
+			var err error
+
+			p, _ := strconv.Atoi(port)
+			if conn, err = tcpForceV6(ip, p); err != nil {
+				return fmt.Errorf("failed creating v6 connection for ip %s", d.remoteAddr)
+			}
+		}
 	}
+
+	if conn == nil {
+		var err error
+		conn, err = reuse.Dial("tcp", d.localAddr, d.remoteAddr)
+		if err != nil {
+			return err
+		}
+	}
+
 	d.conn = conn
 
 	d.r = bufio.NewReader(d.conn)
@@ -1040,4 +1232,8 @@ func (d *connectedTCP) Close() error {
 
 func (d *connectedTCP) MTU() (int, error) {
 	return utils.ConnMTU(d.conn.(utils.HasSyscallConn))
+}
+
+func (d *connectedTCP) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
 }

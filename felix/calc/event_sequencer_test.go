@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -91,8 +91,9 @@ var _ = Describe("ParsedRulesToActivePolicyUpdate", func() {
 			InboundRules: []*calc.ParsedRule{
 				{Action: "Deny"},
 			},
-			PreDNAT:   true,
-			Untracked: true,
+			PreDNAT:          true,
+			Untracked:        true,
+			OriginalSelector: "all()",
 		}
 		fullyLoadedProtoRules = proto.ActivePolicyUpdate{
 			Id: &proto.PolicyID{
@@ -100,18 +101,19 @@ var _ = Describe("ParsedRulesToActivePolicyUpdate", func() {
 				Name: "a-policy",
 			},
 			Policy: &proto.Policy{
-				Namespace:     "namespace",
-				InboundRules:  []*proto.Rule{{Action: "Deny"}},
-				OutboundRules: []*proto.Rule{{Action: "Allow"}},
-				Untracked:     true,
-				PreDnat:       true,
+				Namespace:        "namespace",
+				InboundRules:     []*proto.Rule{{Action: "Deny"}},
+				OutboundRules:    []*proto.Rule{{Action: "Allow"}},
+				Untracked:        true,
+				PreDnat:          true,
+				OriginalSelector: "all()",
 			},
 		}
 	)
 
 	It("a fully-loaded ParsedRules struct should result in all fields being set in the protobuf rules", func() {
 		// We use reflection to scan all the fields in the protobuf rule to make sure that they're
-		// all filled in.  If any are still at their zero value, either hte test is out of date
+		// all filled in.  If any are still at their zero value, either the test is out of date
 		// or we forgot to add conversion logic for that field.
 		protoUpdate := calc.ParsedRulesToActivePolicyUpdate(model.PolicyKey{Name: "a-policy"}, &fullyLoadedParsedRules)
 		protoPolicy := *protoUpdate.Policy
@@ -377,6 +379,11 @@ func (d *dataplaneRecorder) record(message interface{}) {
 }
 
 type dummyConfigInterface struct{}
+
+func (i *dummyConfigInterface) ToConfigUpdate() *proto.ConfigUpdate {
+	// TODO implement me
+	panic("implement me")
+}
 
 func (i *dummyConfigInterface) UpdateFrom(map[string]string, config.Source) (changed bool, err error) {
 	return false, nil

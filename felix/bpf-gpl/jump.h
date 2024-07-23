@@ -5,43 +5,108 @@
 #ifndef __CALI_BPF_JUMP_H__
 #define __CALI_BPF_JUMP_H__
 
-#include "conntrack.h"
-#include "policy.h"
-
-CALI_MAP(cali_v4_state, 3,
+CALI_MAP(cali_state, 4,
 		BPF_MAP_TYPE_PERCPU_ARRAY,
 		__u32, struct cali_tc_state,
-		1, 0, MAP_PIN_GLOBAL)
+		2, 0)
 
 static CALI_BPF_INLINE struct cali_tc_state *state_get(void)
 {
 	__u32 key = 0;
-	return cali_v4_state_lookup_elem(&key);
+	return cali_state_lookup_elem(&key);
 }
 
-struct bpf_map_def_extended __attribute__((section("maps"))) cali_jump2 = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = 4,
-	.value_size = 4,
-	.max_entries = 16,
-#if !defined(__BPFTOOL_LOADER__) && defined(__IPTOOL_LOADER__)
-	.map_id = 1,
-	.pinning_strategy = 1 /* object namespace */,
-#endif
-};
+/* N.B. we just grab large enough chunk of data in the state map. State is so
+ * large that the globals fit in the extra slot in the array. The get functions
+ * just typecast it to the desired type of globals.
+ */
 
-#define CALI_JUMP_TO(ctx, index) bpf_tail_call(ctx, &map_symbol(cali_jump, 2), index)
+static CALI_BPF_INLINE struct cali_tc_globals *state_get_globals_tc(void)
+{
+	__u32 key = 1;
+	return cali_state_lookup_elem(&key);
+}
+
+static CALI_BPF_INLINE struct cali_xdp_globals *state_get_globals_xdp(void)
+{
+	__u32 key = 1;
+	return cali_state_lookup_elem(&key);
+}
+
+#define PROG_PATH(idx) ((CALI_LOG_LEVEL < CALI_LOG_LEVEL_DEBUG) ? idx : idx ## _DEBUG)
+
+#if CALI_F_XDP
+
+#define cali_jump_map map_symbol(xdp_cali_progs, 3)
+
+CALI_MAP_V1(cali_jump_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 400, 0)
+
+#define CALI_JUMP_TO(ctx, index) bpf_tail_call((ctx)->xdp, &cali_jump_map, (ctx)->xdp_globals->jumps[PROG_PATH(index)])
+
+#else /* CALI_F_XDP */
+
+#define cali_jump_map map_symbol(cali_progs, 3)
+
+CALI_MAP_V1(cali_jump_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 400, 0)
+
+#define __CALI_JUMP_TO(ctx, index) do {	\
+	CALI_DEBUG("jump to idx %d prog at %d\n", index, (ctx)->globals->data.jumps[PROG_PATH(index)]);	\
+	bpf_tail_call((ctx)->skb, &cali_jump_map, (ctx)->globals->data.jumps[PROG_PATH(index)]);	\
+} while (0)
+
+#define CALI_JUMP_TO(ctx, index) __CALI_JUMP_TO(ctx, index)
+
+#endif
 
 /* Add new values to the end as these are program indices */
 enum cali_jump_index {
+	PROG_INDEX_MAIN,
 	PROG_INDEX_POLICY,
 	PROG_INDEX_ALLOWED,
 	PROG_INDEX_ICMP,
 	PROG_INDEX_DROP,
-	PROG_INDEX_V6_PROLOGUE,
-	PROG_INDEX_V6_POLICY,
-	PROG_INDEX_V6_ALLOWED,
-	PROG_INDEX_V6_ICMP,
-	PROG_INDEX_V6_DROP,
+	PROG_INDEX_HOST_CT_CONFLICT,
+	PROG_INDEX_ICMP_INNER_NAT,
+	PROG_INDEX_NEW_FLOW,
+
+	PROG_INDEX_MAIN_DEBUG,
+	PROG_INDEX_POLICY_DEBUG,
+	PROG_INDEX_ALLOWED_DEBUG,
+	PROG_INDEX_ICMP_DEBUG,
+	PROG_INDEX_DROP_DEBUG,
+	PROG_INDEX_HOST_CT_CONFLICT_DEBUG,
+	PROG_INDEX_ICMP_INNER_NAT_DEBUG,
+	PROG_INDEX_NEW_FLOW_DEBUG,
 };
+
+#if CALI_F_XDP
+
+#define cali_jump_prog_map map_symbol(xdp_cali_jump, 3)
+
+CALI_MAP_V1(cali_jump_prog_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 2400, 0)
+
+/* We on any path, we always jump to the PROG_INDEX_POLICY for policy, that one
+ * is shared!
+ */
+#define CALI_JUMP_TO_POLICY(ctx) \
+	bpf_tail_call((ctx)->xdp, &cali_jump_prog_map, (ctx)->xdp_globals->jumps[PROG_INDEX_POLICY])
+#else /* CALI_F_XDP */
+
+#define cali_jump_prog_map map_symbol(cali_jump, 3)
+
+CALI_MAP_V1(cali_jump_prog_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 240000, 0)
+
+#define __CALI_JUMP_TO_POLICY(ctx, allow, deny, pol) do {	\
+	(ctx)->skb->cb[0] = (ctx)->globals->data.jumps[PROG_PATH(allow)];			\
+	(ctx)->skb->cb[1] = (ctx)->globals->data.jumps[PROG_PATH(deny)];				\
+	CALI_DEBUG("policy allow prog at %d\n", (ctx)->globals->data.jumps[PROG_PATH(allow)]);	\
+	CALI_DEBUG("policy deny prog at %d\n", (ctx)->globals->data.jumps[PROG_PATH(deny)]);	\
+	CALI_DEBUG("jump to policy prog at %d\n", (ctx)->globals->data.jumps[pol]);		\
+	bpf_tail_call((ctx)->skb, &cali_jump_prog_map, (ctx)->globals->data.jumps[pol]);	\
+} while (0)
+
+#define CALI_JUMP_TO_POLICY(ctx) \
+	__CALI_JUMP_TO_POLICY(ctx, PROG_INDEX_ALLOWED, PROG_INDEX_DROP, PROG_INDEX_POLICY)
+#endif
+
 #endif /* __CALI_BPF_JUMP_H__ */

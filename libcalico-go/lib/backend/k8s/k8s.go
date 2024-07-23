@@ -36,6 +36,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -211,6 +212,24 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 		model.KindKubernetesService,
 		resources.NewServiceClient(cs),
 	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		libapiv3.KindIPAMConfig,
+		resources.NewIPAMConfigClient(cs, crdClientV1),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		libapiv3.KindBlockAffinity,
+		resources.NewBlockAffinityClient(cs, crdClientV1),
+	)
+	kubeClient.registerResourceClient(
+		reflect.TypeOf(model.ResourceKey{}),
+		reflect.TypeOf(model.ResourceListOptions{}),
+		apiv3.KindBGPFilter,
+		resources.NewBGPFilterClient(cs, crdClientV1),
+	)
 
 	if !ca.K8sUsePodCIDR {
 		// Using Calico IPAM - use CRDs to back IPAM resources.
@@ -245,8 +264,9 @@ func NewKubeClient(ca *apiconfig.CalicoAPIConfigSpec) (api.Client, error) {
 }
 
 // deduplicate removes any duplicated values and returns a new slice, keeping the order unchanged
-// 	based on deduplicate([]string) []string found in k8s.io/client-go/tools/clientcmd/loader.go#634
-// 	Copyright 2014 The Kubernetes Authors.
+//
+//	based on deduplicate([]string) []string found in k8s.io/client-go/tools/clientcmd/loader.go#634
+//	Copyright 2014 The Kubernetes Authors.
 func deduplicate(s []string) []string {
 	encountered := map[string]struct{}{}
 	ret := make([]string, 0)
@@ -276,7 +296,7 @@ func fillLoadingRulesFromKubeConfigSpec(loadingRules *clientcmd.ClientConfigLoad
 func CreateKubernetesClientset(ca *apiconfig.CalicoAPIConfigSpec) (*rest.Config, *kubernetes.Clientset, error) {
 	// Use the kubernetes client code to load the kubeconfig file and combine it with the overrides.
 	configOverrides := &clientcmd.ConfigOverrides{}
-	var overridesMap = []struct {
+	overridesMap := []struct {
 		variable *string
 		value    string
 	}{
@@ -317,8 +337,8 @@ func CreateKubernetesClientset(ca *apiconfig.CalicoAPIConfigSpec) (*rest.Config,
 		}
 		config, err = clientConfig.ClientConfig()
 	} else {
-		config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			&loadingRules, configOverrides).ClientConfig()
+		config, err = winutils.NewNonInteractiveDeferredLoadingClientConfig(
+			&loadingRules, configOverrides)
 	}
 	if err != nil {
 		return nil, nil, resources.K8sErrorToCalico(err, nil)
@@ -409,6 +429,9 @@ func (c *KubeClient) Clean() error {
 		apiv3.KindIPReservation,
 		apiv3.KindHostEndpoint,
 		apiv3.KindKubeControllersConfiguration,
+		libapiv3.KindIPAMConfig,
+		libapiv3.KindBlockAffinity,
+		apiv3.KindBGPFilter,
 	}
 	ctx := context.Background()
 	for _, k := range kinds {
@@ -530,6 +553,8 @@ func buildCRDClientV1(cfg rest.Config) (*rest.RESTClient, error) {
 					&apiv3.KubeControllersConfigurationList{},
 					&apiv3.CalicoNodeStatus{},
 					&apiv3.CalicoNodeStatusList{},
+					&apiv3.BGPFilter{},
+					&apiv3.BGPFilterList{},
 				)
 				return nil
 			})
@@ -682,7 +707,7 @@ func (c *KubeClient) getReadyStatus(ctx context.Context, k model.ReadyFlagKey, r
 }
 
 func (c *KubeClient) listHostConfig(ctx context.Context, l model.HostConfigListOptions, revision string) (*model.KVPairList, error) {
-	var kvps = []*model.KVPair{}
+	kvps := []*model.KVPair{}
 
 	// Short circuit if they aren't asking for information we can provide.
 	if l.Name != "" && l.Name != "IpInIpTunnelAddr" {

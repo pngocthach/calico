@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -32,8 +32,8 @@ type Interface struct {
 // GetInterfaces returns a list of all interfaces, skipping any interfaces whose
 // name matches any of the exclusion list regexes, and including those on the
 // inclusion list.
-func GetInterfaces(includeRegexes []string, excludeRegexes []string, version int) ([]Interface, error) {
-	netIfaces, err := net.Interfaces()
+func GetInterfaces(getSystemInterfaces func() ([]net.Interface, error), includeRegexes []string, excludeRegexes []string, version int) ([]Interface, error) {
+	netIfaces, err := getSystemInterfaces()
 	if err != nil {
 		log.WithError(err).Warnf("Failed to enumerate interfaces")
 		return nil, err

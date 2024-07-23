@@ -34,7 +34,6 @@ import (
 )
 
 const (
-	namespaceKubeSystem        = "kube-system"
 	migrationNodeSelectorKey   = "projectcalico.org/node-network-during-migration"
 	migrationNodeInProgressKey = "projectcalico.org/node-flannel-migration-in-progress"
 	addOnManagerLabelKey       = "addonmanager.kubernetes.io/mode"
@@ -166,6 +165,14 @@ func (c *flannelMigrationController) Run(stopCh chan struct{}) {
 
 	// Start migration process.
 
+	// Disable VXLAN in Felix explicitly. We don't want to turn this on until we have
+	// updated the Calico nodes with the necessary VTEP information from flannel. This ensures
+	// that Calico will respect flannel's VXLAN traffic once enabled.
+	if err := c.ipamMigrator.SetVXLANMode(context.TODO(), vxlanModeDisabled); err != nil {
+		log.WithError(err).Errorf("Error disabling VXLAN")
+		c.HandleError(err)
+	}
+
 	// Initialise Calico IPAM before we handle any nodes.
 	err = c.ipamMigrator.InitialiseIPPoolAndFelixConfig()
 	if err != nil {
@@ -189,10 +196,18 @@ func (c *flannelMigrationController) Run(stopCh chan struct{}) {
 		c.HandleError(err)
 	}
 
+	// Now that we have populated Calico with flannel's VXLAN data, we can clear the VXLAN bit
+	// in Felix - Felix will determine that VXLAN is enabled based on the fact that it is
+	// set on an IP pool.
+	if err := c.ipamMigrator.SetVXLANMode(context.TODO(), vxlanModeCleared); err != nil {
+		log.WithError(err).Errorf("Error enabling VXLAN")
+		c.HandleError(err)
+	}
+
 	// Add node selector "projectcalico.org/node-network-during-migration==flannel" to Flannel daemonset.
 	// This would prevent Flannel pod running on any new nodes or a node which has been migrated to Calico network.
 	d := daemonset(c.config.FlannelDaemonsetName)
-	err = d.AddNodeSelector(c.k8sClientset, namespaceKubeSystem, nodeNetworkFlannel)
+	err = d.AddNodeSelector(c.k8sClientset, c.config.FlannelDaemonsetNamespace, nodeNetworkFlannel)
 	if err != nil {
 		log.WithError(err).Errorf("Error adding node selector to Flannel daemonset.")
 		c.HandleError(err)
@@ -257,7 +272,7 @@ func (c *flannelMigrationController) processNewNode(node *v1.Node) {
 // but at the same time migration controller restart itself.
 func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 	// Work out the Flannel config by kubectl exec into daemonset pod on controller node.
-	log.Infof("Trying to read Flannel env config by executing into daemonet pod.")
+	log.Infof("Trying to read Flannel env config by executing into daemonset pod.")
 	var podLabel map[string]string
 	if c.config.IsRunningCanal() {
 		podLabel = canalPodLabel
@@ -266,7 +281,7 @@ func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 	}
 
 	n := k8snode(c.config.PodNodeName)
-	data, err := n.execCommandInPod(c.k8sClientset, namespaceKubeSystem, flannelContainerName,
+	data, err := n.execCommandInPod(c.k8sClientset, c.config.FlannelDaemonsetNamespace, flannelContainerName,
 		podLabel, "cat", flannelConfigFile)
 	if err != nil {
 		return err
@@ -283,7 +298,7 @@ func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 	// Convert subnet.env content to json string and update flannel-migration-config ConfigMap.
 	// So that it could be populated into migration controller pod next time it starts.
 	val := strings.Replace(data, "\n", ";", -1)
-	err = updateConfigMapValue(c.k8sClientset, namespaceKubeSystem, migrationConfigMapName, migrationConfigMapEnvKey, val)
+	err = updateConfigMapValue(c.k8sClientset, c.config.CalicoDaemonsetNamespace, migrationConfigMapName, migrationConfigMapEnvKey, val)
 	if err != nil {
 		return err
 	}
@@ -296,7 +311,7 @@ func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 func (c *flannelMigrationController) CheckShouldMigrate() (bool, error) {
 	// Check if we are running Canal.
 	d := daemonset(canalDaemonsetName)
-	notFound, err := d.CheckNotExists(c.k8sClientset, namespaceKubeSystem)
+	notFound, err := d.CheckNotExists(c.k8sClientset, c.config.FlannelDaemonsetNamespace)
 	if err != nil {
 		return false, err
 	}
@@ -308,7 +323,7 @@ func (c *flannelMigrationController) CheckShouldMigrate() (bool, error) {
 
 	// Check Flannel daemonset.
 	d = daemonset(c.config.FlannelDaemonsetName)
-	notFound, err = d.CheckNotExists(c.k8sClientset, namespaceKubeSystem)
+	notFound, err = d.CheckNotExists(c.k8sClientset, c.config.FlannelDaemonsetNamespace)
 	if err != nil {
 		return false, err
 	}
@@ -318,8 +333,8 @@ func (c *flannelMigrationController) CheckShouldMigrate() (bool, error) {
 		return false, nil
 	}
 
-	//Check if addon manager label exists
-	found, val, err := d.getLabelValue(c.k8sClientset, namespaceKubeSystem, addOnManagerLabelKey)
+	// Check if addon manager label exists
+	found, val, err := d.getLabelValue(c.k8sClientset, c.config.FlannelDaemonsetNamespace, addOnManagerLabelKey)
 	if err != nil {
 		return false, err
 	}
@@ -340,7 +355,7 @@ func (c *flannelMigrationController) CheckShouldMigrate() (bool, error) {
 
 	// Update calico-config ConfigMap veth_mtu.
 	// So that it could be populated into calico-node pods.
-	err = updateConfigMapValue(c.k8sClientset, namespaceKubeSystem, calicoConfigMapName, calicoConfigMapMtuKey, fmt.Sprintf("%d", c.config.FlannelMTU))
+	err = updateConfigMapValue(c.k8sClientset, c.config.CalicoDaemonsetNamespace, calicoConfigMapName, calicoConfigMapMtuKey, fmt.Sprintf("%d", c.config.FlannelMTU))
 	if err != nil {
 		return false, err
 	}
@@ -496,14 +511,14 @@ func (c *flannelMigrationController) completeMigration() error {
 	// Delete Flannel daemonset.
 	d := daemonset(c.config.FlannelDaemonsetName)
 	log.Infof("Start deleting %s daemonset.", c.config.FlannelDaemonsetName)
-	err := d.DeleteForeground(c.k8sClientset, namespaceKubeSystem)
+	err := d.DeleteForeground(c.k8sClientset, c.config.FlannelDaemonsetNamespace)
 	if err != nil {
 		log.WithError(err).Errorf("Failed to delete Flannel daemonset.")
 		return err
 	}
 
 	log.Infof("Waiting for %s daemonset to disappear.", c.config.FlannelDaemonsetName)
-	err = d.WaitForDaemonsetNotFound(c.k8sClientset, namespaceKubeSystem, 1*time.Second, 5*time.Minute)
+	err = d.WaitForDaemonsetNotFound(c.k8sClientset, c.config.FlannelDaemonsetNamespace, 1*time.Second, 5*time.Minute)
 	if err != nil {
 		log.WithError(err).Errorf("Timeout deleting Flannel daemonset.")
 		return err
@@ -512,7 +527,7 @@ func (c *flannelMigrationController) completeMigration() error {
 	// Remove nodeSelector for Calico Daemonet.
 	d = daemonset(c.config.CalicoDaemonsetName)
 	log.Infof("Remove node selector for daemonset %s.", c.config.CalicoDaemonsetName)
-	err = d.RemoveNodeSelector(c.k8sClientset, namespaceKubeSystem, NodeNetworkCalico)
+	err = d.RemoveNodeSelector(c.k8sClientset, c.config.CalicoDaemonsetNamespace, NodeNetworkCalico)
 	if err != nil {
 		log.WithError(err).Errorf("Failed to remove node selector for daemonset %s.", c.config.CalicoDaemonsetName)
 		return err

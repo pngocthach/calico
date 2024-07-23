@@ -71,7 +71,7 @@ func init() {
 }
 
 type AsyncCalcGraph struct {
-	*CalcGraph
+	CalcGraph        *CalcGraph
 	inputEvents      chan interface{}
 	outputChannels   []chan<- interface{}
 	eventSequencer   *EventSequencer
@@ -89,8 +89,9 @@ type AsyncCalcGraph struct {
 }
 
 const (
-	healthName     = "async_calc_graph"
+	healthName     = "CalculationGraph"
 	healthInterval = 10 * time.Second
+	healthTimeout  = 30 * time.Second
 )
 
 func NewAsyncCalcGraph(
@@ -99,14 +100,13 @@ func NewAsyncCalcGraph(
 	healthAggregator *health.HealthAggregator,
 ) *AsyncCalcGraph {
 	eventSequencer := NewEventSequencer(conf)
-	calcGraph := NewCalculationGraph(eventSequencer, conf)
 	g := &AsyncCalcGraph{
-		CalcGraph:        calcGraph,
 		inputEvents:      make(chan interface{}, 10),
 		outputChannels:   outputChannels,
 		eventSequencer:   eventSequencer,
 		healthAggregator: healthAggregator,
 	}
+	g.CalcGraph = NewCalculationGraph(eventSequencer, conf, g.reportHealth)
 	if conf.DebugSimulateCalcGraphHangAfter != 0 {
 		log.WithField("delay", conf.DebugSimulateCalcGraphHangAfter).Warn(
 			"Simulating a calculation graph hang.")
@@ -114,7 +114,7 @@ func NewAsyncCalcGraph(
 	}
 	eventSequencer.Callback = g.onEvent
 	if healthAggregator != nil {
-		healthAggregator.RegisterReporter(healthName, &health.HealthReport{Live: true, Ready: true}, healthInterval*2)
+		healthAggregator.RegisterReporter(healthName, &health.HealthReport{Live: true, Ready: true}, healthTimeout)
 	}
 	return g
 }
@@ -148,7 +148,7 @@ func (acg *AsyncCalcGraph) loop() {
 					// each update.  (The dispatcher sends individual updates anyway so this makes
 					// no difference.)
 					updStartTime := time.Now()
-					acg.AllUpdDispatcher.OnUpdates(update[i : i+1])
+					acg.CalcGraph.OnUpdates(update[i : i+1])
 					summaryUpdateTime.Observe(time.Since(updStartTime).Seconds())
 					// Record stats for the number of messages processed.
 					typeName := reflect.TypeOf(upd.Key).Name()
@@ -161,7 +161,7 @@ func (acg *AsyncCalcGraph) loop() {
 				log.WithField("status", update).Debug(
 					"Pulled status update off channel")
 				acg.syncStatusNow = update
-				acg.AllUpdDispatcher.OnStatusUpdated(update)
+				acg.CalcGraph.OnStatusUpdated(update)
 				if update == api.InSync && !acg.beenInSync {
 					log.Info("First time we've been in sync")
 					acg.beenInSync = true
@@ -211,6 +211,7 @@ func (acg *AsyncCalcGraph) maybeFlush() {
 		log.Debug("Not throttled: flushing event buffer")
 		acg.flushLeakyBucket--
 		flushStart := time.Now()
+		acg.CalcGraph.Flush()
 		acg.eventSequencer.Flush()
 		flushDuration := time.Since(flushStart)
 		if flushDuration > time.Second {

@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/projectcalico/calico/felix/bpf/cachingmap"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 
 	. "github.com/onsi/ginkgo"
@@ -29,6 +29,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	k8sp "k8s.io/kubernetes/pkg/proxy"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
@@ -44,20 +46,19 @@ func init() {
 }
 
 var _ = Describe("BPF Syncer", func() {
-	svcs := newMockNATMap()
-	eps := newMockNATBackendMap()
-	aff := newMockAffinityMap()
-	ct := mock.NewMockMap(conntrack.MapParams)
+	var (
+		svcs *mockNATMap
+		eps  *mockNATBackendMap
+		aff  *mockAffinityMap
+		ct   *mock.Map
 
-	var connScan *conntrack.Scanner
+		s        *proxy.Syncer
+		connScan *conntrack.Scanner
+		state    proxy.DPSyncerState
+		rt       *proxy.RTCache
+	)
 
 	nodeIPs := []net.IP{net.IPv4(192, 168, 0, 1), net.IPv4(10, 123, 0, 1)}
-	rt := proxy.NewRTCache()
-
-	feCache := cachingmap.New(nat.FrontendMapParameters, svcs)
-	beCache := cachingmap.New(nat.BackendMapParameters, eps)
-
-	s, _ := proxy.NewSyncer(nodeIPs, feCache, beCache, aff, rt)
 
 	svcKey := k8sp.ServicePortName{
 		NamespacedName: types.NamespacedName{
@@ -66,18 +67,29 @@ var _ = Describe("BPF Syncer", func() {
 		},
 	}
 
-	state := proxy.DPSyncerState{
-		SvcMap: k8sp.ServiceMap{
-			svcKey: proxy.NewK8sServicePort(
-				net.IPv4(10, 0, 0, 1),
-				1234,
-				v1.ProtocolTCP,
-			),
-		},
-		EpsMap: k8sp.EndpointsMap{
-			svcKey: []k8sp.Endpoint{&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555"}},
-		},
-	}
+	BeforeEach(func() {
+		svcs = newMockNATMap()
+		eps = newMockNATBackendMap()
+		aff = newMockAffinityMap()
+		ct = mock.NewMockMap(conntrack.MapParams)
+
+		rt = proxy.NewRTCache()
+
+		s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
+
+		state = proxy.DPSyncerState{
+			SvcMap: k8sp.ServicePortMap{
+				svcKey: proxy.NewK8sServicePort(
+					net.IPv4(10, 0, 0, 1),
+					1234,
+					v1.ProtocolTCP,
+				),
+			},
+			EpsMap: k8sp.EndpointsMap{
+				svcKey: []k8sp.Endpoint{&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555"}},
+			},
+		}
+	})
 
 	makestep := func(step func()) func() {
 		return func() {
@@ -120,6 +132,13 @@ var _ = Describe("BPF Syncer", func() {
 			},
 		}
 
+		svcKey4 := k8sp.ServicePortName{
+			NamespacedName: types.NamespacedName{
+				Namespace: "default",
+				Name:      "fourth-service",
+			},
+		}
+
 		By("inserting another service with multiple endpoints", makestep(func() {
 			state.SvcMap[svcKey2] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
@@ -152,7 +171,8 @@ var _ = Describe("BPF Syncer", func() {
 		}))
 
 		By("creating a CT scanner", func() {
-			connScan = conntrack.NewScanner(ct, conntrack.NewStaleNATScanner(s))
+			connScan = conntrack.NewScanner(ct,
+				conntrack.KeyFromBytes, conntrack.ValueFromBytes, conntrack.NewStaleNATScanner(s))
 		})
 
 		By("creating conntrack entries for test-service", makestep(func() {
@@ -194,13 +214,13 @@ var _ = Describe("BPF Syncer", func() {
 
 			cnt := 0
 
-			err := ct.Iter(func(k, v []byte) bpf.IteratorAction {
+			err := ct.Iter(func(k, v []byte) maps.IteratorAction {
 				cnt++
 				key := conntrack.KeyFromBytes(k)
 				val := conntrack.ValueFromBytes(v)
 				log("key = %s\n", key)
 				log("val = %s\n", val)
-				return bpf.IterNone
+				return maps.IterNone
 			})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -225,19 +245,54 @@ var _ = Describe("BPF Syncer", func() {
 			Expect(eps.m).To(ContainElement(nat.NewNATBackendValue(net.IPv4(10, 2, 0, 1), 2222)))
 		}))
 
+		By("terminating second-service backend", makestep(func() {
+			state.EpsMap[svcKey2] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: false, Terminating: true, Endpoint: "10.2.0.1:2222"},
+			}
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(svcs.m).To(HaveLen(01))
+			val, ok := svcs.m[nat.NewNATKey(net.IPv4(10, 0, 0, 2), 2222, proxy.ProtoV1ToIntPanic(v1.ProtocolTCP))]
+			Expect(ok).To(BeTrue())
+			Expect(val.Count()).To(Equal(uint32(0)))
+
+			Expect(eps.m).To(HaveLen(0))
+		}))
+
+		// Just that the rest of the test has the expected conditions.
+		By("reviving one second-service backend", makestep(func() {
+			state.EpsMap[svcKey2] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.1:2222"},
+			}
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(svcs.m).To(HaveLen(1))
+			val, ok := svcs.m[nat.NewNATKey(net.IPv4(10, 0, 0, 2), 2222, proxy.ProtoV1ToIntPanic(v1.ProtocolTCP))]
+			Expect(ok).To(BeTrue())
+			Expect(val.Count()).To(Equal(uint32(1)))
+
+			Expect(eps.m).To(HaveLen(1))
+			Expect(eps.m).To(HaveKey(nat.NewNATBackendKey(val.ID(), 0)))
+			Expect(eps.m).To(ContainElement(nat.NewNATBackendValue(net.IPv4(10, 2, 0, 1), 2222)))
+		}))
+
 		By("checking that another CT entry pair is cleaned up by connScan", makestep(func() {
 
 			connScan.Scan()
 
 			cnt := 0
 
-			err := ct.Iter(func(k, v []byte) bpf.IteratorAction {
+			err := ct.Iter(func(k, v []byte) maps.IteratorAction {
 				cnt++
 				key := conntrack.KeyFromBytes(k)
 				val := conntrack.ValueFromBytes(v)
 				log("key = %s\n", key)
 				log("val = %s\n", val)
-				return bpf.IterNone
+				return maps.IterNone
 			})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -388,7 +443,7 @@ var _ = Describe("BPF Syncer", func() {
 		}))
 
 		By("resyncing after creating a new syncer with the same result", makestep(func() {
-			s, _ = proxy.NewSyncer(nodeIPs, feCache, beCache, aff, rt)
+			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
 			checkAfterResync()
 		}))
 
@@ -396,7 +451,7 @@ var _ = Describe("BPF Syncer", func() {
 			svcs.m[nat.NewNATKey(net.IPv4(5, 5, 5, 5), 1111, 6)] = nat.NewNATValue(0xdeadbeef, 2, 2, 0)
 			eps.m[nat.NewNATBackendKey(0xdeadbeef, 0)] = nat.NewNATBackendValue(net.IPv4(6, 6, 6, 6), 666)
 			eps.m[nat.NewNATBackendKey(0xdeadbeef, 1)] = nat.NewNATBackendValue(net.IPv4(7, 7, 7, 7), 777)
-			s, _ = proxy.NewSyncer(nodeIPs, feCache, beCache, aff, rt)
+			s, _ = proxy.NewSyncer(4, nodeIPs, svcs, eps, aff, rt, nil)
 			checkAfterResync()
 		}))
 
@@ -544,7 +599,7 @@ var _ = Describe("BPF Syncer", func() {
 
 		By("inserting non-local eps for a NodePort - no route", makestep(func() {
 			// use the meta node IP for nodeports as well
-			s, _ = proxy.NewSyncer(append(nodeIPs, net.IPv4(255, 255, 255, 255)), feCache, beCache, aff, rt)
+			s, _ = proxy.NewSyncer(4, append(nodeIPs, net.IPv4(255, 255, 255, 255)), svcs, eps, aff, rt, nil)
 			state.SvcMap[svcKey2] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
@@ -583,7 +638,7 @@ var _ = Describe("BPF Syncer", func() {
 					logrus.WithError(err).Info("Syncer result")
 				}()
 			})
-			_ = rt.Update(
+			rt.Update(
 				routes.NewKey(ip.CIDRFromAddrAndPrefix(ip.FromString("10.2.1.0"), 24).(ip.V4CIDR)),
 				routes.NewValueWithNextHop(
 					routes.FlagsRemoteWorkload,
@@ -618,8 +673,8 @@ var _ = Describe("BPF Syncer", func() {
 			Expect(cluster.LocalCount()).To(Equal(uint32(1)))
 		}))
 
-		By("adding an unrelated route does not change anyhing", makestep(func() {
-			_ = rt.Update(
+		By("adding an unrelated route does not change anything", makestep(func() {
+			rt.Update(
 				routes.NewKey(ip.CIDRFromAddrAndPrefix(ip.FromString("10.2.55.0"), 24).(ip.V4CIDR)),
 				routes.NewValueWithNextHop(
 					routes.FlagsRemoteWorkload,
@@ -627,7 +682,7 @@ var _ = Describe("BPF Syncer", func() {
 			)
 
 			// XXX we do not have quite a good sync with the fixer in Syncer, we
-			// XXX just do it speculatively and to introduce some fuzzynes. If this
+			// XXX just do it speculatively and to introduce some fuzziness. If this
 			// XXX or the next test fails, something is wrong and should be fixed
 			svcs.Lock()
 			defer svcs.Unlock()
@@ -637,7 +692,7 @@ var _ = Describe("BPF Syncer", func() {
 		}))
 
 		By("adding route should fix another missing expanded NP", makestep(func() {
-			_ = rt.Update(
+			rt.Update(
 				routes.NewKey(ip.CIDRFromAddrAndPrefix(ip.FromString("10.2.3.0"), 24).(ip.V4CIDR)),
 				routes.NewValueWithNextHop(
 					routes.FlagsRemoteWorkload,
@@ -670,7 +725,7 @@ var _ = Describe("BPF Syncer", func() {
 				net.IPv4(10, 0, 0, 2), 2222, net.IPv4(10, 2, 3, 1), 2222, 6)).To(BeTrue())
 
 			// Not all backends are reachable through the NodePort, but there is
-			// no harm in not cleaning connctions that cannot exist. Even if
+			// no harm in not cleaning connections that cannot exist. Even if
 			// they existed, why would we break them?
 
 			Expect(s.ConntrackFrontendHasBackend(
@@ -697,7 +752,7 @@ var _ = Describe("BPF Syncer", func() {
 
 		By("inserting only non-local eps for a NodePort - multiple nodes & pods/node", makestep(func() {
 			// use the meta node IP for nodeports as well
-			s, _ = proxy.NewSyncer(append(nodeIPs, net.IPv4(255, 255, 255, 255)), feCache, beCache, aff, rt)
+			s, _ = proxy.NewSyncer(4, append(nodeIPs, net.IPv4(255, 255, 255, 255)), svcs, eps, aff, rt, nil)
 			state.SvcMap[svcKey2] = proxy.NewK8sServicePort(
 				net.IPv4(10, 0, 0, 2),
 				2222,
@@ -713,13 +768,13 @@ var _ = Describe("BPF Syncer", func() {
 				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.3.1:2222"},
 			}
 
-			_ = rt.Update(
+			rt.Update(
 				routes.NewKey(ip.CIDRFromAddrAndPrefix(ip.FromString("10.2.2.0"), 24).(ip.V4CIDR)),
 				routes.NewValueWithNextHop(
 					routes.FlagsRemoteWorkload,
 					ip.FromString("10.123.0.112").(ip.V4Addr)),
 			)
-			_ = rt.Update(
+			rt.Update(
 				routes.NewKey(ip.CIDRFromAddrAndPrefix(ip.FromString("10.2.3.0"), 24).(ip.V4CIDR)),
 				routes.NewValueWithNextHop(
 					routes.FlagsRemoteWorkload,
@@ -777,7 +832,7 @@ var _ = Describe("BPF Syncer", func() {
 
 		By("restarting Syncer to check if NodePortRemotes are picked up correctly", makestep(func() {
 			// use the meta node IP for nodeports as well
-			s, _ = proxy.NewSyncer(append(nodeIPs, net.IPv4(255, 255, 255, 255)), feCache, beCache, aff, rt)
+			s, _ = proxy.NewSyncer(4, append(nodeIPs, net.IPv4(255, 255, 255, 255)), svcs, eps, aff, rt, nil)
 			err := s.Apply(state)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -809,6 +864,8 @@ var _ = Describe("BPF Syncer", func() {
 			Expect(ok).To(BeTrue())
 			Expect(val1.Count()).To(Equal(uint32(4)))
 			Expect(val1.LocalCount()).To(Equal(uint32(2)))
+			// ClusterIP only reflects internal traffic policy, not the external one
+			Expect(val1.Flags()).To(Equal(uint32(nat.NATFlgInternalLocal)))
 
 			val2, ok := svcs.m[nat.NewNATKey(net.IPv4(192, 168, 0, 1), 4444, proxy.ProtoV1ToIntPanic(v1.ProtocolTCP))]
 			Expect(ok).To(BeTrue())
@@ -978,7 +1035,8 @@ var _ = Describe("BPF Syncer", func() {
 		}))
 
 		By("recreating a CT scanner for the actual syncer", func() {
-			connScan = conntrack.NewScanner(ct, conntrack.NewStaleNATScanner(s))
+			connScan = conntrack.NewScanner(ct,
+				conntrack.KeyFromBytes, conntrack.ValueFromBytes, conntrack.NewStaleNATScanner(s))
 		})
 
 		By("checking that CT table emptied by connScan", makestep(func() {
@@ -987,18 +1045,234 @@ var _ = Describe("BPF Syncer", func() {
 
 			cnt := 0
 
-			err := ct.Iter(func(k, v []byte) bpf.IteratorAction {
+			err := ct.Iter(func(k, v []byte) maps.IteratorAction {
 				cnt++
 				key := conntrack.KeyFromBytes(k)
 				val := conntrack.ValueFromBytes(v)
 				log("key = %s\n", key)
 				log("val = %s\n", val)
-				return bpf.IterNone
+				return maps.IterNone
 			})
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(cnt).To(Equal(0))
 		}))
+
+		By("checking topology aware hints auto in service with multiple endpoints match first zone", makestep(func() {
+			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+				proxy.K8sSvcWithHintsAnnotation("auto"),
+			)
+			state.EpsMap[svcKey] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555", ZoneHints: sets.New[string]("us-west-2a")},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.2:5555", ZoneHints: sets.New[string]("us-west-2b")},
+			}
+			state.NodeZone = "us-west-2a"
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(1))
+		}))
+
+		By("checking topology aware hints auto in service with multiple endpoints match second zone", makestep(func() {
+			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+				proxy.K8sSvcWithHintsAnnotation("auto"),
+			)
+			state.EpsMap[svcKey] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555", ZoneHints: sets.New[string]("us-west-2a")},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.2:5555", ZoneHints: sets.New[string]("us-west-2b")},
+			}
+			state.NodeZone = "us-west-2b"
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(1))
+		}))
+
+		By("checking topology aware hints disabled in service with multiple endpoints match all zones", makestep(func() {
+			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+				proxy.K8sSvcWithHintsAnnotation("disabled"),
+			)
+			state.EpsMap[svcKey] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555", ZoneHints: sets.New[string]("us-west-2a")},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.2:5555", ZoneHints: sets.New[string]("us-west-2b")},
+			}
+			state.NodeZone = "us-west-2b"
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(2))
+		}))
+
+		By("checking topology aware hints empty in service with multiple endpoints match all zones", makestep(func() {
+			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+			)
+			state.EpsMap[svcKey] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555", ZoneHints: sets.New[string]("us-west-2a")},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.2:5555", ZoneHints: sets.New[string]("us-west-2b")},
+			}
+			state.NodeZone = "us-west-2b"
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(2))
+		}))
+
+		By("checking topology aware hints auto in service with multiple endpoints without node zone match all zones", makestep(func() {
+			state.SvcMap[svcKey] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+				proxy.K8sSvcWithHintsAnnotation("auto"),
+			)
+			state.EpsMap[svcKey] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555", ZoneHints: sets.New[string]("us-west-2a")},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.2.0.2:5555", ZoneHints: sets.New[string]("us-west-2b")},
+			}
+			state.NodeZone = ""
+
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(2))
+		}))
+
+		By("checking endpointslice terminating status should be included in endpointslice collection for processing", makestep(func() {
+
+			// Clean up all prior state.
+			delete(state.SvcMap, svcKey)
+			delete(state.SvcMap, svcKey2)
+			delete(state.SvcMap, svcKey3)
+			delete(state.EpsMap, svcKey)
+			delete(state.EpsMap, svcKey2)
+			delete(state.EpsMap, svcKey3)
+
+			// Apply new SvcMap and Eps state.
+			state.SvcMap[svcKey4] = proxy.NewK8sServicePort(
+				net.IPv4(10, 0, 0, 1),
+				1234,
+				v1.ProtocolTCP,
+			)
+			state.EpsMap[svcKey4] = []k8sp.Endpoint{
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555"},
+				&k8sp.BaseEndpointInfo{Terminating: true, Endpoint: "10.1.0.2:6666"},
+				&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.3:7777"},
+			}
+
+			// Expect 2x new map entries for Ready pods only; Terminating pods not added to map.
+			err := s.Apply(state)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(eps.m).To(HaveLen(2))
+		}))
+
+		By("checking that conntrack scan does not remove the terminating endpoint connection", makestep(func() {
+
+			// Unroll conntrack entries for service additions following convention in unit test above.
+			svc := state.SvcMap[svcKey4]
+			ep := state.EpsMap[svcKey4][0]
+			ctEntriesForSvc(ct, svc.Protocol(), svc.ClusterIP(), uint16(svc.Port()), ep, net.IPv4(5, 6, 7, 8), 111)
+			ep = state.EpsMap[svcKey4][1]
+			ctEntriesForSvc(ct, svc.Protocol(), svc.ClusterIP(), uint16(svc.Port()), ep, net.IPv4(5, 6, 7, 8), 222)
+			ep = state.EpsMap[svcKey4][2]
+			ctEntriesForSvc(ct, svc.Protocol(), svc.ClusterIP(), uint16(svc.Port()), ep, net.IPv4(5, 6, 7, 8), 333)
+
+			connScan.Scan()
+
+			cnt := 0
+			err := ct.Iter(func(k, v []byte) maps.IteratorAction {
+				cnt++
+				key := conntrack.KeyFromBytes(k)
+				val := conntrack.ValueFromBytes(v)
+				log("key = %s\n", key)
+				log("val = %s\n", val)
+				return maps.IterNone
+			})
+
+			// Expect 6x new conntrack entries from 3x pods NAT forward and 3x pods NAT reverse total.
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cnt).To(Equal(6))
+		}))
+
+	})
+
+	It("should remove conntrack of terminating UDP backed if service annotated as such", func() {
+		state = proxy.DPSyncerState{
+			SvcMap: k8sp.ServicePortMap{
+				svcKey: proxy.NewK8sServicePort(
+					net.IPv4(10, 0, 0, 1),
+					1234,
+					v1.ProtocolUDP,
+					proxy.K8sSvcWithReapTerminatingUDP(),
+				),
+			},
+			EpsMap: k8sp.EndpointsMap{
+				svcKey: []k8sp.Endpoint{
+					&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555"},
+					&k8sp.BaseEndpointInfo{Terminating: true, Endpoint: "10.1.0.2:5555"},
+				},
+			},
+		}
+
+		err := s.Apply(state)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(svcs.m).To(HaveLen(1))
+		val, ok := svcs.m[nat.NewNATKey(net.IPv4(10, 0, 0, 1), 1234, proxy.ProtoV1ToIntPanic(v1.ProtocolUDP))]
+		Expect(ok).To(BeTrue())
+		Expect(val.Count()).To(Equal(uint32(1))) // only the ready endpoint
+
+		By("running ct scan - expect terminating to be reaped", func() {
+			s.StopExpandNPFixup()
+			s.ConntrackScanStart()
+			defer s.ConntrackScanEnd()
+
+			Expect(s.ConntrackFrontendHasBackend(
+				net.IPv4(10, 0, 0, 1), 1234, net.IPv4(10, 1, 0, 1), 5555, 17)).To(BeTrue())
+			Expect(s.ConntrackFrontendHasBackend(
+				net.IPv4(10, 0, 0, 1), 1234, net.IPv4(10, 1, 0, 2), 5555, 17)).To(BeFalse())
+		})
+
+		By("removing the annotation")
+
+		state = proxy.DPSyncerState{
+			SvcMap: k8sp.ServicePortMap{
+				svcKey: proxy.NewK8sServicePort(
+					net.IPv4(10, 0, 0, 1),
+					1234,
+					v1.ProtocolUDP,
+				),
+			},
+			EpsMap: k8sp.EndpointsMap{
+				svcKey: []k8sp.Endpoint{
+					&k8sp.BaseEndpointInfo{Ready: true, Endpoint: "10.1.0.1:5555"},
+					&k8sp.BaseEndpointInfo{Terminating: true, Endpoint: "10.1.0.2:5555"},
+				},
+			},
+		}
+
+		err = s.Apply(state)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("running ct scan again - expect terminating not to be reaped", func() {
+			s.StopExpandNPFixup()
+			s.ConntrackScanStart()
+			defer s.ConntrackScanEnd()
+
+			Expect(s.ConntrackFrontendHasBackend(
+				net.IPv4(10, 0, 0, 1), 1234, net.IPv4(10, 1, 0, 1), 5555, 17)).To(BeTrue())
+			Expect(s.ConntrackFrontendHasBackend(
+				net.IPv4(10, 0, 0, 1), 1234, net.IPv4(10, 1, 0, 2), 5555, 17)).To(BeTrue())
+		})
 
 	})
 })
@@ -1009,7 +1283,7 @@ type mockNATMap struct {
 	m map[nat.FrontendKey]nat.FrontendValue
 }
 
-func (m *mockNATMap) MapFD() bpf.MapFD {
+func (m *mockNATMap) MapFD() maps.FD {
 	panic("implement me")
 }
 
@@ -1027,7 +1301,7 @@ func (m *mockNATMap) Path() string {
 	return "/sys/fs/bpf/tc/nat"
 }
 
-func (m *mockNATMap) Iter(iter bpf.IterCallback) error {
+func (m *mockNATMap) Iter(iter maps.IterCallback) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -1035,7 +1309,7 @@ func (m *mockNATMap) Iter(iter bpf.IterCallback) error {
 	vs := len(nat.FrontendValue{})
 	for k, v := range m.m {
 		action := iter(k[:ks], v[:vs])
-		if action == bpf.IterDelete {
+		if action == maps.IterDelete {
 			delete(m.m, k)
 		}
 	}
@@ -1102,7 +1376,7 @@ type mockNATBackendMap struct {
 	m map[nat.BackendKey]nat.BackendValue
 }
 
-func (m *mockNATBackendMap) MapFD() bpf.MapFD {
+func (m *mockNATBackendMap) MapFD() maps.FD {
 	panic("implement me")
 }
 
@@ -1120,7 +1394,7 @@ func (m *mockNATBackendMap) Path() string {
 	return "/sys/fs/bpf/tc/natbe"
 }
 
-func (m *mockNATBackendMap) Iter(iter bpf.IterCallback) error {
+func (m *mockNATBackendMap) Iter(iter maps.IterCallback) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -1128,7 +1402,7 @@ func (m *mockNATBackendMap) Iter(iter bpf.IterCallback) error {
 	vs := len(nat.BackendValue{})
 	for k, v := range m.m {
 		action := iter(k[:ks], v[:vs])
-		if action == bpf.IterDelete {
+		if action == maps.IterDelete {
 			delete(m.m, k)
 		}
 	}
@@ -1209,7 +1483,7 @@ func (m *mockAffinityMap) Path() string {
 	return "/sys/fs/bpf/tc/aff"
 }
 
-func (m *mockAffinityMap) Iter(iter bpf.IterCallback) error {
+func (m *mockAffinityMap) Iter(iter maps.IterCallback) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -1217,7 +1491,7 @@ func (m *mockAffinityMap) Iter(iter bpf.IterCallback) error {
 	vs := len(nat.AffinityValue{})
 	for k, v := range m.m {
 		action := iter(k[:ks], v[:vs])
-		if action == bpf.IterDelete {
+		if action == maps.IterDelete {
 			delete(m.m, k)
 		}
 	}
@@ -1270,11 +1544,11 @@ func (m *mockAffinityMap) Delete(k []byte) error {
 	return nil
 }
 
-func (m *mockAffinityMap) MapFD() bpf.MapFD {
+func (m *mockAffinityMap) MapFD() maps.FD {
 	panic("implement me")
 }
 
-func ctEntriesForSvc(ct bpf.Map, proto v1.Protocol,
+func ctEntriesForSvc(ct maps.Map, proto v1.Protocol,
 	svcIP net.IP, svcPort uint16, ep k8sp.Endpoint, srcIP net.IP, srcPort uint16) {
 
 	p, err := proxy.ProtoV1ToInt(proto)

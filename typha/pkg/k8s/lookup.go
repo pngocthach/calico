@@ -16,13 +16,14 @@ package k8s
 
 import (
 	"context"
+	"os"
 
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 	"github.com/projectcalico/calico/typha/pkg/calc"
 )
 
@@ -38,7 +39,7 @@ type RealK8sAPI struct {
 func (r *RealK8sAPI) clientSet() (*kubernetes.Clientset, error) {
 	if r.cachedClientSet == nil {
 		// TODO Typha: support Typha lookup without using rest.InClusterConfig().
-		k8sconf, err := rest.InClusterConfig()
+		k8sconf, err := winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
 		if err != nil {
 			log.WithError(err).Error("Unable to create Kubernetes config.")
 			return nil, err
@@ -66,7 +67,7 @@ func (r *RealK8sAPI) GetNumTyphas(ctx context.Context, namespace, serviceName, p
 		return 0, err
 	}
 
-	ips := set.New()
+	ips := set.New[string]()
 	for _, s := range ep.Subsets {
 		found := false
 		for _, port := range s.Ports {

@@ -1,4 +1,4 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 # Build Debian and RPM packages for the current Git HEAD.
 #
@@ -19,9 +19,7 @@ version=${FORCE_VERSION:-`git_auto_version`}
 version=`strip_v ${version}`
 sha=`git_commit_id`
 
-MY_UID=`id -u`
-MY_GID=`id -g`
-DOCKER_RUN_RM="docker run --rm --user ${MY_UID}:${MY_GID} -v $rpmDir:/rpm -v $(dirname `pwd`):/code -w /code/$(basename `pwd`)"
+DOCKER_RUN_RM="docker run --rm --user $(id -u):$(id -g) -v $rpmDir:/rpm -v $(dirname `pwd`):/code -w /code/$(basename `pwd`)"
 
 # Determine if this is a release (i.e. corresponds exactly to a Git tag) or a
 # snapshot.
@@ -42,6 +40,13 @@ for package_type in "$@"; do
     case ${package_type} in
 
 	deb )
+	    if [ "${PKG_NAME}" = felix ]; then
+	        # Felix is built with RHEL/UBI and links against libpcap.so.1. We need this patchelf
+	        # until Debian changes the soname from .0.8 to .1.
+	        # FIXME remove the following patchelf command once Debian dependency is updated.
+	        patchelf --replace-needed libpcap.so.1 libpcap.so.0.8 bin/calico-felix
+	    fi
+
 	    # The Debian version that we are about to generate.
 	    debver=${FORCE_VERSION_DEB:-`git_version_to_deb ${version}`}
 	    debver=`strip_v ${debver}`
@@ -49,32 +54,25 @@ for package_type in "$@"; do
 	    # Current time in Debian changelog format; e.g. Wed, 02
 	    # Mar 2016 14:08:51 +0000.
 	    timestamp=`date "+%a, %d %b %Y %H:%M:%S %z"`
-	    for series in trusty xenial bionic focal; do
+	    for series in focal jammy; do
 		{
+			if ${release}; then
+				changelog_message="* ${NAME} v${version} (from Git commit ${sha})."
+			else
+				changelog_message="* Development snapshot (from Git commit ${sha})."
+			fi
 		    cat <<EOF
 ${PKG_NAME} (${DEB_EPOCH}${debver}-$series) $series; urgency=low
 
-EOF
-		    if ${release}; then
-			cat <<EOF
-  * ${NAME} v${version} (from Git commit ${sha}).
-EOF
-		    else
-			cat <<EOF
-  * Development snapshot (from Git commit ${sha}).
-EOF
-		    fi
+  ${changelog_message}
 
-		    cat <<EOF
-
- -- Neil Jerram <neil@tigera.io>  ${timestamp}
-
+ -- Daniel Fox <dan.fox@tigera.io>  ${timestamp}
 EOF
 		} > debian/changelog
 
 		excludes="${DPKG_EXCL:--I}"
 
-		${DOCKER_RUN_RM} calico-build/${series} dpkg-buildpackage ${excludes} -S -d
+		${DOCKER_RUN_RM} calico-build/${series} dpkg-buildpackage ${excludes} -S -d | ts "[build $series]"
 	    done
 
 	    cat <<EOF
@@ -131,7 +129,7 @@ EOF
 	    for elversion in ${elversions}; do
 		# Skip the rpm build if we are missing the matching build image.
 		imageid=$(docker images -q calico-build/centos${elversion}:latest)
-		[ -n "$imageid"  ] && ${DOCKER_RUN_RM} -e EL_VERSION=el${elversion} \
+		[ -n "$imageid" ] && ${DOCKER_RUN_RM} -e EL_VERSION=el${elversion} \
 		    -e FORCE_VERSION=${FORCE_VERSION} \
 		    -e RPM_TAR_ARGS="${RPM_TAR_ARGS}" \
 		    $imageid /rpm/build-rpms
@@ -148,7 +146,7 @@ EOF
 
 	* )
 	    echo "ERROR: unknown package type \"${package_type}\""
-	    exit -1
+	    exit 255
 
     esac
 

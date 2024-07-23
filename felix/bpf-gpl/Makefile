@@ -1,5 +1,5 @@
 # Project Calico BPF dataplane build scripts.
-# Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+# Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
 # Disable implicit rules.
@@ -43,14 +43,23 @@ CFLAGS +=  \
 TRIPLET := $(shell gcc -dumpmachine)
 CFLAGS += -I/usr/include/$(TRIPLET)
 
-CC := clang-12
-LD := llc-12
+ifeq ($(findstring x86_64,$(TRIPLET)),x86_64)
+	CFLAGS += -D__TARGET_ARCH_x86 -D__x86_64__
+else ifeq ($(findstring aarch64,$(TRIPLET)),aarch64)
+	CFLAGS += -D__TARGET_ARCH_arm64
+endif
+CC := clang-17
+LD := llc
 
 UT_C_FILES:=$(shell find ut -name '*.c')
 UT_OBJS:=$(UT_C_FILES:.c=.o) $(shell ./list-ut-objs)
+UT_OBJS+=ut/ip_parse_test_v6.o
 
 OBJS:=$(shell ./list-objs)
-C_FILES:=tc.c connect_balancer.c xdp.c
+OBJS+=bin/tc_preamble.o
+OBJS+=bin/xdp_preamble.o
+OBJS+=bin/policy_default.o
+C_FILES:=tc_preamble.c tc.c connect_balancer.c connect_balancer_v46.c connect_balancer_v6.c xdp_preamble.c xdp.c policy_default.c
 
 all: $(OBJS)
 ut-objs: $(UT_OBJS)
@@ -58,8 +67,10 @@ ut-objs: $(UT_OBJS)
 COMPILE=$(CC) $(CFLAGS) `./calculate-flags $@` -c $< -o $@
 connect_time_%v4.ll: connect_balancer.c connect_balancer.d calculate-flags
 	$(COMPILE)
-connect_time_%v6.ll: connect_balancer_v6.c connect_balancer_v6.d calculate-flags
+connect_time_%v46.ll: connect_balancer_v46.c connect_balancer_v46.d calculate-flags
 	$(COMPILE)
+connect_time_%v6.ll: connect_balancer_v6.c connect_balancer_v6.d calculate-flags
+	$(COMPILE) -DIPVER6
 
 UT_CFLAGS=\
 	-D__BPFTOOL_LOADER__ \
@@ -69,8 +80,19 @@ UT_CFLAGS=\
 	-I .
 
 # Mini-UT programs that test one or two functions.  These are each in their own files.
-ut/%.ll: ut/%.c ut/ut.h tc.c tc.d
+ut/%.ll: ut/%.c ut/ut.h
 	$(CC) $(UT_CFLAGS) $(CFLAGS) -c $< -o $@
+
+ut/icmp6_port_unreachable.ll: CFLAGS += -DIPVER6
+
+tc_preamble.ll: tc_preamble.c tc_preamble.d
+	$(CC) $(CFLAGS) -c $< -o $@
+
+xdp_preamble.ll: xdp_preamble.c xdp_preamble.d
+	$(CC) $(CFLAGS) -DCALI_COMPILE_FLAGS=64 -c $< -o $@
+
+policy_default.ll: policy_default.c policy_default.d
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # Production and UT versions of the main binaries.
 # Combining the targets into one rule causes make to fail to rebuild the .ll files.  Not sure why.
@@ -78,14 +100,30 @@ to%.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
 from%.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
+to%_v6.ll: tc.c tc.d calculate-flags
+	$(COMPILE)
+from%_v6.ll: tc.c tc.d calculate-flags
+	$(COMPILE)
 test%.ll: tc.c tc.d calculate-flags
+	$(COMPILE)
+test%_v6.ll: tc.c tc.d calculate-flags
 	$(COMPILE)
 xdp%.ll: xdp.c xdp.d calculate-flags
 	$(COMPILE)
+xdp%_v6.ll: xdp.c xdp.d calculate-flags
+	$(COMPILE)
 test_xdp%.ll: xdp.c xdp.d calculate-flags
+	$(COMPILE)
+test_xdp%_v6.ll: xdp.c xdp.d calculate-flags
 	$(COMPILE)
 
 LINK=$(LD) -march=bpf -filetype=obj -o $@ $<
+bin/tc_preamble.o: tc_preamble.ll | bin
+	$(LINK)
+bin/xdp_preamble.o: xdp_preamble.ll | bin
+	$(LINK)
+bin/policy_default.o: policy_default.ll | bin
+	$(LINK)
 bin/to%.o: to%.ll | bin
 	$(LINK)
 bin/from%.o: from%.ll | bin
@@ -96,13 +134,21 @@ bin/xdp%.o: xdp%.ll | bin
 	$(LINK)
 bin/connect_time_%v4.o: connect_time_%v4.ll | bin
 	$(LINK)
+bin/connect_time_%v46.o: connect_time_%v46.ll | bin
+	$(LINK)
 bin/connect_time_%v6.o: connect_time_%v6.ll | bin
 	$(LINK)
 bin/connect_time_%v4_co-re.o: connect_time_%v4.ll | bin
 	$(LINK)
+bin/connect_time_%v46_co-re.o: connect_time_%v46.ll | bin
+	$(LINK)
 bin/connect_time_%v6_co-re.o: connect_time_%v6.ll | bin
 	$(LINK)
 ut/%.o: ut/%.ll
+	$(LINK)
+ut/ip_parse_test_v6.ll: ut/ip_parse_test.c
+	$(CC) $(UT_CFLAGS) $(CFLAGS) -DIPVER6 -c $< -o $@
+ut/ip_parse_test_v6.o: ut/ip_parse_test_v6.ll
 	$(LINK)
 
 bin:

@@ -19,8 +19,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/timeshim"
 )
 
@@ -85,7 +86,7 @@ func WithTimeShim(shim timeshim.Interface) LivenessScannerOpt {
 	}
 }
 
-func (l *LivenessScanner) Check(ctKey Key, ctVal Value, get EntryGet) ScanVerdict {
+func (l *LivenessScanner) Check(ctKey KeyInterface, ctVal ValueInterface, get EntryGet) ScanVerdict {
 	if l.cachedKTime == 0 || l.time.Since(l.goTimeOfLastKTimeLookup) > time.Second {
 		l.cachedKTime = l.time.KTimeNanos()
 		l.goTimeOfLastKTimeLookup = l.time.Now()
@@ -98,7 +99,7 @@ func (l *LivenessScanner) Check(ctKey Key, ctVal Value, get EntryGet) ScanVerdic
 	case TypeNATForward:
 		// Look up the reverse entry, where we do the book-keeping.
 		revEntry, err := get(ctVal.ReverseNATKey())
-		if err != nil && bpf.IsNotExists(err) {
+		if err != nil && maps.IsNotExists(err) {
 			// Forward entry exists but no reverse entry. We might have come across the reverse
 			// entry first and removed it. It is useless on its own, so delete it now.
 			//
@@ -144,7 +145,7 @@ func (l *LivenessScanner) Check(ctKey Key, ctVal Value, get EntryGet) ScanVerdic
 
 // EntryExpired checks whether a given conntrack table entry for a given
 // protocol and time, is expired.
-func (t *Timeouts) EntryExpired(nowNanos int64, proto uint8, entry Value) (reason string, expired bool) {
+func (t *Timeouts) EntryExpired(nowNanos int64, proto uint8, entry ValueInterface) (reason string, expired bool) {
 	sinceCreation := time.Duration(nowNanos - entry.Created())
 	if sinceCreation < t.CreationGracePeriod {
 		log.Debug("Conntrack entry in creation grace period. Ignoring.")
@@ -174,7 +175,7 @@ func (t *Timeouts) EntryExpired(nowNanos int64, proto uint8, entry Value) (reaso
 			}
 		}
 		return "", false
-	case ProtoICMP:
+	case ProtoICMP, ProtoICMP6:
 		if age > t.ICMPLastSeen {
 			return "no traffic on ICMP flow for too long", true
 		}
@@ -212,14 +213,17 @@ func NewStaleNATScanner(frontendHasBackend NATChecker) *StaleNATScanner {
 }
 
 // Check checks the conntrack entry
-func (sns *StaleNATScanner) Check(k Key, v Value, _ EntryGet) ScanVerdict {
+func (sns *StaleNATScanner) Check(k KeyInterface, v ValueInterface, get EntryGet) ScanVerdict {
 	debug := log.GetLevel() >= log.DebugLevel
+
+again:
 
 	switch v.Type() {
 	case TypeNormal:
 		// skip non-NAT entry
 
 	case TypeNATReverse:
+
 		proto := k.Proto()
 		ipA := k.AddrA()
 		ipB := k.AddrB()
@@ -288,8 +292,31 @@ func (sns *StaleNATScanner) Check(k Key, v Value, _ EntryGet) ScanVerdict {
 				svcIP = kA
 				svcPort = kAport
 			} else {
-				log.WithFields(log.Fields{"key": k, "value": v}).Error("Mismatch between key and rev key")
-				return ScanVerdictOK // don't touch, will get deleted when expired
+				rv, err := get(revKey)
+				if err != nil {
+					if err == unix.ENOENT {
+						// There is no match for the reverse key, delete it, its useless - we
+						// can get here due to host networked program accessing service
+						// without ctlb when the backed is accessible via tunnel.
+						if debug {
+							log.WithFields(log.Fields{"key": k, "value": v}).
+								Debug("Mismatch between key and rev key - " +
+									"deleting entry because reverse key does not exist.")
+						}
+						return ScanVerdictDelete
+					} else {
+						if debug {
+							// In the worst case, the entry will timeout
+							log.WithFields(log.Fields{"key": k, "value": v}).WithError(err).
+								Debug("Mismatch between key and rev key - " +
+									"keeping entry, failed to retrieve reverse entry. Will try again.")
+						}
+						return ScanVerdictOK
+					}
+				}
+				k = revKey
+				v = rv
+				goto reverse // handle it based on the reverse entry
 			}
 		} else {
 			// snatPort is the new client port. It does not match the client
@@ -316,8 +343,31 @@ func (sns *StaleNATScanner) Check(k Key, v Value, _ EntryGet) ScanVerdict {
 				svcIP = kA
 				svcPort = kAport
 			} else {
-				log.WithFields(log.Fields{"key": k, "value": v}).Error("Mismatch between key and rev key")
-				return ScanVerdictOK // don't touch, will get deleted when expired
+				rv, err := get(revKey)
+				if err != nil {
+					if err == unix.ENOENT {
+						// There is no match for the reverse key, delete it, its useless - we
+						// can get here due to host networked program accessing service
+						// without ctlb when the backed is accessible via tunnel.
+						if debug {
+							log.WithFields(log.Fields{"key": k, "value": v}).
+								Debug("Mismatch between key and rev key - " +
+									"deleting entry because reverse key does not exist.")
+						}
+						return ScanVerdictDelete
+					} else {
+						if debug {
+							// In the worst case, the entry will timeout
+							log.WithFields(log.Fields{"key": k, "value": v}).WithError(err).
+								Debug("Mismatch between key and rev key - " +
+									"keeping entry, failed to retrieve reverse entry. Will try again.")
+						}
+						return ScanVerdictOK
+					}
+				}
+				k = revKey
+				v = rv
+				goto reverse // handle it based on the reverse entry
 			}
 		}
 
@@ -336,6 +386,19 @@ func (sns *StaleNATScanner) Check(k Key, v Value, _ EntryGet) ScanVerdict {
 	}
 
 	return ScanVerdictOK
+
+reverse:
+	if v.Type() == TypeNATReverse {
+		goto again
+	}
+
+	if debug {
+		log.WithFields(log.Fields{"key": k, "value": v}).
+			Debug("Mismatch between key and rev key - " +
+				"deleting entry because reverse key does not point to a reverse entry.")
+	}
+
+	return ScanVerdictDelete
 }
 
 // IterationStart satisfies EntryScannerSynced

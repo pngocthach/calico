@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,18 @@
 package mock
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 )
 
 type Map struct {
-	bpf.MapParameters
+	sync.Mutex
+	maps.MapParameters
 	logCxt *logrus.Entry
 
 	Contents map[string]string
@@ -37,12 +41,17 @@ type Map struct {
 	DeleteErr error
 }
 
-func (m *Map) MapFD() bpf.MapFD {
+func (m *Map) MapFD() maps.FD {
 	panic("implement me")
 }
 
 func (m *Map) Open() error {
 	m.logCxt.Info("Open called")
+	return nil
+}
+
+func (m *Map) Close() error {
+	m.logCxt.Info("Close called")
 	return nil
 }
 
@@ -56,10 +65,13 @@ func (m *Map) GetName() string {
 }
 
 func (m *Map) Path() string {
-	return m.Filename
+	return m.VersionedFilename()
 }
 
-func (m *Map) Iter(f bpf.IterCallback) error {
+func (m *Map) Iter(f maps.IterCallback) error {
+	m.Lock()
+	defer m.Unlock()
+
 	m.IterCount++
 
 	if m.IterErr != nil {
@@ -68,7 +80,7 @@ func (m *Map) Iter(f bpf.IterCallback) error {
 
 	for kstr, vstr := range m.Contents {
 		action := f([]byte(kstr), []byte(vstr))
-		if action == bpf.IterDelete {
+		if action == maps.IterDelete {
 			delete(m.Contents, kstr)
 		}
 	}
@@ -76,6 +88,13 @@ func (m *Map) Iter(f bpf.IterCallback) error {
 }
 
 func (m *Map) Update(k, v []byte) error {
+	m.Lock()
+	defer m.Unlock()
+
+	return m.updateUnlocked(k, v)
+}
+
+func (m *Map) updateUnlocked(k, v []byte) error {
 	m.UpdateCount++
 	if m.UpdateErr != nil {
 		return m.UpdateErr
@@ -92,7 +111,23 @@ func (m *Map) Update(k, v []byte) error {
 	return nil
 }
 
+func (m *Map) UpdateWithFlags(k, v []byte, flags int) error {
+	m.Lock()
+	defer m.Unlock()
+
+	if (flags & unix.BPF_EXIST) != 0 {
+		if _, ok := m.Contents[string(k)]; ok {
+			return fmt.Errorf("key exists")
+		}
+	}
+
+	return m.updateUnlocked(k, v)
+}
+
 func (m *Map) Get(k []byte) ([]byte, error) {
+	m.Lock()
+	defer m.Unlock()
+
 	m.GetCount++
 
 	vstr, ok := m.Contents[string(k)]
@@ -103,6 +138,9 @@ func (m *Map) Get(k []byte) ([]byte, error) {
 }
 
 func (m *Map) Delete(k []byte) error {
+	m.Lock()
+	defer m.Unlock()
+
 	m.DeleteCount++
 	if m.DeleteErr != nil {
 		return m.DeleteErr
@@ -115,6 +153,10 @@ func (m *Map) Delete(k []byte) error {
 	return nil
 }
 
+func (m *Map) DeleteIfExists(k []byte) error {
+	return m.Delete(k)
+}
+
 func (m *Map) OpCount() int {
 	return m.UpdateCount + m.IterCount + m.GetCount + m.DeleteCount
 }
@@ -123,7 +165,33 @@ func (m *Map) CopyDeltaFromOldMap() error {
 	return nil
 }
 
-func NewMockMap(params bpf.MapParameters) *Map {
+func (m *Map) ContainsKey(k []byte) bool {
+	m.Lock()
+	defer m.Unlock()
+
+	_, ok := m.Contents[string(k)]
+	return ok
+}
+
+func (m *Map) ContainsKV(k, v []byte) bool {
+	val, ok := m.Contents[string(k)]
+
+	if !ok {
+		return false
+	}
+
+	return val == string(v)
+}
+
+func (m *Map) IsEmpty() bool {
+	return len(m.Contents) == 0
+}
+
+func (*Map) ErrIsNotExists(err error) bool {
+	return maps.IsNotExists(err)
+}
+
+func NewMockMap(params maps.MapParameters) *Map {
 	if params.KeySize <= 0 {
 		logrus.WithField("params", params).Panic("KeySize should be >0")
 	}
@@ -143,7 +211,7 @@ func NewMockMap(params bpf.MapParameters) *Map {
 	return m
 }
 
-var _ bpf.Map = (*Map)(nil)
+var _ maps.Map = (*Map)(nil)
 
 type DummyMap struct{}
 
@@ -155,11 +223,15 @@ func (*DummyMap) Open() error {
 	return nil
 }
 
+func (*DummyMap) Close() error {
+	return nil
+}
+
 func (*DummyMap) EnsureExists() error {
 	return nil
 }
 
-func (*DummyMap) MapFD() bpf.MapFD {
+func (*DummyMap) MapFD() maps.FD {
 	return 0
 }
 
@@ -167,7 +239,7 @@ func (*DummyMap) Path() string {
 	return "DummyMap"
 }
 
-func (*DummyMap) Iter(_ bpf.IterCallback) error {
+func (*DummyMap) Iter(_ maps.IterCallback) error {
 	return nil
 }
 
@@ -185,4 +257,8 @@ func (*DummyMap) Delete(k []byte) error {
 
 func (*DummyMap) CopyDeltaFromOldMap() error {
 	return nil
+}
+
+func (*DummyMap) ErrIsNotExists(err error) bool {
+	return maps.IsNotExists(err)
 }

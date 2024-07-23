@@ -16,13 +16,15 @@ package metrics
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -42,8 +44,9 @@ func PortString() string {
 	return strconv.Itoa(Port)
 }
 
-func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (metric string, err error) {
+func GetRawMetrics(ip string, port int, name, caFile, certFile, keyFile string) (out string, err error) {
 	httpClient := http.Client{Timeout: time.Second}
+	defer httpClient.CloseIdleConnections()
 	method := "http"
 	// Client setup for TLS.
 	if certFile != "" {
@@ -76,7 +79,7 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 			// tlsConfig.ServerName, and we don't want that.  We will do certificate
 			// chain verification ourselves inside CertificateVerifier.
 			transport.TLSClientConfig.InsecureSkipVerify = true
-			caPEMBlock, err := ioutil.ReadFile(caFile)
+			caPEMBlock, err := os.ReadFile(caFile)
 			if err != nil {
 				log.WithError(err).Error("Failed to read CA data")
 				return "", err
@@ -98,6 +101,9 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 		}
 		httpClient.Transport = &transport
 		method = "https"
+	} else {
+		// Use a dedicated transport to avoid sharing connections between attempts.
+		httpClient.Transport = &http.Transport{}
 	}
 	var resp *http.Response
 	resp, err = httpClient.Get(fmt.Sprintf("%v://%v:%v/metrics", method, ip, port))
@@ -112,17 +118,34 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 		return
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	all, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(all), nil
+}
+
+func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (metric string, err error) {
+	metrics, err := GetRawMetrics(ip, port, name, caFile, certFile, keyFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to load metrics: %w", err)
+	}
+	scanner := bufio.NewScanner(bytes.NewBufferString(metrics))
+	found := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		log.WithField("line", line).Debug("Line")
 		if strings.HasPrefix(line, name) {
 			log.WithField("line", line).Info("Line")
 			metric = strings.TrimSpace(strings.TrimPrefix(line, name))
+			found = true
 			break
 		}
 	}
 	err = scanner.Err()
+	if !found {
+		return "", fmt.Errorf("metric %q not found in\n%s", name, metrics)
+	}
 	return
 }
 
@@ -137,6 +160,12 @@ func GetFelixMetricInt(felixIP, name string) (metric int, err error) {
 		return 0, err
 	}
 	return strconv.Atoi(s)
+}
+
+func GetFelixMetricIntFn(felixIP, name string) func() (metric int, err error) {
+	return func() (metric int, err error) {
+		return GetFelixMetricInt(felixIP, name)
+	}
 }
 
 func GetFelixMetricFloat(felixIP, name string) (metric float64, err error) {

@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -39,7 +38,7 @@ const (
 )
 
 // ConfigurationOptions may be used to setup the driver.
-// These are optional and most users will not depened on them and will instead use the defaults.
+// These are optional and most users will not depend on them and will instead use the defaults.
 type ConfigurationOptions struct {
 	// Location on the node's filesystem where the driver will host the
 	// per workload directory and the credentials for the workload.
@@ -108,7 +107,7 @@ func RetrieveConfig() (*ConfigurationOptions, error) {
 	config := ConfigurationOptions{}
 	if _, err := os.Stat(configFile); err == nil {
 		// Read the config from the file.
-		bytes, err := ioutil.ReadFile(configFile)
+		bytes, err := os.ReadFile(configFile)
 		if err != nil {
 			return nil, fmt.Errorf("Unable to read configuration at %s: %v", configFile, err)
 		}

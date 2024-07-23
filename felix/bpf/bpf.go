@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package bpf provides primitives to manage Calico-specific XDP programs
-// attached to network interfaces, along with the blacklist LPM map and the
+// attached to network interfaces, along with the blocklist LPM map and the
 // failsafe map.
 //
 // It does not call the bpf() syscall itself but executes external programs
@@ -21,12 +21,10 @@
 package bpf
 
 import (
-	"bufio"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -35,21 +33,24 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
+	"github.com/projectcalico/calico/felix/bpf/hook"
+	"github.com/projectcalico/calico/felix/bpf/utils"
 	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/proto"
 )
 
 type XDPMode int
 
 const (
-	XDPDriver XDPMode = iota
-	XDPOffload
-	XDPGeneric
+	XDPDriver  XDPMode = unix.XDP_FLAGS_DRV_MODE
+	XDPOffload XDPMode = unix.XDP_FLAGS_HW_MODE
+	XDPGeneric XDPMode = unix.XDP_FLAGS_SKB_MODE
 )
 
 type FindObjectMode uint32
@@ -76,8 +77,6 @@ const (
 	sockMapName                = "calico_sock_map_" + sockMapVersion
 	sockmapEndpointsMapVersion = "v1"
 	sockmapEndpointsMapName    = "calico_sk_endpoints_" + sockmapEndpointsMapVersion
-
-	defaultBPFfsPath = "/sys/fs/bpf"
 )
 
 var (
@@ -169,12 +168,12 @@ func NewBPFLib(binDir string) (*BPFLib, error) {
 		return nil, errors.New("bpftool not found in $PATH")
 	}
 
-	bpfDir, err := MaybeMountBPFfs()
+	bpfDir, err := utils.MaybeMountBPFfs()
 	if err != nil {
 		return nil, err
 	}
 
-	cgroupV2Dir, err := MaybeMountCgroupV2()
+	cgroupV2Dir, err := utils.MaybeMountCgroupV2()
 	if err != nil {
 		return nil, err
 	}
@@ -191,128 +190,6 @@ func NewBPFLib(binDir string) (*BPFLib, error) {
 		cgroupV2Dir: cgroupV2Dir,
 		xdpDir:      xdpDir,
 	}, nil
-}
-
-func MaybeMountBPFfs() (string, error) {
-	var err error
-	bpffsPath := defaultBPFfsPath
-
-	mnt, err := isMount(defaultBPFfsPath)
-	if err != nil {
-		return "", err
-	}
-
-	fsBPF, err := isBPF(defaultBPFfsPath)
-	if err != nil {
-		return "", err
-	}
-
-	if !mnt {
-		err = mountBPFfs(defaultBPFfsPath)
-	} else if !fsBPF {
-		var runfsBPF bool
-
-		bpffsPath = "/var/run/calico/bpffs"
-
-		if err := os.MkdirAll(bpffsPath, 0700); err != nil {
-			return "", err
-		}
-
-		runfsBPF, err = isBPF(bpffsPath)
-		if err != nil {
-			return "", err
-		}
-
-		if !runfsBPF {
-			err = mountBPFfs(bpffsPath)
-		}
-	}
-
-	return bpffsPath, err
-}
-
-func MaybeMountCgroupV2() (string, error) {
-	var err error
-	cgroupV2Path := "/run/calico/cgroup"
-
-	if err := os.MkdirAll(cgroupV2Path, 0700); err != nil {
-		return "", err
-	}
-
-	mnt, err := isMount(cgroupV2Path)
-	if err != nil {
-		return "", fmt.Errorf("error checking if %s is a mount: %v", cgroupV2Path, err)
-	}
-
-	fsCgroup, err := isCgroupV2(cgroupV2Path)
-	if err != nil {
-		return "", fmt.Errorf("error checking if %s is CgroupV2: %v", cgroupV2Path, err)
-	}
-
-	if !mnt {
-		err = mountCgroupV2(cgroupV2Path)
-	} else if !fsCgroup {
-		err = fmt.Errorf("something that's not cgroup v2 is already mounted in %s", cgroupV2Path)
-	}
-
-	return cgroupV2Path, err
-}
-
-func mountCgroupV2(path string) error {
-	return syscall.Mount(path, path, "cgroup2", 0, "")
-}
-
-func isMount(path string) (bool, error) {
-	procPath := "/proc/self/mountinfo"
-
-	mi, err := os.Open(procPath)
-	if err != nil {
-		return false, err
-	}
-	defer mi.Close()
-
-	sc := bufio.NewScanner(mi)
-
-	for sc.Scan() {
-		line := sc.Text()
-		columns := strings.Split(line, " ")
-		if len(columns) < 7 {
-			return false, fmt.Errorf("not enough fields from line %q: %+v", line, columns)
-		}
-
-		mountPoint := columns[4]
-		if filepath.Clean(mountPoint) == filepath.Clean(path) {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-func isBPF(path string) (bool, error) {
-	bpffsMagicNumber := uint32(0xCAFE4A11)
-
-	var fsdata unix.Statfs_t
-	if err := unix.Statfs(path, &fsdata); err != nil {
-		return false, fmt.Errorf("%s is not mounted", path)
-	}
-
-	return uint32(fsdata.Type) == bpffsMagicNumber, nil
-}
-
-func isCgroupV2(path string) (bool, error) {
-	cgroup2MagicNumber := uint32(0x63677270)
-
-	var fsdata unix.Statfs_t
-	if err := unix.Statfs(path, &fsdata); err != nil {
-		return false, fmt.Errorf("%s is not mounted", path)
-	}
-
-	return uint32(fsdata.Type) == cgroup2MagicNumber, nil
-}
-
-func mountBPFfs(path string) error {
-	return syscall.Mount(path, path, "bpf", 0, "")
 }
 
 type BPFDataplane interface {
@@ -459,7 +336,7 @@ func (b *BPFLib) NewCIDRMap(ifName string, family IPFamily) (string, error) {
 
 func (b *BPFLib) ListCIDRMaps(family IPFamily) ([]string, error) {
 	var ifNames []string
-	maps, err := ioutil.ReadDir(b.xdpDir)
+	maps, err := os.ReadDir(b.xdpDir)
 	if err != nil {
 		return nil, err
 	}
@@ -510,12 +387,45 @@ type mapEntry struct {
 	Err   string   `json:"error"`
 }
 
-type progInfo struct {
-	Id     int    `json:"id"`
-	Type   string `json:"type"`
-	Tag    string `json:"tag"`
-	MapIds []int  `json:"map_ids"`
-	Err    string `json:"error"`
+type perCpuMapEntry []struct {
+	Key    []string `json:"key"`
+	Values []struct {
+		CPU   int      `json:"cpu"`
+		Value []string `json:"value"`
+	} `json:"values"`
+}
+
+type ProgInfo struct {
+	Name   string      `json:"name"`
+	Id     int         `json:"id"`
+	Type   BPFProgType `json:"type"`
+	Tag    string      `json:"tag"`
+	MapIds []int       `json:"map_ids"`
+	Err    string      `json:"error"`
+}
+
+// BPFProgType is usually a string, but if the type is not known to bpftool, it
+// would be represented by an int. We do not care about those, but we must not
+// fail on parsing them.
+type BPFProgType string
+
+func (t *BPFProgType) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" || string(data) == `""` || len(data) < 1 {
+		return nil
+	}
+
+	if data[0] == '"' {
+		var s string
+		err := json.Unmarshal(data, &s)
+		if err != nil {
+			return fmt.Errorf("cannot parse json output: %v\n%s", err, data)
+		}
+		*t = BPFProgType(s)
+		return nil
+	}
+
+	*t = BPFProgType(data)
+	return nil
 }
 
 type cgroupProgEntry struct {
@@ -998,7 +908,7 @@ func (b *BPFLib) loadXDPRaw(objPath, ifName string, mode XDPMode, mapArgs []stri
 }
 
 func (b *BPFLib) getMapArgs(ifName string) ([]string, error) {
-	// FIXME harcoded ipv4, do we need both?
+	// FIXME hardcoded ipv4, do we need both?
 	mapName := getCIDRMapName(ifName, IPFamilyV4)
 	mapPath := filepath.Join(b.xdpDir, mapName)
 
@@ -1078,7 +988,7 @@ func (b *BPFLib) GetXDPTag(ifName string) (string, error) {
 		return "", fmt.Errorf("failed to show XDP program (%s): %s\n%s", progPath, err, output)
 	}
 
-	p := progInfo{}
+	p := ProgInfo{}
 	err = json.Unmarshal(output, &p)
 	if err != nil {
 		return "", fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -1168,7 +1078,7 @@ func (b *BPFLib) GetMapsFromXDP(ifName string) ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to show XDP program (%s): %s\n%s", progPath, err, output)
 	}
-	p := progInfo{}
+	p := ProgInfo{}
 	err = json.Unmarshal(output, &p)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -1258,12 +1168,12 @@ func (b *BPFLib) GetXDPIfaces() ([]string, error) {
 	printCommand(prog, args...)
 	output, err := exec.Command(prog, args...).CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("failed to show interface informations: %s\n%s", err, output)
+		return nil, fmt.Errorf("failed to show interface information: %s\n%s", err, output)
 	}
 
 	m := ifaceRegexp.FindAllStringSubmatch(string(output), -1)
 	if len(m) < 2 {
-		return nil, fmt.Errorf("failed to parse interface informations")
+		return nil, fmt.Errorf("failed to parse interface information")
 	}
 
 	for _, i := range m {
@@ -1289,9 +1199,11 @@ func (b *BPFLib) GetXDPIfaces() ([]string, error) {
 // For example, for 8080/TCP:
 //
 // [
-//  06,     IPPROTO_TCP as defined by <linux/in.h>
-//  00,     padding
-//  90, 1F  LSB in little endian order
+//
+//	06,     IPPROTO_TCP as defined by <linux/in.h>
+//	00,     padding
+//	90, 1F  LSB in little endian order
+//
 // ]
 func failsafeToHex(proto uint8, port uint16) ([]string, error) {
 	portBytes := make([]byte, 2)
@@ -1353,8 +1265,10 @@ func hexToFailsafe(hexString []string) (proto uint8, port uint16, err error) {
 // For example, for "192.168.0.0/16":
 //
 // [
-//  10, 00, 00, 00,   mask in little endian order
-//  C0, A8, 00, 00    IP address
+//
+//	10, 00, 00, 00,   mask in little endian order
+//	C0, A8, 00, 00    IP address
+//
 // ]
 func CidrToHex(cidr string) ([]string, error) {
 	cidrParts := strings.Split(cidr, "/")
@@ -1376,6 +1290,11 @@ func CidrToHex(cidr string) ([]string, error) {
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		return nil, fmt.Errorf("IP %q is not IPv4", ip)
+	}
+
+	// Check bounds on the mask since the mask will be in CIDR notation and should range between 0 and 32
+	if mask > 32 || mask < 0 {
+		return nil, fmt.Errorf("mask %d should be between 0 and 32", mask)
 	}
 
 	maskBytes := make([]byte, 4)
@@ -1584,7 +1503,11 @@ func (b *BPFLib) getSkMsgID() (int, error) {
 	return -1, nil
 }
 
-func getAllProgs() ([]progInfo, error) {
+func GetAllProgs() ([]ProgInfo, error) {
+	return getAllProgs()
+}
+
+func getAllProgs() ([]ProgInfo, error) {
 	prog := "bpftool"
 	args := []string{
 		"--json",
@@ -1599,13 +1522,39 @@ func getAllProgs() ([]progInfo, error) {
 		return nil, fmt.Errorf("failed to get progs: %s\n%s", err, output)
 	}
 
-	var progs []progInfo
+	var progs []ProgInfo
 	err = json.Unmarshal(output, &progs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 
 	return progs, nil
+}
+
+func GetProgByID(id int) (ProgInfo, error) {
+	cmd := "bpftool"
+	args := []string{
+		"--json",
+		"--pretty",
+		"prog",
+		"show",
+		"id",
+		strconv.Itoa(id),
+	}
+
+	printCommand(cmd, args...)
+	output, err := exec.Command(cmd, args...).CombinedOutput()
+	if err != nil {
+		return ProgInfo{}, fmt.Errorf("failed to get prog: %s\n%s", err, output)
+	}
+
+	var prog ProgInfo
+	err = json.Unmarshal(output, &prog)
+	if err != nil {
+		return ProgInfo{}, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
+	}
+
+	return prog, nil
 }
 
 func (b *BPFLib) getAttachedSockopsID() (int, error) {
@@ -1654,7 +1603,7 @@ func (b *BPFLib) getSockMapID(progID int) (int, error) {
 		return -1, fmt.Errorf("failed to get sockmap ID for prog %d: %s\n%s", progID, err, output)
 	}
 
-	p := progInfo{}
+	p := ProgInfo{}
 	err = json.Unmarshal(output, &p)
 	if err != nil {
 		return -1, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -2240,8 +2189,109 @@ func KTimeNanos() int64 {
 	return ts.Nano()
 }
 
-const jumpMapVersion = 2
+func PolicyDebugJSONFileName(iface, polDir string, ipFamily proto.IPVersion) string {
+	return path.Join(RuntimePolDir, fmt.Sprintf("%s_%s_v%d.json", iface, polDir, ipFamily))
+}
 
-func JumpMapName() string {
-	return fmt.Sprintf("cali_jump%d", jumpMapVersion)
+func MapPinDir(typ int, name, iface string, h hook.Hook) string {
+	PinBaseDir := path.Join(bpfdefs.DefaultBPFfsPath, "tc")
+	subDir := "globals"
+	return path.Join(PinBaseDir, subDir)
+}
+
+type TcList []struct {
+	DevName string `json:"devname"`
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	Kind    string `json:"kind"`
+}
+
+type XDPList []struct {
+	DevName string `json:"devname"`
+	IfIndex int    `json:"ifindex"`
+	Mode    string `json:"mode"`
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+}
+
+// ListTcXDPAttachedProgs returns all programs attached to TC or XDP hooks.
+func ListTcXDPAttachedProgs(dev ...string) (TcList, XDPList, error) {
+	var (
+		out []byte
+		err error
+	)
+
+	if len(dev) < 1 {
+		// Find all the programs that are attached to interfaces.
+		out, err = exec.Command("bpftool", "net", "-j").Output()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list attached bpf programs: %w", err)
+		}
+	} else {
+		out, err = exec.Command("bpftool", "-j", "net", "show", "dev", dev[0]).Output()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list attached bpf programs: %w", err)
+		}
+	}
+
+	var attached []struct {
+		TC  TcList  `json:"tc"`
+		XDP XDPList `json:"xdp"`
+	}
+
+	err = json.Unmarshal(out, &attached)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse list of attached BPF programs: %w\n%s", err, out)
+	}
+
+	return attached[0].TC, attached[0].XDP, nil
+}
+
+// IterMapCmdOutput iterates over the output of a command obtained by DumpMapCmd
+func IterMapCmdOutput(output []byte, f func(k, v []byte)) error {
+	var mp []mapEntry
+	err := json.Unmarshal(output, &mp)
+	if err != nil {
+		return fmt.Errorf("cannot parse json output: %w\n%s", err, output)
+	}
+
+	for _, me := range mp {
+		k, err := hexStringsToBytes(me.Key)
+		if err != nil {
+			return fmt.Errorf("failed parsing entry %s key: %w", me, err)
+		}
+		v, err := hexStringsToBytes(me.Value)
+		if err != nil {
+			return fmt.Errorf("failed parsing entry %s val: %w", me, err)
+		}
+		f(k, v)
+	}
+
+	return nil
+}
+
+// IterPerCpuMapCmdOutput iterates over the output of the dump of per-cpu map
+func IterPerCpuMapCmdOutput(output []byte, f func(k, v []byte)) error {
+	var mp perCpuMapEntry
+	var v []byte
+	err := json.Unmarshal(output, &mp)
+	if err != nil {
+		return fmt.Errorf("cannot parse json output: %w\n%s", err, output)
+	}
+
+	for _, me := range mp {
+		k, err := hexStringsToBytes(me.Key)
+		if err != nil {
+			return fmt.Errorf("failed parsing entry %v key: %w", me, err)
+		}
+		for _, value := range me.Values {
+			perCpuVal, err := hexStringsToBytes(value.Value)
+			if err != nil {
+				return fmt.Errorf("failed parsing entry %v val: %w", me, err)
+			}
+			v = append(v, perCpuVal...)
+		}
+		f(k, v)
+	}
+	return nil
 }

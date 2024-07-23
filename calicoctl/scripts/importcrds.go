@@ -16,7 +16,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -33,7 +32,7 @@ const (
 func main() {
 	crdPath := "../../../../libcalico-go/config/crd/"
 
-	fs, _ := ioutil.ReadDir(crdPath)
+	fs, _ := os.ReadDir(crdPath)
 	out, _ := os.Create("../../commands/crds/crds.go")
 	_, _ = out.Write([]byte(fmt.Sprintf(`// Copyright (c) %s Tigera, Inc. All rights reserved.
 
@@ -50,13 +49,13 @@ func main() {
 // limitations under the License.
 
 `, time.Now().Format("2006"))))
-	_, _ = out.Write([]byte("package crds \n\n//DO NOT CHANGE. This is a generated file. In order to update, run `make gen-crds`.\n\nconst (\n"))
+	_, _ = out.Write([]byte("package crds\n\n//DO NOT CHANGE. This is a generated file. In order to update, run `make gen-crds`.\n\nconst (\n"))
 	for _, f := range fs {
 		if strings.HasSuffix(f.Name(), fileSuffix) && strings.HasPrefix(f.Name(), crdPrefix) {
 			fname := strings.TrimPrefix(f.Name(), crdPrefix)
 			name := strings.TrimSuffix(fname, fileSuffix)
 			_, _ = out.Write([]byte("\t" + name + " = "))
-			b, _ := ioutil.ReadFile(crdPath + f.Name())
+			b, _ := os.ReadFile(crdPath + f.Name())
 			fstr := strconv.Quote(string(b))
 			_, _ = out.Write([]byte(fstr))
 			_, _ = out.Write([]byte("\n"))

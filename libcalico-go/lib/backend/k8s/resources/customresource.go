@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
@@ -39,23 +40,52 @@ import (
 // mechanism for a 1:1 mapping between a Calico Resource and an equivalent Kubernetes
 // custom resource type.
 type customK8sResourceClient struct {
-	clientSet           *kubernetes.Clientset
-	restClient          *rest.RESTClient
-	name                string
-	resource            string
-	description         string
-	k8sResourceType     reflect.Type
+	clientSet  *kubernetes.Clientset
+	restClient *rest.RESTClient
+
+	// Name of the CRD. Not used.
+	name string
+
+	// resource is the kind of the CRD managed by this client, used as part of the
+	// endpoint generated for Kubernetes API calls.
+	resource string
+
+	// CRD description. Not used.
+	description string
+
+	// Types used to generate the returned structs.
+	k8sResourceType reflect.Type
+	k8sListType     reflect.Type
+
+	// k8sResourceTypeMeta is the TypeMeta to set for all resources
+	// returned by this client. It is used to set the GroupVersion.
 	k8sResourceTypeMeta metav1.TypeMeta
-	k8sListType         reflect.Type
-	namespaced          bool
-	resourceKind        string
-	versionconverter    VersionConverter
+
+	// Whether or not the CRD managed by this is namespaced. Used for generating
+	// Kubernetes API call endpoints.
+	namespaced bool
+
+	// resourceKind is the kind to set for TypeMeta.Kind for all resources
+	// returned by this client.
+	resourceKind string
+
+	// versionConverter is an optional hook to convert the returned data from the CRD
+	// from one format to another before returning it to the caller.
+	versionconverter VersionConverter
+
+	// validator used to validate resources.
+	validator Validator
 }
 
 // VersionConverter converts v1 or v3 k8s resources into v3 resources.
 // For a v3 resource, the conversion should be a no-op.
 type VersionConverter interface {
 	ConvertFromK8s(Resource) (Resource, error)
+}
+
+// Validator validates a resource.
+type Validator interface {
+	Validate(Resource) error
 }
 
 // Create creates a new Custom K8s Resource instance in the k8s API from the supplied KVPair.
@@ -72,6 +102,14 @@ func (c *customK8sResourceClient) Create(ctx context.Context, kvp *model.KVPair)
 	if err != nil {
 		logContext.WithError(err).Debug("Error creating resource")
 		return nil, err
+	}
+
+	// Validate the resource if the Validator is defined.
+	if c.validator != nil {
+		if err = c.validator.Validate(resIn); err != nil {
+			logContext.WithError(err).Debug("Error creating resource")
+			return nil, err
+		}
 	}
 
 	// Send the update request using the REST interface.
@@ -116,6 +154,14 @@ func (c *customK8sResourceClient) Update(ctx context.Context, kvp *model.KVPair)
 	if err != nil {
 		logContext.WithError(err).Debug("Error updating resource")
 		return nil, err
+	}
+
+	// Validate the resource if the Validator is defined.
+	if c.validator != nil {
+		if err = c.validator.Validate(resIn); err != nil {
+			logContext.WithError(err).Debug("Error updating resource")
+			return nil, err
+		}
 	}
 
 	// Send the update request using the name.
@@ -175,7 +221,13 @@ func (c *customK8sResourceClient) Delete(ctx context.Context, k model.Key, revis
 
 	opts := &metav1.DeleteOptions{}
 	if uid != nil {
-		opts.Preconditions = &metav1.Preconditions{UID: uid}
+		// The UID in the v3 resources is a translation of the UID in the CR. Translate it
+		// before passing as a precondition.
+		uid, err := conversion.ConvertUID(*uid)
+		if err != nil {
+			return nil, err
+		}
+		opts.Preconditions = &metav1.Preconditions{UID: &uid}
 	}
 
 	// Delete the resource using the name.
@@ -371,7 +423,9 @@ func (c *customK8sResourceClient) convertResourceToKVPair(r Resource) (*model.KV
 		}
 	}
 
-	r.GetObjectKind().SetGroupVersionKind(c.k8sResourceTypeMeta.GetObjectKind().GroupVersionKind())
+	gvk := c.k8sResourceTypeMeta.GetObjectKind().GroupVersionKind()
+	gvk.Kind = c.resourceKind
+	r.GetObjectKind().SetGroupVersionKind(gvk)
 	kvp := &model.KVPair{
 		Key: model.ResourceKey{
 			Name:      r.GetObjectMeta().GetName(),

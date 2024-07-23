@@ -87,6 +87,11 @@ message ToDataplane {
     // HostIPRemove is sent when a host IP is removed.
     HostMetadataRemove host_metadata_remove = 18;
 
+    // HostMetadataV4V6Update is sent when a host is added or updated.
+    HostMetadataV4V6Update host_metadata_v4v6_update = 37;
+    // HostIPRemove is sent when a host is removed.
+    HostMetadataV4V6Remove host_metadata_v4v6_remove = 38; 
+
     // IPAMPoolUpdate is sent when an IPAM pool is added/updated.
     IPAMPoolUpdate ipam_pool_update = 16;
     // IPAMPoolRemove is sent when an IPAM pool is removed.
@@ -112,9 +117,9 @@ message ToDataplane {
     // VXLANTunnelEndpointRemove is send when a route is deleted.
     VXLANTunnelEndpointRemove vtep_remove = 26;
 
-    // WireguardEndpointUpdate is sent to setup wireguard on the host.
+    // WireguardEndpointUpdate is sent to setup IPv4 wireguard on the host.
     WireguardEndpointUpdate wireguard_endpoint_update = 27;
-    // WireguardEndpointRemove is sent to undo wireguard on the host.
+    // WireguardEndpointRemove is sent to undo IPv4 wireguard on the host.
     WireguardEndpointRemove wireguard_endpoint_remove = 28;
 
     // GlobalBGPConfigUpdate is sent when global BGPConfiguration changes.
@@ -124,6 +129,16 @@ message ToDataplane {
 
     ServiceUpdate service_update = 31;
     ServiceRemove service_remove = 32;
+
+    // WireguardEndpointV6Update is sent to setup IPv6 wireguard on the host.
+    WireguardEndpointV6Update wireguard_endpoint_v6_update = 33;
+    // WireguardEndpointV6Remove is sent to undo IPv6 wireguard on the host.
+    WireguardEndpointV6Remove wireguard_endpoint_v6_remove = 34;
+
+    // HostMetadataV6Update is sent when a host IPv6 address is added or updated.
+    HostMetadataV6Update host_metadata_v6_update = 35;
+    // HostMetadataV6Remove is sent when a host IPv6 address is removed.
+    HostMetadataV6Remove host_metadata_v6_remove = 36;
   }
 }
 
@@ -150,11 +165,20 @@ message FromDataplane {
     // WireguardStatusUpdate is sent when the wireguard is available with the
     // crypto primitives set up.
     WireguardStatusUpdate wireguard_status_update = 9;
+
+    DataplaneInSync dataplane_in_sync = 10;
   }
 }
 
 message ConfigUpdate {
+  string message = 3;
   map<string, string> config = 1;
+  map<uint32, RawConfig> source_to_raw_config = 2;
+}
+
+message RawConfig {
+  string source = 1;
+  map<string,string> config = 2;
 }
 
 message InSync {
@@ -222,6 +246,8 @@ message Policy {
   repeated Rule outbound_rules = 2;
   bool untracked = 3;
   bool pre_dnat = 4;
+
+  string original_selector = 6;
 }
 
 enum IPVersion {
@@ -373,6 +399,7 @@ message WorkloadEndpoint {
   repeated NatInfo ipv4_nat = 8;
   repeated NatInfo ipv6_nat = 9;
   repeated string allow_spoofed_source_prefixes = 10;
+  map<string, string> annotations = 11;
 }
 
 message WorkloadEndpointRemove {
@@ -446,6 +473,25 @@ message WorkloadEndpointStatusRemove {
 message WireguardStatusUpdate {
   // Wireguard public-key set on the interface.
   string public_key = 1;
+
+  // The IP version of this update
+  IPVersion ip_version = 2;
+}
+
+message DataplaneInSync {
+}
+
+message HostMetadataV4V6Update {
+  string hostname = 1;
+  string ipv4_addr = 2;
+  string ipv6_addr = 3;
+  string asnumber = 4;
+  map<string, string> labels = 5;
+}
+
+message HostMetadataV4V6Remove {
+  string hostname = 1;
+  string ipv4_addr = 2;
 }
 
 message HostMetadataUpdate {
@@ -456,6 +502,16 @@ message HostMetadataUpdate {
 message HostMetadataRemove {
   string hostname = 1;
   string ipv4_addr = 2;
+}
+
+message HostMetadataV6Update {
+  string hostname = 1;
+  string ipv6_addr = 2;
+}
+
+message HostMetadataV6Remove {
+  string hostname = 1;
+  string ipv6_addr = 2;
 }
 
 message IPAMPoolUpdate {
@@ -470,11 +526,14 @@ message IPAMPoolRemove {
 message IPAMPool {
   string cidr = 1;
   bool masquerade = 2;
+  string ipip_mode = 3;
+  string vxlan_mode = 4;
 }
 
 message Encapsulation {
   bool ipip_enabled = 1;
   bool vxlan_enabled = 2;
+  bool vxlan_enabled_v6 = 3;
 }
 
 message ServiceAccountUpdate {
@@ -562,18 +621,34 @@ message VXLANTunnelEndpointRemove {
 }
 
 message WireguardEndpointUpdate {
-  // The name of the wireguard host.
+  // The name of the IPv4 wireguard host.
   string hostname = 1;
 
-  // The public key for this endpoint.
+  // The public key for IPv4 wireguard on this endpoint.
   string public_key = 2;
 
-  // The IP address of the wireguard interface.
+  // The IP address of the IPv4 wireguard interface.
   string interface_ipv4_addr = 3;
 }
 
 message WireguardEndpointRemove {
-  // The name of the wireguard host.
+  // The name of the IPv4 wireguard host.
+  string hostname = 1;
+}
+
+message WireguardEndpointV6Update {
+  // The name of the IPv6 wireguard host.
+  string hostname = 1;
+
+  // The public key for IPv6 wireguard on this endpoint.
+  string public_key_v6 = 2;
+
+  // The IP address of the IPv6 wireguard interface.
+  string interface_ipv6_addr = 3;
+}
+
+message WireguardEndpointV6Remove {
+  // The name of the IPv6 wireguard host.
   string hostname = 1;
 }
 
@@ -583,6 +658,12 @@ message GlobalBGPConfigUpdate {
   repeated string service_loadbalancer_cidrs = 3;
 }
 
+message ServicePort {
+	string Protocol = 1;
+	int32 Port = 2;
+	int32 NodePort = 3;
+}
+
 message ServiceUpdate {
 	string name = 1;
 	string namespace = 2;
@@ -590,6 +671,7 @@ message ServiceUpdate {
 	string cluster_ip = 4;
 	string loadbalancer_ip = 5;
 	repeated string external_ips = 6;
+	repeated ServicePort ports = 7;
 }
 
 message ServiceRemove {

@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,23 +15,20 @@
 package ipsets_test
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
-
-	"bufio"
-
-	"time"
-
-	"bytes"
-	"regexp"
 
 	. "github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
@@ -46,14 +43,14 @@ var (
 
 func newMockDataplane() *mockDataplane {
 	return &mockDataplane{
-		IPSetMembers:     make(map[string]set.Set),
+		IPSetMembers:     make(map[string]set.Set[string]),
 		IPSetMetadata:    make(map[string]setMetadata),
-		FailDestroyNames: set.New(),
+		FailDestroyNames: set.New[string](),
 	}
 }
 
 type mockDataplane struct {
-	IPSetMembers      map[string]set.Set
+	IPSetMembers      map[string]set.Set[string]
 	IPSetMetadata     map[string]setMetadata
 	Cmds              []CmdIface
 	CmdNames          []string
@@ -62,28 +59,30 @@ type mockDataplane struct {
 	ListOpFailures    []string
 	RestoreOpFailures []string
 	FailNextDestroy   bool
-	FailDestroyNames  set.Set
+	FailDestroyNames  set.Set[string]
 
 	// Record when various (expected) error cases are hit.
 	TriedToDeleteNonExistent bool
 	TriedToAddExistent       bool
 
+	LinesExecuted     []string
 	AttemptedDestroys []string
 
 	CumulativeSleep time.Duration
+	numRestoreCalls int
 }
 
 func (d *mockDataplane) ExpectMembers(expected map[string][]string) {
 	// Input has a slice for each set, convert to a set for comparison.
-	membersToCompare := map[string]set.Set{}
+	membersToCompare := map[string]set.Set[string]{}
 	for name, members := range expected {
-		memberSet := set.New()
+		memberSet := set.New[string]()
 		for _, member := range members {
 			memberSet.Add(member)
 		}
 		membersToCompare[name] = memberSet
 	}
-	Expect(d.IPSetMembers).To(Equal(membersToCompare))
+	ExpectWithOffset(1, d.IPSetMembers).To(Equal(membersToCompare))
 }
 
 func (d *mockDataplane) newCmd(name string, arg ...string) CmdIface {
@@ -95,6 +94,7 @@ func (d *mockDataplane) newCmd(name string, arg ...string) CmdIface {
 
 	switch arg[0] {
 	case "restore":
+		d.numRestoreCalls++
 		Expect(len(arg)).To(Equal(1))
 		cmd = &restoreCmd{
 			Dataplane: d,
@@ -108,11 +108,16 @@ func (d *mockDataplane) newCmd(name string, arg ...string) CmdIface {
 			SetName:   name,
 		}
 	case "list":
-		Expect(len(arg)).To(Equal(1))
-		cmd = &listCmd{
+		Expect(len(arg)).To(Equal(2))
+		command := &listCmd{
 			Dataplane: d,
 			resultC:   make(chan error),
+			allIpSets: arg[1] == "-name",
 		}
+		if !command.allIpSets {
+			command.SetName = arg[1]
+		}
+		cmd = command
 	default:
 		Fail(fmt.Sprintf("Unexpected command %v", arg))
 	}
@@ -121,6 +126,10 @@ func (d *mockDataplane) newCmd(name string, arg ...string) CmdIface {
 	d.CmdNames = append(d.CmdNames, arg[0])
 
 	return cmd
+}
+
+func (d *mockDataplane) NumRestoreCalls() int {
+	return d.numRestoreCalls
 }
 
 func (d *mockDataplane) sleep(t time.Duration) {
@@ -179,7 +188,17 @@ func (c *restoreCmd) StdinPipe() (WriteCloserFlusher, error) {
 	if c.Dataplane.popRestoreFailure("write-ip") {
 		log.Warn("Returning a bad pipe that will fail when writing an IP")
 		return &badPipe{
-			FirstWriteFailRegexp: regexp.MustCompile(`\s*\d+\.\d+\.\d+\.\d+\s*`),
+			WriteFailRegexp: regexp.MustCompile(`\s*\d+\.\d+\.\d+\.\d+\s*`),
+		}, nil
+	}
+	if c.Dataplane.popRestoreFailure("write-ip-only") {
+		log.Warn("Returning a bad pipe that will fail when writing the first IP (and only that IP)")
+		// To hit this case, we have to trick the main function into returning
+		// without an error.
+		c.Stdin = bytes.NewBufferString("COMMIT\n")
+		return &badPipe{
+			WriteFailRegexp: regexp.MustCompile(`\s*\d+\.\d+\.\d+\.\d+\s*`),
+			OnlyFailOnce:    true,
 		}, nil
 	}
 	if c.Dataplane.popRestoreFailure("close") {
@@ -268,35 +287,50 @@ func (c *restoreCmd) main() {
 			"line":    line,
 			"subCmd":  subCmd,
 		}).Info("Mock dataplane, analysing ipset restore line")
+		c.Dataplane.LinesExecuted = append(c.Dataplane.LinesExecuted, line)
 		if subCmd != "COMMIT" {
 			Expect(commitSeen).To(BeFalse())
 		}
 		switch subCmd {
 		case "create":
-			Expect(len(parts)).To(Equal(7))
-
 			name := parts[1]
 			Expect(len(name)).To(BeNumerically("<=", MaxIPSetNameLength))
 			Expect(name).To(HavePrefix("cali"))
 
 			ipSetType := IPSetType(parts[2])
-			Expect(ipSetType.IsValid()).To(BeTrue())
+			Expect(ipSetType.IsValid()).To(BeTrue(), "Invalid IP set type: "+parts[2])
 
-			Expect(parts[3]).To(Equal("family"))
-			ipFamily := IPFamily(parts[4])
-			Expect(ipFamily.IsValid()).To(BeTrue())
+			var meta setMetadata
+			if ipSetType == IPSetTypeBitmapPort {
+				// Has no "family".
+				// create cali4t0 bitmap:port range 10-1024
+				Expect(parts).To(HaveLen(5))
+				Expect(parts[3]).To(Equal("range"))
+				rMin, rMax, err := ParseRange(parts[4])
+				Expect(err).NotTo(HaveOccurred())
+				meta = setMetadata{
+					Name:     name,
+					RangeMin: rMin,
+					RangeMax: rMax,
+					Type:     ipSetType,
+				}
+			} else {
+				Expect(parts).To(HaveLen(7))
+				Expect(parts[3]).To(Equal("family"))
+				ipFamily := IPFamily(parts[4])
+				Expect(ipFamily.IsValid()).To(BeTrue())
 
-			Expect(parts[5]).To(Equal("maxelem"))
-			maxElem, err := strconv.Atoi(parts[6])
-			Expect(err).NotTo(HaveOccurred())
-
-			setMetadata := setMetadata{
-				Name:    name,
-				Family:  ipFamily,
-				MaxSize: maxElem,
-				Type:    ipSetType,
+				Expect(parts[5]).To(Equal("maxelem"))
+				maxElem, err := strconv.Atoi(parts[6])
+				Expect(err).NotTo(HaveOccurred())
+				meta = setMetadata{
+					Name:    name,
+					Family:  ipFamily,
+					MaxSize: maxElem,
+					Type:    ipSetType,
+				}
 			}
-			log.WithField("setMetadata", setMetadata).Info("Set created")
+			log.WithField("setMetadata", meta).Info("Set created")
 
 			if _, ok := c.Dataplane.IPSetMembers[name]; ok {
 				_, _ = c.Stderr.Write([]byte("set exists"))
@@ -304,8 +338,8 @@ func (c *restoreCmd) main() {
 				return
 			}
 
-			c.Dataplane.IPSetMembers[name] = set.New()
-			c.Dataplane.IPSetMetadata[name] = setMetadata
+			c.Dataplane.IPSetMembers[name] = set.New[string]()
+			c.Dataplane.IPSetMetadata[name] = meta
 		case "destroy":
 			Expect(len(parts)).To(Equal(2))
 			name := parts[1]
@@ -417,10 +451,12 @@ func (d *restoreCmd) CombinedOutput() ([]byte, error) {
 }
 
 type setMetadata struct {
-	Name    string
-	Family  IPFamily
-	Type    IPSetType
-	MaxSize int
+	Name     string
+	Family   IPFamily
+	Type     IPSetType
+	MaxSize  int
+	RangeMin int
+	RangeMax int
 }
 
 type destroyCmd struct {
@@ -490,6 +526,7 @@ func (d *destroyCmd) CombinedOutput() ([]byte, error) {
 type listCmd struct {
 	Dataplane *mockDataplane
 	SetName   string
+	allIpSets bool
 	Stdout    *io.PipeWriter
 	resultC   chan error
 }
@@ -541,10 +578,11 @@ func (c *listCmd) StdoutPipe() (io.ReadCloser, error) {
 }
 
 type badPipe struct {
-	data                 []byte
-	CloseFail            bool
-	FirstWriteFailRegexp *regexp.Regexp
-	ReadError            error
+	data            []byte
+	CloseFail       bool
+	WriteFailRegexp *regexp.Regexp
+	OnlyFailOnce    bool
+	ReadError       error
 }
 
 func (pipe *badPipe) Read(p []byte) (n int, err error) {
@@ -566,14 +604,20 @@ func (pipe *badPipe) Read(p []byte) (n int, err error) {
 }
 
 func (p *badPipe) Write(x []byte) (n int, err error) {
-	if p.FirstWriteFailRegexp != nil {
+	if p.WriteFailRegexp != nil {
 		// Delay failure until we hit the regex.
 		log.WithField("data", string(x)).Debug("Bad pipe write input")
-		if !p.FirstWriteFailRegexp.Match(x) {
-			return len(x), nil
+		if p.WriteFailRegexp.Match(x) {
+			log.Info("Bad pipe WriteFailRegexp matches; failing write")
+			if !p.OnlyFailOnce {
+				log.Info("Will fail all subsequent writes")
+				p.WriteFailRegexp = nil
+			} else {
+				p.WriteFailRegexp = regexp.MustCompile("SHOULDNOTMATCH")
+			}
+			return 0, transientFailure
 		}
-		log.Info("Bad pipe FirstWriteFailRegexp matches")
-		p.FirstWriteFailRegexp = nil
+		return len(x), nil
 	}
 	log.Info("Bad pipe returning write error")
 	return 0, transientFailure
@@ -659,18 +703,41 @@ func (c *listCmd) main() {
 		return
 	}
 
-	first := true
-	for setName, members := range c.Dataplane.IPSetMembers {
-		if !first {
-			fmt.Fprint(c.Stdout, "\n")
+	if c.allIpSets {
+		for setName := range c.Dataplane.IPSetMembers {
+			fmt.Fprintf(c.Stdout, "%s\n", setName)
 		}
-		fmt.Fprintf(c.Stdout, "Name: %s\n", setName)
-		fmt.Fprint(c.Stdout, "Field: foobar\n") // Dummy field, should get ignored.
-		fmt.Fprint(c.Stdout, "Members:\n")
-		members.Iter(func(member interface{}) error {
-			fmt.Fprintf(c.Stdout, "%s\n", member)
-			return nil
-		})
-		first = false
+		return
 	}
+
+	members, exists := c.Dataplane.IPSetMembers[c.SetName]
+	if !exists {
+		result = fmt.Errorf("ipset %v does not exists", c.SetName)
+		return
+	}
+	fmt.Fprintf(c.Stdout, "Name: %s\n", c.SetName)
+	meta, ok := c.Dataplane.IPSetMetadata[c.SetName]
+	if !ok {
+		// Default metadata for IP sets created by tests.
+		meta = setMetadata{
+			Name:    v4MainIPSetName,
+			Family:  IPFamilyV4,
+			Type:    IPSetTypeHashIP,
+			MaxSize: 1234,
+		}
+	}
+	fmt.Fprintf(c.Stdout, "Type: %s\n", meta.Type)
+	if meta.Type == IPSetTypeBitmapPort {
+		fmt.Fprintf(c.Stdout, "Header: family %s range %d-%d\n", meta.Family, meta.RangeMin, meta.RangeMax)
+	} else if meta.Type == "unknown:type" {
+		fmt.Fprintf(c.Stdout, "Header: floop\n")
+	} else {
+		fmt.Fprintf(c.Stdout, "Header: family %s hashsize 1024 maxelem %d\n", meta.Family, meta.MaxSize)
+	}
+	fmt.Fprint(c.Stdout, "Field: foobar\n") // Dummy field, should get ignored.
+	fmt.Fprint(c.Stdout, "Members:\n")
+	members.Iter(func(member string) error {
+		fmt.Fprintf(c.Stdout, "%s\n", member)
+		return nil
+	})
 }

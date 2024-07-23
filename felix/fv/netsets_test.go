@@ -48,12 +48,12 @@ const (
 	numNetworkSets = 100
 )
 
-// netsetsConfig is used to parametrise the whole suite of tests for IPv4 or IPv6, it provides
+// netsetsConfig is used to parameterize the whole suite of tests for IPv4 or IPv6, it provides
 // methods that return:
 //
-//     - the IP to use for a given workload, each from a separate subnet
-//     - a CIDR that encompasses each workload's IP (and only its IP)
-//     - a full-length CIDR (i.e. the IP address expressed as a /32 or /128).
+//   - the IP to use for a given workload, each from a separate subnet
+//   - a CIDR that encompasses each workload's IP (and only its IP)
+//   - a full-length CIDR (i.e. the IP address expressed as a /32 or /128).
 type netsetsConfig struct {
 	ipVersion int
 	zeroCIDR  string
@@ -100,7 +100,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 	var (
 		etcd     *containers.Container
-		felix    *infrastructure.Felix
+		tc       infrastructure.TopologyContainers
 		felixPID int
 		client   client.Interface
 		infra    infrastructure.DatastoreInfra
@@ -108,15 +108,15 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 	BeforeEach(func() {
 		topologyOptions := infrastructure.DefaultTopologyOptions()
-		felix, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
-		felixPID = felix.GetFelixPID()
+		tc, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
+		felixPID = tc.Felixes[0].GetFelixPID()
 	})
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			felix.Exec("iptables-save", "-c")
+			tc.Felixes[0].Exec("iptables-save", "-c")
 		}
-		felix.Stop()
+		tc.Stop()
 
 		if CurrentGinkgoTestDescription().Failed {
 			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
@@ -153,7 +153,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 				ports = "3000"
 				w[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"w"+iiStr,
 					"fv",
 					c.workloadIP(ii, false),
@@ -165,7 +165,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 				w[ii].Configure(client)
 
 				nw[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"nw"+iiStr,
 					"fv",
 					c.workloadIP(ii, true),
@@ -363,7 +363,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 					cc.ExpectSome(nw[2], nw[3])
 					cc.ExpectNone(nw[3], nw[0])
 					cc.ExpectNone(nw[3], nw[1])
-					cc.ExpectSome(nw[3], nw[2]) // now allowed because all sources are white listed
+					cc.ExpectSome(nw[3], nw[2]) // now allowed because all sources are allowed
 					cc.CheckConnectivity()
 				})
 
@@ -617,7 +617,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 						cc.ExpectNone(nw[1], nw[2])
 						cc.ExpectNone(nw[1], nw[3])
 
-						// Doesn't match as a source any more.
+						// Doesn't match as a source anymore.
 						cc.ExpectNone(nw[2], nw[0])
 						cc.ExpectNone(nw[2], nw[1])
 						cc.ExpectNone(nw[2], nw[3])
@@ -782,7 +782,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 					cc.ExpectSome(w[2], w[3])
 					cc.ExpectNone(w[3], w[0])
 					cc.ExpectNone(w[3], w[1])
-					cc.ExpectSome(w[3], w[2]) // now allowed because all sources are white listed
+					cc.ExpectSome(w[3], w[2]) // now allowed because all sources are allowed
 					cc.CheckConnectivity()
 				})
 
@@ -1035,7 +1035,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 						cc.ExpectNone(w[1], w[2])
 						cc.ExpectNone(w[1], w[3])
 
-						// Doesn't match as a source any more.
+						// Doesn't match as a source anymore.
 						cc.ExpectNone(w[2], w[0])
 						cc.ExpectNone(w[2], w[1])
 						cc.ExpectNone(w[2], w[3])
@@ -1087,7 +1087,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		BeforeEach(func() {
 			// Start a workload so we have something to add policy to
 			w := workload.Run(
-				felix,
+				tc.Felixes[0],
 				"w",
 				"default",
 				"10.65.0.2",
@@ -1097,7 +1097,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 			w.Configure(client)
 
 			nw := workload.Run(
-				felix,
+				tc.Felixes[0],
 				"w",
 				"default",
 				"10.64.0.2",
@@ -1218,7 +1218,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 			wg.Wait()
 
 			// getFelixPIDs may return more than one PID, transiently due to Felix calling fork().
-			Expect(felix.GetFelixPID()).To(Equal(felixPID))
+			Expect(tc.Felixes[0].GetFelixPID()).To(Equal(felixPID))
 		})
 	})
 })

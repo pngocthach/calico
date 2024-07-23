@@ -15,7 +15,9 @@
 package proxy_test
 
 import (
+	"fmt"
 	"net"
+	"net/http"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -23,7 +25,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/bpfmap"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
 	"github.com/projectcalico/calico/felix/bpf/mock"
 	proxy "github.com/projectcalico/calico/felix/bpf/proxy"
@@ -32,25 +34,29 @@ import (
 var _ = Describe("BPF kube-proxy", func() {
 	initIP := net.IPv4(1, 1, 1, 1)
 
-	bpfMc := &bpf.MapContext{}
-	bpfMc.FrontendMap = newMockNATMap()
-	bpfMc.BackendMap = newMockNATBackendMap()
-	bpfMc.AffinityMap = newMockAffinityMap()
-	bpfMc.CtMap = mock.NewMockMap(conntrack.MapParams)
-	front := bpfMc.FrontendMap.(*mockNATMap)
+	maps := new(bpfmap.IPMaps)
+	maps.FrontendMap = newMockNATMap()
+	maps.BackendMap = newMockNATBackendMap()
+	maps.AffinityMap = newMockAffinityMap()
+	maps.CtMap = mock.NewMockMap(conntrack.MapParams)
+	front := maps.FrontendMap.(*mockNATMap)
 
 	var p *proxy.KubeProxy
+
+	healthCheckNodePort := 1212
 
 	BeforeEach(func() {
 		testSvc := &v1.Service{
 			TypeMeta:   typeMetaV1("Service"),
-			ObjectMeta: objectMeataV1("testService"),
+			ObjectMeta: objectMetaV1("testService"),
 			Spec: v1.ServiceSpec{
 				ClusterIP: "10.1.0.1",
-				Type:      v1.ServiceTypeClusterIP,
+				Type:      v1.ServiceTypeLoadBalancer,
 				Selector: map[string]string{
 					"app": "test",
 				},
+				ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+				HealthCheckNodePort:   int32(healthCheckNodePort),
 				Ports: []v1.ServicePort{
 					{
 						Protocol: v1.ProtocolTCP,
@@ -63,7 +69,7 @@ var _ = Describe("BPF kube-proxy", func() {
 
 		testSvcEps := &v1.Endpoints{
 			TypeMeta:   typeMetaV1("Endpoints"),
-			ObjectMeta: objectMeataV1("testService"),
+			ObjectMeta: objectMetaV1("testService"),
 			Subsets: []v1.EndpointSubset{
 				{
 					Addresses: []v1.EndpointAddress{
@@ -81,7 +87,7 @@ var _ = Describe("BPF kube-proxy", func() {
 		}
 
 		k8s := fake.NewSimpleClientset(testSvc, testSvcEps)
-		p, _ = proxy.StartKubeProxy(k8s, "test-node", bpfMc, proxy.WithImmediateSync())
+		p, _ = proxy.StartKubeProxy(k8s, "test-node", maps, proxy.WithImmediateSync())
 	})
 
 	AfterEach(func() {
@@ -104,6 +110,19 @@ var _ = Describe("BPF kube-proxy", func() {
 			}).Should(BeTrue())
 		})
 
+		By("checking that the healthCheckNodePort is accessible", func() {
+			Eventually(func() error {
+				result, err := http.Get(fmt.Sprintf("http://localhost:%d", healthCheckNodePort))
+				if err != nil {
+					return err
+				}
+				if result.StatusCode != 503 {
+					return fmt.Errorf("Unexpected status code %d; expected 503", result.StatusCode)
+				}
+				return nil
+			}, "5s", "200ms").Should(Succeed())
+		})
+
 		By("checking nodeport has the updated IP and not the initial IP", func() {
 			updatedIP := net.IPv4(2, 2, 2, 2)
 			p.OnHostIPsUpdate([]net.IP{updatedIP})
@@ -122,6 +141,19 @@ var _ = Describe("BPF kube-proxy", func() {
 				}
 				return false
 			}).Should(BeTrue())
+		})
+
+		By("checking that the healthCheckNodePort is still accessible", func() {
+			Eventually(func() error {
+				result, err := http.Get(fmt.Sprintf("http://localhost:%d", healthCheckNodePort))
+				if err != nil {
+					return err
+				}
+				if result.StatusCode != 503 {
+					return fmt.Errorf("Unexpected status code %d; expected 503", result.StatusCode)
+				}
+				return nil
+			}, "5s", "200ms").Should(Succeed())
 		})
 
 		By("checking nodeport has 2 updated IPs", func() {

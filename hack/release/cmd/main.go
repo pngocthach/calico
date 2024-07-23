@@ -11,12 +11,16 @@ import (
 	"github.com/projectcalico/calico/hack/release/pkg/builder"
 )
 
-var create, publish, newBranch bool
+var create, publish, newBranch, meta bool
+var dir string
 
 func init() {
 	flag.BoolVar(&create, "create", false, "Create a release from the current commit")
 	flag.BoolVar(&publish, "publish", false, "Publish the release built from the current tag")
 	flag.BoolVar(&newBranch, "new-branch", false, "Create a new release branch from master")
+	flag.BoolVar(&meta, "metadata", false, "Product release metadata")
+
+	flag.StringVar(&dir, "dir", "./", "Directory to place build metadata in")
 
 	flag.Parse()
 }
@@ -25,18 +29,15 @@ func main() {
 	// Create a releaseBuilder to use.
 	r := builder.NewReleaseBuilder(&builder.RealCommandRunner{})
 
-	// Uncomment this to echo out commands that would be run, rather than running them!
-	//
-	// echoRunner := &echoRunner{
-	// 	responses: map[string]string{
-	// 		"git rev-parse --abbrev-ref HEAD":                  "release-v4.15",
-	// 		"git describe --tags --dirty --always --abbrev=12": "v4.16.0-0.dev-24850-ga7254d42ad39",
-	// 	},
-	// 	errors: map[string]error{
-	// 		"git describe --exact-match --tags HEAD": fmt.Errorf("Not on a tag"),
-	// 	},
-	// }
-	// r = builder.NewReleaseBuilder(&echoRunner)
+	if meta {
+		configureLogging("metadata.log")
+		err := r.BuildMetadata(dir)
+		if err != nil {
+			logrus.WithError(err).Error("Failed to produce release metadata")
+			os.Exit(1)
+		}
+		return
+	}
 
 	if create {
 		configureLogging("release-build.log")

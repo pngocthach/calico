@@ -47,10 +47,12 @@ type resourceConverter interface {
 }
 type clientOpts interface{}
 
-type clientObjectOperator func(context.Context, clientv3.Interface, resourceObject, clientOpts) (resourceObject, error)
-type clientNameOperator func(context.Context, clientv3.Interface, string, string, clientOpts) (resourceObject, error)
-type clientLister func(context.Context, clientv3.Interface, clientOpts) (resourceListObject, error)
-type clientWatcher func(context.Context, clientv3.Interface, clientOpts) (calicowatch.Interface, error)
+type (
+	clientObjectOperator func(context.Context, clientv3.Interface, resourceObject, clientOpts) (resourceObject, error)
+	clientNameOperator   func(context.Context, clientv3.Interface, string, string, clientOpts) (resourceObject, error)
+	clientLister         func(context.Context, clientv3.Interface, clientOpts) (resourceListObject, error)
+	clientWatcher        func(context.Context, clientv3.Interface, clientOpts) (calicowatch.Interface, error)
+)
 
 type resourceStore struct {
 	client            clientv3.Interface
@@ -70,6 +72,16 @@ type resourceStore struct {
 	resourceName      string
 	converter         resourceConverter
 }
+
+func (rs *resourceStore) RequestWatchProgress(ctx context.Context) error {
+	// This method is supposed to trigger the client to emit a progress
+	// notification on each active watch but our client doesn't support that
+	// yet.
+	klog.Error("STUB: RequestWatchProgress() not supported by Calico client.")
+	return nil
+}
+
+var _ storage.Interface = (*resourceStore)(nil)
 
 func CreateClientFromConfig() clientv3.Interface {
 	// TODO(doublek): nicer errors returned
@@ -118,7 +130,7 @@ func validationError(err error, qualifiedKind schema.GroupKind, name string) *aa
 // in seconds (0 means forever). If no error is returned and out is not nil, out will be
 // set to the read value from database.
 func (rs *resourceStore) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
-	klog.Infof("Create called with key: %v for resource %v\n", key, rs.resourceName)
+	klog.V(1).Infof("Create called with key: %v for resource %v\n", key, rs.resourceName)
 	lcObj := rs.converter.convertToLibcalico(obj)
 
 	opts := options.SetOptions{TTL: time.Duration(ttl) * time.Second}
@@ -141,8 +153,9 @@ func (rs *resourceStore) Create(ctx context.Context, key string, obj, out runtim
 // If key didn't exist, it will return NotFound storage error.
 func (rs *resourceStore) Delete(ctx context.Context, key string, out runtime.Object,
 	preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc,
-	cachedExistingObject runtime.Object) error {
-	klog.Infof("Delete called with key: %v for resource %v\n", key, rs.resourceName)
+	cachedExistingObject runtime.Object,
+) error {
+	klog.V(1).Infof("Delete called with key: %v for resource %v\n", key, rs.resourceName)
 
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
@@ -201,7 +214,7 @@ func checkPreconditions(key string, preconditions *storage.Preconditions, out ru
 // If resource version is "0", this interface will get current object at given key
 // and send it in an "ADDED" event, before watch starts.
 func (rs *resourceStore) Watch(ctx context.Context, key string, opts storage.ListOptions) (k8swatch.Interface, error) {
-	klog.Infof("Watch called with key: %v on resource %v\n", key, rs.resourceName)
+	klog.V(1).Infof("Watch called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return nil, err
@@ -217,7 +230,7 @@ func (rs *resourceStore) Watch(ctx context.Context, key string, opts storage.Lis
 // If resource version is "0", this interface will list current objects directory defined by key
 // and send them in "ADDED" events, before watch starts.
 func (rs *resourceStore) WatchList(ctx context.Context, key string, opts storage.ListOptions) (k8swatch.Interface, error) {
-	klog.Infof("WatchList called with key: %v on resource %v\n", key, rs.resourceName)
+	klog.V(1).Infof("WatchList called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return nil, err
@@ -231,8 +244,9 @@ func (rs *resourceStore) WatchList(ctx context.Context, key string, opts storage
 // The returned contents may be delayed, but it is guaranteed that they will
 // be have at least 'resourceVersion'.
 func (rs *resourceStore) Get(ctx context.Context, key string, optsK8s storage.GetOptions,
-	out runtime.Object) error {
-	klog.Infof("Get called with key: %v on resource %v\n", key, rs.resourceName)
+	out runtime.Object,
+) error {
+	klog.V(1).Infof("Get called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return err
@@ -250,13 +264,14 @@ func (rs *resourceStore) Get(ctx context.Context, key string, optsK8s storage.Ge
 	return nil
 }
 
-// GetToList unmarshals json found at key and opaque it into *List api object
-// (an object that satisfies the runtime.IsList definition).
+// GetList unmarshalls objects found at key into a *List api object (an object
+// that satisfies runtime.IsList definition).
+// If 'opts.Recursive' is false, 'key' is used as an exact match. If `opts.Recursive'
+// is true, 'key' is used as a prefix.
 // The returned contents may be delayed, but it is guaranteed that they will
-// be have at least 'resourceVersion'.
-func (rs *resourceStore) GetToList(ctx context.Context, key string,
-	opts storage.ListOptions, listObj runtime.Object) error {
-	klog.Infof("GetToList called with key: %v on resource %v\n", key, rs.resourceName)
+// match 'opts.ResourceVersion' according 'opts.ResourceVersionMatch'.
+func (rs *resourceStore) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	klog.V(1).Infof("GetList called with key: %v on resource %v\n", key, rs.resourceName)
 	return rs.List(ctx, key, opts, listObj)
 }
 
@@ -265,7 +280,7 @@ func (rs *resourceStore) GetToList(ctx context.Context, key string,
 // The returned contents may be delayed, but it is guaranteed that they will
 // be have at least 'resourceVersion'.
 func (rs *resourceStore) List(ctx context.Context, key string, optsK8s storage.ListOptions, listObj runtime.Object) error {
-	klog.Infof("List called with key: %v on resource %v\n", key, rs.resourceName)
+	klog.V(1).Infof("List called with key: %v on resource %v\n", key, rs.resourceName)
 	ns, name, err := NamespaceAndNameFromKey(key, rs.isNamespaced)
 	if err != nil {
 		return err
@@ -287,7 +302,7 @@ func (rs *resourceStore) List(ctx context.Context, key string, optsK8s storage.L
 type objState struct {
 	obj  runtime.Object
 	meta *storage.ResponseMeta
-	rev  int64
+	rev  uint64
 	data []byte
 }
 
@@ -301,8 +316,8 @@ func (rs *resourceStore) getStateFromObject(obj runtime.Object) (*objState, erro
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get resource version: %v", err)
 	}
-	state.rev = int64(rv)
-	state.meta.ResourceVersion = uint64(state.rev)
+	state.rev = rv
+	state.meta.ResourceVersion = rv
 
 	state.data, err = runtime.Encode(rs.codec, obj)
 	if err != nil {
@@ -327,7 +342,7 @@ func decode(
 	return nil
 }
 
-// GuaranteedUpdate keers calling 'tryUpdate()' to update key 'key' (of type 'ptrToType')
+// GuaranteedUpdate keeps calling 'tryUpdate()' to update key 'key' (of type 'ptrToType')
 // retrying the update until success if there is index conflict.
 // Note that object passed to tryUpdate may change across invocations of tryUpdate() if
 // other writers are simultaneously updating it, so tryUpdate() needs to take into account
@@ -344,23 +359,25 @@ func decode(
 //
 // s := /* implementation of Interface */
 // err := s.GuaranteedUpdate(
-//     "myKey", &MyType{}, true,
-//     func(input runtime.Object, res ResponseMeta) (runtime.Object, *uint64, error) {
-//       // Before each incovation of the user defined function, "input" is reset to
-//       // current contents for "myKey" in database.
-//       curr := input.(*MyType)  // Guaranteed to succeed.
 //
-//       // Make the modification
-//       curr.Counter++
+//	    "myKey", &MyType{}, true,
+//	    func(input runtime.Object, res ResponseMeta) (runtime.Object, *uint64, error) {
+//	      // Before each invocation of the user defined function, "input" is reset to
+//	      // current contents for "myKey" in database.
+//	      curr := input.(*MyType)  // Guaranteed to succeed.
 //
-//       // Return the modified object - return an error to stop iterating. Return
-//       // a uint64 to alter the TTL on the object, or nil to keep it the same value.
-//       return cur, nil, nil
-//    }
-// })
+//	      // Make the modification
+//	      curr.Counter++
+//
+//	      // Return the modified object - return an error to stop iterating. Return
+//	      // a uint64 to alter the TTL on the object, or nil to keep it the same value.
+//	      return cur, nil, nil
+//	   }
+//	})
 func (rs *resourceStore) GuaranteedUpdate(
 	ctx context.Context, key string, out runtime.Object, ignoreNotFound bool,
-	precondtions *storage.Preconditions, userUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
+	preconditions *storage.Preconditions, userUpdate storage.UpdateFunc, cachedExistingObject runtime.Object,
+) error {
 	klog.V(6).Infof("GuaranteedUpdate called with key: %v on resource %v\n", key, rs.resourceName)
 	// If a cachedExistingObject was passed, use that as the initial object, otherwise use Get() to retrieve it
 	var initObj runtime.Object
@@ -392,7 +409,7 @@ func (rs *resourceStore) GuaranteedUpdate(
 	for totalLoopCount < 5 {
 		totalLoopCount++
 
-		if err := checkPreconditions(key, precondtions, curState.obj); err != nil {
+		if err := checkPreconditions(key, preconditions, curState.obj); err != nil {
 			klog.Errorf("checking preconditions (%s)", err)
 			return err
 		}
@@ -423,11 +440,18 @@ func (rs *resourceStore) GuaranteedUpdate(
 		if err != nil {
 			return err
 		}
-		revInt, _ := strconv.Atoi(accessor.GetResourceVersion())
+		versionStr := accessor.GetResourceVersion()
+		var revInt uint64
+		if versionStr != "" {
+			revInt, err = strconv.ParseUint(versionStr, 10, 64)
+			if err != nil {
+				return fmt.Errorf("failed to parse non-empty resource version %q key=%q: %w", versionStr, key, err)
+			}
+		}
 		updatedRes := updatedObj.(resourceObject)
 		if !shouldCreateOnUpdate() {
-			if updatedRes.GetObjectMeta().GetResourceVersion() == "" || revInt < int(curState.rev) {
-				updatedRes.(resourceObject).GetObjectMeta().SetResourceVersion(strconv.FormatInt(curState.rev, 10))
+			if updatedRes.GetObjectMeta().GetResourceVersion() == "" || revInt < curState.rev {
+				updatedRes.GetObjectMeta().SetResourceVersion(strconv.FormatUint(curState.rev, 10))
 			}
 		}
 		libcalicoObj := rs.converter.convertToLibcalico(updatedRes)

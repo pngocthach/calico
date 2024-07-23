@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -101,7 +102,7 @@ func run(input []byte, checkNoError bool, command string, args ...string) error 
 		}
 	}
 	if checkNoError {
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Command failed\nCommand: %v args: %v\nOutput:\n\n%v",
+		ExpectWithOffset(2, err).NotTo(HaveOccurred(), fmt.Sprintf("Command failed\nCommand: %v args: %v\nOutput:\n\n%v",
 			command, args, string(outputBytes)))
 	}
 	if err != nil {
@@ -274,4 +275,13 @@ func UpdateFelixConfig(client client.Interface, deltaFn func(*api.FelixConfigura
 		_, err = client.FelixConfigurations().Update(ctx, cfg, options.SetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 	}
+}
+
+func GetSysArch() string {
+	arch := os.Getenv("ARCH")
+	if len(arch) == 0 {
+		log.Info("ARCH env is not defined, set it to amd64")
+		arch = "amd64"
+	}
+	return arch
 }

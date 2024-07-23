@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -224,8 +224,10 @@ func (a *allocation) isPodIP() bool {
 func (a *allocation) isTunnelAddress() bool {
 	ipip := a.attrs[ipam.AttributeType] == ipam.AttributeTypeIPIP
 	vxlan := a.attrs[ipam.AttributeType] == ipam.AttributeTypeVXLAN
+	vxlanV6 := a.attrs[ipam.AttributeType] == ipam.AttributeTypeVXLANV6
 	wg := a.attrs[ipam.AttributeType] == ipam.AttributeTypeWireguard
-	return ipip || vxlan || wg
+	wgV6 := a.attrs[ipam.AttributeType] == ipam.AttributeTypeWireguardV6
+	return ipip || vxlan || vxlanV6 || wg || wgV6
 }
 
 func (a *allocation) isWindowsReserved() bool {

@@ -242,6 +242,11 @@ func (c *MockIPAMClient) BGPPeers() client.BGPPeerInterface {
 	return nil
 }
 
+func (c *MockIPAMClient) BGPFilter() client.BGPFilterInterface {
+	// DO NOTHING
+	return nil
+}
+
 func (c *MockIPAMClient) IPAM() ipam.Interface {
 	// DO NOTHING
 	return nil
@@ -268,6 +273,16 @@ func (c *MockIPAMClient) KubeControllersConfiguration() client.KubeControllersCo
 }
 
 func (c *MockIPAMClient) CalicoNodeStatus() client.CalicoNodeStatusInterface {
+	// DO NOTHING
+	return nil
+}
+
+func (c *MockIPAMClient) IPAMConfig() client.IPAMConfigInterface {
+	// DO NOTHING
+	return nil
+}
+
+func (c *MockIPAMClient) BlockAffinities() client.BlockAffinityInterface {
 	// DO NOTHING
 	return nil
 }

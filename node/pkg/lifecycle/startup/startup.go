@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -44,6 +44,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/selector"
 	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator"
 	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator/clients"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 
 	"github.com/projectcalico/calico/node/pkg/calicoclient"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/startup/autodetection"
@@ -81,10 +82,10 @@ var (
 
 // This file contains the main startup processing for the calico/node.  This
 // includes:
-// -  Detecting IP address and Network to use for BGP
-// -  Configuring the node resource with IP/AS information provided in the
-//    environment, or autodetected.
-// -  Creating default IP Pools for quick-start use
+//   - Detecting IP address and Network to use for BGP
+//   - Configuring the node resource with IP/AS information provided in the
+//     environment, or autodetected.
+//   - Creating default IP Pools for quick-start use
 func Run() {
 	// Check $CALICO_STARTUP_LOGLEVEL to capture early log statements
 	ConfigureLogging()
@@ -129,7 +130,7 @@ func Run() {
 	}
 
 	// If running under kubernetes with secrets to call k8s API
-	if config, err := rest.InClusterConfig(); err == nil {
+	if config, err := winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG")); err == nil {
 		// default timeout is 30 seconds, which isn't appropriate for this kind of
 		// startup action because network services, like kube-proxy might not be
 		// running and we don't want to block the full 30 seconds if they are just
@@ -151,7 +152,7 @@ func Run() {
 		if err != nil {
 			if kerrors.IsNotFound(err) {
 				kubeadmConfig = nil
-			} else if kerrors.IsUnauthorized(err) {
+			} else if kerrors.IsUnauthorized(err) || kerrors.IsForbidden(err) {
 				kubeadmConfig = nil
 				log.WithError(err).Info("Unauthorized to query kubeadm configmap, assuming not on kubeadm. CIDR detection will not occur.")
 			} else {
@@ -166,7 +167,7 @@ func Run() {
 		if err != nil {
 			if kerrors.IsNotFound(err) {
 				rancherState = nil
-			} else if kerrors.IsUnauthorized(err) {
+			} else if kerrors.IsUnauthorized(err) || kerrors.IsForbidden(err) {
 				kubeadmConfig = nil
 				log.WithError(err).Info("Unauthorized to query rancher configmap, assuming not on rancher. CIDR detection will not occur.")
 			} else {
@@ -182,25 +183,21 @@ func Run() {
 		}
 	}
 
-	configureAndCheckIPAddressSubnets(ctx, cli, node, k8sNode)
-
-	// If Calico is running in policy only mode we don't need to write BGP related details to the Node.
-	if os.Getenv("CALICO_NETWORKING_BACKEND") != "none" {
-		// Configure the node AS number.
-		configureASNumber(node)
-	}
-
+	needsNodeUpdate := configureAndCheckIPAddressSubnets(ctx, cli, node, k8sNode)
+	// Configure the node AS number.
+	needsNodeUpdate = configureASNumber(node) || needsNodeUpdate
 	// Populate a reference to the node based on orchestrator node identifiers.
-	configureNodeRef(node)
+	needsNodeUpdate = configureNodeRef(node) || needsNodeUpdate
+	if needsNodeUpdate {
+		// Apply the updated node resource.
+		if _, err := CreateOrUpdate(ctx, cli, node); err != nil {
+			log.WithError(err).Errorf("Unable to set node resource configuration")
+			utils.Terminate()
+		}
+	}
 
 	// Check expected filesystem
 	ensureFilesystemAsExpected()
-
-	// Apply the updated node resource.
-	if _, err := CreateOrUpdate(ctx, cli, node); err != nil {
-		log.WithError(err).Errorf("Unable to set node resource configuration")
-		utils.Terminate()
-	}
 
 	// Configure IP Pool configuration.
 	configureIPPools(ctx, cli, kubeadmConfig)
@@ -258,8 +255,15 @@ func getMonitorPollInterval() time.Duration {
 }
 
 func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface, node *libapi.Node, k8sNode *v1.Node) bool {
+	// If Calico is running in policy only mode we don't need to write BGP related
+	// details to the Node.
+	if os.Getenv("CALICO_NETWORKING_BACKEND") == "none" {
+		return false
+	}
 	// Configure and verify the node IP addresses and subnets.
-	checkConflicts, err := configureIPsAndSubnets(node, k8sNode, autodetection.GetInterfaces)
+	checkConflicts, err := configureIPsAndSubnets(node, k8sNode, func(incl []string, excl []string, version int) ([]autodetection.Interface, error) {
+		return autodetection.GetInterfaces(net.Interfaces, incl, excl, version)
+	})
 	if err != nil {
 		// If this is auto-detection error, do a cleanup before returning
 		clearv4 := os.Getenv("IP") == "autodetect"
@@ -279,7 +283,7 @@ func configureAndCheckIPAddressSubnets(ctx context.Context, cli client.Interface
 			// Unrecoverable error, terminate to restart.
 			utils.Terminate()
 		} else {
-			log.Warn("No IPv4 or IPv6 addresses configured or detected. Some features may not work properly.")
+			log.Info("No IPv4 or IPv6 addresses configured or detected. Some features may not work properly.")
 			// Bail here setting BGPSpec to nil (if empty) to pass validation.
 			if reflect.DeepEqual(node.Spec.BGP, &libapi.NodeBGPSpec{}) {
 				node.Spec.BGP = nil
@@ -326,7 +330,7 @@ func MonitorIPAddressSubnets() {
 	if nodeRef := os.Getenv("CALICO_K8S_NODE_REF"); nodeRef != "" {
 		k8sNodeName = nodeRef
 	}
-	if config, err = rest.InClusterConfig(); err == nil {
+	if config, err = winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG")); err == nil {
 		// Create the k8s clientset.
 		clientset, err = kubernetes.NewForConfig(config)
 		if err != nil {
@@ -362,16 +366,18 @@ func MonitorIPAddressSubnets() {
 
 // configureNodeRef will attempt to discover the cluster type it is running on, check to ensure we
 // have not already set it on this Node, and set it if need be.
-func configureNodeRef(node *libapi.Node) {
+// Returns true if the node object needs to updated.
+func configureNodeRef(node *libapi.Node) bool {
 	orchestrator := "k8s"
 	nodeRef := ""
 
 	// Sort out what type of cluster we're running on.
 	if nodeRef = os.Getenv("CALICO_K8S_NODE_REF"); nodeRef == "" {
-		return
+		return false
 	}
 
 	node.Spec.OrchRefs = []libapi.OrchRef{{NodeName: nodeRef, Orchestrator: orchestrator}}
+	return true
 }
 
 // CreateOrUpdate creates the Node if ResourceVersion is not specified,
@@ -601,7 +607,7 @@ func validateIP(ipn string) {
 
 	// Get a complete list of interfaces with their addresses and check if
 	// the IP address can be found.
-	ifaces, err := autodetection.GetInterfaces(nil, nil, ipAddr.Version())
+	ifaces, err := autodetection.GetInterfaces(net.Interfaces, nil, nil, ipAddr.Version())
 	if err != nil {
 		log.WithError(err).Error("Unable to query host interfaces")
 		utils.Terminate()
@@ -683,7 +689,13 @@ func evaluateENVBool(envVar string, defaultValue bool) bool {
 
 // configureASNumber configures the Node resource with the AS number specified
 // in the environment, or is a no-op if not specified.
-func configureASNumber(node *libapi.Node) {
+// Returns true if the node object needs to be updated.
+func configureASNumber(node *libapi.Node) bool {
+	// If Calico is running in policy only mode we don't need to write BGP related
+	// details to the Node.
+	if os.Getenv("CALICO_NETWORKING_BACKEND") == "none" {
+		return false
+	}
 	// Extract the AS number from the environment
 	asStr := os.Getenv("AS")
 	if asStr != "" {
@@ -693,6 +705,7 @@ func configureASNumber(node *libapi.Node) {
 		} else {
 			log.Infof("Using AS number specified in environment (AS=%s)", asNum)
 			node.Spec.BGP.ASNumber = &asNum
+			return true
 		}
 	} else {
 		if node.Spec.BGP.ASNumber == nil {
@@ -701,6 +714,7 @@ func configureASNumber(node *libapi.Node) {
 			log.Infof("Using AS number %s configured in node resource", node.Spec.BGP.ASNumber)
 		}
 	}
+	return false
 }
 
 // generateIPv6ULAPrefix return a random generated ULA IPv6 prefix as per RFC 4193.  The pool
@@ -754,6 +768,7 @@ func configureIPPools(ctx context.Context, client client.Interface, kubeadmConfi
 
 	ipv4IpipModeEnvVar := strings.ToLower(os.Getenv("CALICO_IPV4POOL_IPIP"))
 	ipv4VXLANModeEnvVar := strings.ToLower(os.Getenv("CALICO_IPV4POOL_VXLAN"))
+	ipv6VXLANModeEnvVar := strings.ToLower(os.Getenv("CALICO_IPV6POOL_VXLAN"))
 
 	var (
 		ipv4BlockSize int
@@ -840,20 +855,23 @@ func configureIPPools(ctx context.Context, client client.Interface, kubeadmConfi
 	if !ipv4Present {
 		log.Debug("Create default IPv4 IP pool")
 		outgoingNATEnabled := evaluateENVBool("CALICO_IPV4POOL_NAT_OUTGOING", true)
+		bgpExportDisabled := evaluateENVBool("CALICO_IPV4POOL_DISABLE_BGP_EXPORT", false)
 
-		createIPPool(ctx, client, ipv4Cidr, DEFAULT_IPV4_POOL_NAME, ipv4IpipModeEnvVar, ipv4VXLANModeEnvVar, outgoingNATEnabled, ipv4BlockSize, ipv4NodeSelector)
+		createIPPool(ctx, client, ipv4Cidr, DEFAULT_IPV4_POOL_NAME, ipv4IpipModeEnvVar, ipv4VXLANModeEnvVar, outgoingNATEnabled, ipv4BlockSize, ipv4NodeSelector, bgpExportDisabled)
 	}
 	if !ipv6Present && ipv6Supported() {
 		log.Debug("Create default IPv6 IP pool")
 		outgoingNATEnabled := evaluateENVBool("CALICO_IPV6POOL_NAT_OUTGOING", false)
+		bgpExportDisabled := evaluateENVBool("CALICO_IPV6POOL_DISABLE_BGP_EXPORT", false)
 
-		createIPPool(ctx, client, ipv6Cidr, DEFAULT_IPV6_POOL_NAME, string(api.IPIPModeNever), string(api.VXLANModeNever), outgoingNATEnabled, ipv6BlockSize, ipv6NodeSelector)
+		createIPPool(ctx, client, ipv6Cidr, DEFAULT_IPV6_POOL_NAME, string(api.IPIPModeNever), ipv6VXLANModeEnvVar, outgoingNATEnabled, ipv6BlockSize, ipv6NodeSelector, bgpExportDisabled)
 	}
+
 }
 
 // createIPPool creates an IP pool using the specified CIDR.  This
 // method is a no-op if the pool already exists.
-func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet, poolName, ipipModeName, vxlanModeName string, isNATOutgoingEnabled bool, blockSize int, nodeSelector string) {
+func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet, poolName, ipipModeName, vxlanModeName string, isNATOutgoingEnabled bool, blockSize int, nodeSelector string, bgpExportDisabled bool) {
 	version := cidr.Version()
 	var ipipMode api.IPIPMode
 	var vxlanMode api.VXLANMode
@@ -880,7 +898,7 @@ func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet
 	case "always":
 		vxlanMode = api.VXLANModeAlways
 	default:
-		log.Errorf("Unrecognized VXLAN mode specified in CALICO_IPV4POOL_VXLAN'%s'", vxlanModeName)
+		log.Errorf("Unrecognized VXLAN mode specified in CALICO_IPV%dPOOL_VXLAN '%s'", version, vxlanModeName)
 		utils.Terminate()
 	}
 
@@ -889,16 +907,17 @@ func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet
 			Name: poolName,
 		},
 		Spec: api.IPPoolSpec{
-			CIDR:         cidr.String(),
-			NATOutgoing:  isNATOutgoingEnabled,
-			IPIPMode:     ipipMode,
-			VXLANMode:    vxlanMode,
-			BlockSize:    blockSize,
-			NodeSelector: nodeSelector,
+			CIDR:             cidr.String(),
+			NATOutgoing:      isNATOutgoingEnabled,
+			IPIPMode:         ipipMode,
+			VXLANMode:        vxlanMode,
+			BlockSize:        blockSize,
+			NodeSelector:     nodeSelector,
+			DisableBGPExport: bgpExportDisabled,
 		},
 	}
 
-	log.Infof("Ensure default IPv%d pool is created. IPIP mode: %s, VXLAN mode: %s", version, ipipMode, vxlanMode)
+	log.Infof("Ensure default IPv%d pool is created. IPIP mode: %s, VXLAN mode: %s, DisableBGPExport: %t", version, ipipMode, vxlanMode, bgpExportDisabled)
 
 	// Create the pool.  There is a small chance that another node may
 	// beat us to it, so handle the fact that the pool already exists.
@@ -908,8 +927,8 @@ func createIPPool(ctx context.Context, client client.Interface, cidr *cnet.IPNet
 			utils.Terminate()
 		}
 	} else {
-		log.Infof("Created default IPv%d pool (%s) with NAT outgoing %t. IPIP mode: %s, VXLAN mode: %s",
-			version, cidr, isNATOutgoingEnabled, ipipMode, vxlanMode)
+		log.Infof("Created default IPv%d pool (%s) with NAT outgoing %t. IPIP mode: %s, VXLAN mode: %s, DisableBGPExport: %t",
+			version, cidr, isNATOutgoingEnabled, ipipMode, vxlanMode, bgpExportDisabled)
 	}
 }
 

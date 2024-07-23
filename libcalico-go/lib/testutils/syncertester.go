@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,9 +46,7 @@ func NewSyncerTester() *SyncerTester {
 	}
 }
 
-var (
-	UnsetSyncStatus = api.SyncStatus(255)
-)
+var UnsetSyncStatus = api.SyncStatus(255)
 
 // Encapsulates parse error details for easy handling with a single channel.
 type parseError struct {
@@ -101,7 +99,6 @@ func (st *SyncerTester) OnStatusUpdated(status api.SyncStatus) {
 	// to unblock the processing.
 	st.statusBlocker.Wait()
 	log.Infof("OnStatusUpdated now unblocked waiting for: %s", status)
-
 }
 
 // OnUpdates just stores the update and asserts the state of the cache and the update.
@@ -437,7 +434,7 @@ func (st *SyncerTester) ExpectUpdates(expectedUpdates []api.Update, checkOrder b
 // This removes all updates/onUpdate events from this receiver, so that the next call to this just requires the next set
 // of updates.
 //
-// Note that for this function to be useful, your test code needs to have fine grained control over the order in which
+// Note that for this function to be useful, your test code needs to have fine-grained control over the order in which
 // events occur.
 func (st *SyncerTester) ExpectOnUpdates(expected [][]api.Update) {
 	log.Infof("Expecting OnUpdates of %v", expected)
@@ -634,7 +631,6 @@ func kvpsEqual(actual, expected model.KVPair) bool {
 		expectedCopy.GetObjectMeta().SetDeletionGracePeriodSeconds(actualCopy.GetObjectMeta().GetDeletionGracePeriodSeconds())
 		expectedCopy.GetObjectMeta().SetFinalizers(actualCopy.GetObjectMeta().GetFinalizers())
 		expectedCopy.GetObjectMeta().SetOwnerReferences(actualCopy.GetObjectMeta().GetOwnerReferences())
-		expectedCopy.GetObjectMeta().SetClusterName(actualCopy.GetObjectMeta().GetClusterName())
 		expectedCopy.GetObjectMeta().SetManagedFields(actualCopy.GetObjectMeta().GetManagedFields())
 
 		// Finally compare the structs.

@@ -184,7 +184,7 @@ var _ = Describe("Health timeouts", func() {
 				"| COMPONENT | TIMEOUT |    LIVENESS    |    READINESS    |     DETAIL     |",
 				"+-----------+---------+----------------+-----------------+----------------+",
 				"| source1   | 100ms   | -              | reporting ready |                |",
-				"| source2   | 0s      | reporting live | reporting ready | but very busy! |",
+				"| source2   | -       | reporting live | reporting ready | but very busy! |",
 				"+-----------+---------+----------------+-----------------+----------------+",
 			}, "\n")))
 		})
@@ -198,6 +198,57 @@ var _ = Describe("Health timeouts", func() {
 				Expect(aggregator.Summary().Ready).To(BeFalse())
 				// Because the liveness reporter has no timeout.
 				Expect(aggregator.Summary().Live).To(BeTrue())
+			})
+		})
+
+		Context("with a global override for SOURCE1", func() {
+			BeforeEach(func() {
+				health.SetGlobalTimeoutOverrides(map[string]time.Duration{
+					SOURCE1: 300 * time.Millisecond,
+				})
+			})
+			AfterEach(func() {
+				health.SetGlobalTimeoutOverrides(nil)
+			})
+
+			It("it should take longer to time out", func() {
+				By("Being ready initially.")
+				Expect(aggregator.Summary().Ready).To(BeTrue())
+				Expect(aggregator.Summary().Live).To(BeTrue())
+				Expect(aggregator.Summary().Detail).To(Equal(strings.Join([]string{
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| COMPONENT |     TIMEOUT      |    LIVENESS    |    READINESS    |     DETAIL     |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| source1   | 300ms (override) | -              | reporting ready |                |",
+					"| source2   | -                | reporting live | reporting ready | but very busy! |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+				}, "\n")))
+
+				By("Being ready after the original timeout.")
+				time.Sleep(200 * time.Millisecond)
+				Expect(aggregator.Summary().Ready).To(BeTrue())
+				Expect(aggregator.Summary().Live).To(BeTrue())
+				Expect(aggregator.Summary().Detail).To(Equal(strings.Join([]string{
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| COMPONENT |     TIMEOUT      |    LIVENESS    |    READINESS    |     DETAIL     |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| source1   | 300ms (override) | -              | reporting ready |                |",
+					"| source2   | -                | reporting live | reporting ready | but very busy! |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+				}, "\n")))
+
+				By("Timing out after the override timeout.")
+				time.Sleep(200 * time.Millisecond)
+				Expect(aggregator.Summary().Ready).To(BeFalse())
+				Expect(aggregator.Summary().Live).To(BeTrue())
+				Expect(aggregator.Summary().Detail).To(Equal(strings.Join([]string{
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| COMPONENT |     TIMEOUT      |    LIVENESS    |    READINESS    |     DETAIL     |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+					"| source1   | 300ms (override) | -              | timed out       |                |",
+					"| source2   | -                | reporting live | reporting ready | but very busy! |",
+					"+-----------+------------------+----------------+-----------------+----------------+",
+				}, "\n")))
 			})
 		})
 	})

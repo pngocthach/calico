@@ -56,7 +56,7 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 
 	var (
 		etcd   *containers.Container
-		felix  *infrastructure.Felix
+		tc     infrastructure.TopologyContainers
 		client client.Interface
 		infra  infrastructure.DatastoreInfra
 
@@ -65,14 +65,11 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 
 	BeforeEach(func() {
 		topologyOptions := infrastructure.DefaultTopologyOptions()
-		topologyOptions.EnableIPv6 = true
+		topologyOptions.IPIPEnabled = false
 		topologyOptions.ExtraEnvVars["FELIX_BPFLOGLEVEL"] = "off" // For best perf.
 
-		felix, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
-		_ = felix.GetFelixPID()
-
-		// Install the hping tool, which we use for latency measurments.
-		felix.Exec("apt-get", "install", "-y", "hping3")
+		tc, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
+		_ = tc.Felixes[0].GetFelixPID()
 
 		var err error
 		resultsFile, err = os.OpenFile("latency.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
@@ -86,9 +83,9 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 		}
 
 		if CurrentGinkgoTestDescription().Failed {
-			felix.Exec("iptables-save", "-c")
+			tc.Felixes[0].Exec("iptables-save", "-c")
 		}
-		felix.Stop()
+		tc.Stop()
 
 		if CurrentGinkgoTestDescription().Failed {
 			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
@@ -125,7 +122,7 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 
 				ports = "3000"
 				w[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"w"+iiStr,
 					"fv",
 					c.workloadIP(ii),
@@ -199,16 +196,11 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 					// The all() selector should now map to an IP set with 10,002 IPs in it.
 					if os.Getenv("FELIX_FV_ENABLE_BPF") == "true" {
 						Eventually(func() int {
-							return getTotalBPFIPSetMembers(felix)
+							return getTotalBPFIPSetMembers(tc.Felixes[0])
 						}, "10s", "1000ms").Should(Equal(10002))
 					} else {
 						ipSetName := utils.IPSetNameForSelector(c.ipVersion, sourceSelector)
-						Eventually(func() int {
-							return getNumIPSetMembers(
-								felix.Container,
-								ipSetName,
-							)
-						}, "100s", "1000ms").Should(Equal(10002))
+						Eventually(tc.Felixes[0].IPSetSizeFn(ipSetName), "100s", "1000ms").Should(Equal(10002))
 					}
 				})
 
@@ -233,9 +225,9 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 	})
 
 	// Unfortunately, hping3 doesn't support IPv6.
-	//Context("IPv6: Network sets tests with initialized Felix and etcd datastore", func() {
+	// Context("IPv6: Network sets tests with initialized Felix and etcd datastore", func() {
 	//	describeLatencyTests(latencyConfig{ipVersion: 6, generateIPs: generateIPv6s})
-	//})
+	// })
 })
 
 func generateIPv4s(n int) (result []string) {

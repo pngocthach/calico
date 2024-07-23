@@ -49,7 +49,7 @@ func (m *Metadata) GetMetadata() *Metadata {
 }
 
 func (m *Metadata) parseFailed(raw, msg string) error {
-	return fmt.Errorf("Failer to parse config parameter %v; value %#v: %v",
+	return fmt.Errorf("Failed to parse config parameter %v; value %#v: %v",
 		m.Name, raw, msg)
 }
 
@@ -81,7 +81,7 @@ type IntParam struct {
 }
 
 func (p *IntParam) Parse(raw string) (interface{}, error) {
-	value, err := strconv.ParseInt(raw, 0, 64)
+	value, err := strconv.ParseInt(raw, 0, 32)
 	if err != nil {
 		err = p.parseFailed(raw, "invalid int")
 		return nil, err

@@ -45,7 +45,7 @@ const (
 )
 
 const (
-	numBaseFelixConfigs = 110
+	numBaseFelixConfigs = 136
 )
 
 var _ = Describe("Test the generic configuration update processor and the concrete implementations", func() {
@@ -246,6 +246,36 @@ var _ = Describe("Test the generic configuration update processor and the concre
 		)
 	})
 
+	It("should handle HealthTimeoutOVerrides", func() {
+		cc := updateprocessors.NewFelixConfigUpdateProcessor()
+		By("converting a per-node felix KVPair with certain values and checking for the correct number of fields")
+		res := apiv3.NewFelixConfiguration()
+		res.Spec.HealthTimeoutOverrides = []apiv3.HealthTimeoutOverride{
+			{
+				Name:    "Foo",
+				Timeout: metav1.Duration{Duration: 20 * time.Second},
+			},
+			{
+				Name:    "Bar",
+				Timeout: metav1.Duration{Duration: 25 * time.Second},
+			},
+		}
+		expected := map[string]interface{}{
+			"HealthTimeoutOverrides": "Foo=20s,Bar=25s",
+		}
+		kvps, err := cc.Process(&model.KVPair{
+			Key:   perNodeFelixKey,
+			Value: res,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		checkExpectedConfigs(
+			kvps,
+			isNodeFelixConfig,
+			numFelixConfigs,
+			expected,
+		)
+	})
+
 	It("should handle cluster config string slice field", func() {
 		cc := updateprocessors.NewClusterInfoUpdateProcessor()
 		By("converting a global cluster info KVPair with values assigned")
@@ -377,61 +407,61 @@ func checkExpectedConfigs(kvps []*model.KVPair, dataType int, expectedNum int, e
 			case model.ReadyFlagKey:
 				name = "ready-flag"
 			default:
-				Expect(kvp.Key).To(BeAssignableToTypeOf(model.GlobalConfigKey{}))
+				ExpectWithOffset(1, kvp.Key).To(BeAssignableToTypeOf(model.GlobalConfigKey{}))
 				name = kvp.Key.(model.GlobalConfigKey).Name
 			}
 		case isNodeFelixConfig:
 			switch kt := kvp.Key.(type) {
 			case model.HostConfigKey:
 				node := kt.Hostname
-				Expect(node).To(Equal("mynode"))
+				ExpectWithOffset(1, node).To(Equal("mynode"))
 				name = kt.Name
 			case model.HostIPKey:
 				// Although the HostIPKey is not in the same key space as the HostConfig, we
 				// special case this to make this test reusable for more tests.
 				node := kt.Hostname
-				Expect(node).To(Equal("mynode"))
+				ExpectWithOffset(1, node).To(Equal("mynode"))
 				name = hostIPMarker
 				logrus.Warnf("IP in key: %s", kvp.Value)
 			case model.ResourceKey:
 				node := kt.Name
-				Expect(node).To(Equal("mynode"))
+				ExpectWithOffset(1, node).To(Equal("mynode"))
 				name = nodeMarker
 			case model.WireguardKey:
 				node := kt.NodeName
-				Expect(node).To(Equal("mynode"))
+				ExpectWithOffset(1, node).To(Equal("mynode"))
 				name = wireguardMarker
 			default:
-				Expect(kvp.Key).To(BeAssignableToTypeOf(model.HostConfigKey{}))
+				ExpectWithOffset(1, kvp.Key).To(BeAssignableToTypeOf(model.HostConfigKey{}))
 			}
 		case isGlobalBgpConfig:
-			Expect(kvp.Key).To(BeAssignableToTypeOf(model.GlobalBGPConfigKey{}))
+			ExpectWithOffset(1, kvp.Key).To(BeAssignableToTypeOf(model.GlobalBGPConfigKey{}))
 			name = kvp.Key.(model.GlobalBGPConfigKey).Name
 		case isNodeBgpConfig:
-			Expect(kvp.Key).To(BeAssignableToTypeOf(model.NodeBGPConfigKey{}))
+			ExpectWithOffset(1, kvp.Key).To(BeAssignableToTypeOf(model.NodeBGPConfigKey{}))
 			node := kvp.Key.(model.NodeBGPConfigKey).Nodename
-			Expect(node).To(Equal("bgpnode1"))
+			ExpectWithOffset(1, node).To(Equal("bgpnode1"))
 			name = kvp.Key.(model.NodeBGPConfigKey).Name
 		}
 
 		// Validate and track the expected values.
 		if v, ok := ev[name]; ok {
 			if v == nil {
-				Expect(kvp.Value).To(BeNil(), "Field: "+name)
+				ExpectWithOffset(1, kvp.Value).To(BeNil(), "Field: "+name)
 			} else {
-				Expect(kvp.Value).To(Equal(v), "Field: "+name)
+				ExpectWithOffset(1, kvp.Value).To(Equal(v), "Field: "+name)
 			}
 			delete(ev, name)
 		} else {
-			Expect(kvp.Value).To(BeNil(), "Field: "+name)
+			ExpectWithOffset(1, kvp.Value).To(BeNil(), "Field: "+name)
 		}
 
 		// Validate the fields we have seen, checking for duplicates.
 		_, ok := allNames[name]
-		Expect(ok).To(BeFalse(), fmt.Sprintf("config name is repeated in response: %s", name))
+		ExpectWithOffset(1, ok).To(BeFalse(), fmt.Sprintf("config name is repeated in response: %s", name))
 		allNames[name] = struct{}{}
 	}
 
 	By(" - checking all expected values were accounted for")
-	Expect(ev).To(HaveLen(0), fmt.Sprintf("config name missing in response"))
+	ExpectWithOffset(1, ev).To(HaveLen(0), fmt.Sprintf("config name missing in response"))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -30,22 +32,25 @@ import (
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/asm"
 	"github.com/projectcalico/calico/felix/bpf/ipsets"
+	"github.com/projectcalico/calico/felix/bpf/jump"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/polprog"
 	"github.com/projectcalico/calico/felix/bpf/state"
+	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/proto"
 )
 
-func TestLoadAllowAllProgram(t *testing.T) {
+func TestPolicyLoadAllowAllProgram(t *testing.T) {
 	RegisterTestingT(t)
 
-	b := asm.NewBlock()
+	b := asm.NewBlock(false)
 	b.MovImm32(asm.R0, -1)
 	b.Exit()
 	insns, err := b.Assemble()
 	Expect(err).NotTo(HaveOccurred())
 
-	fd, err := bpf.LoadBPFProgramFromInsns(insns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	fd, err := bpf.LoadBPFProgramFromInsns(insns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(fd).NotTo(BeZero())
 	defer func() {
@@ -57,14 +62,14 @@ func TestLoadAllowAllProgram(t *testing.T) {
 	Expect(rc.RC).To(BeNumerically("==", -1))
 }
 
-func TestLoadProgramWithMapAccess(t *testing.T) {
+func TestPolicyLoadProgramWithMapAccess(t *testing.T) {
 	RegisterTestingT(t)
 
-	ipsMap := ipsets.Map(&bpf.MapContext{})
+	ipsMap := ipsets.Map()
 	Expect(ipsMap.EnsureExists()).NotTo(HaveOccurred())
 	Expect(ipsMap.MapFD()).NotTo(BeZero())
 
-	b := asm.NewBlock()
+	b := asm.NewBlock(false)
 	b.MovImm64(asm.R1, 0)
 	b.StoreStack64(asm.R1, -8)
 	b.StoreStack64(asm.R1, -16)
@@ -79,7 +84,7 @@ func TestLoadProgramWithMapAccess(t *testing.T) {
 	insns, err := b.Assemble()
 	Expect(err).NotTo(HaveOccurred())
 
-	fd, err := bpf.LoadBPFProgramFromInsns(insns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	fd, err := bpf.LoadBPFProgramFromInsns(insns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(fd).NotTo(BeZero())
 	defer func() {
@@ -110,7 +115,7 @@ func makeRulesSingleTier(protoRules []*proto.Rule) polprog.Rules {
 	}
 }
 
-func TestLoadKitchenSinkPolicy(t *testing.T) {
+func TestPolicyLoadKitchenSinkPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	alloc := idalloc.New()
 	allocID := func(id string) string {
@@ -120,7 +125,8 @@ func TestLoadKitchenSinkPolicy(t *testing.T) {
 
 	cleanIPSetMap()
 
-	pg := polprog.NewBuilder(alloc, ipsMap.MapFD(), stateMap.MapFD(), tcJumpMap.MapFD())
+	pg := polprog.NewBuilder(alloc, ipsMap.MapFD(), stateMap.MapFD(), policyJumpMap.MapFD(), 0,
+		polprog.WithAllowDenyJumps(tcdefs.ProgIndexAllowed, tcdefs.ProgIndexDrop))
 	insns, err := pg.Instructions(polprog.Rules{
 		Tiers: []polprog.Tier{{
 			Name: "base tier",
@@ -154,52 +160,49 @@ func TestLoadKitchenSinkPolicy(t *testing.T) {
 		}}})
 
 	Expect(err).NotTo(HaveOccurred())
-	fd, err := bpf.LoadBPFProgramFromInsns(insns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	Expect(insns).To(HaveLen(1))
+	fd, err := bpf.LoadBPFProgramFromInsns(insns[0], "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(fd).NotTo(BeZero())
 	Expect(fd.Close()).NotTo(HaveOccurred())
 }
 
-func TestLoadGarbageProgram(t *testing.T) {
+func TestPolicyLoadGarbageProgram(t *testing.T) {
 	RegisterTestingT(t)
 
 	var insns asm.Insns
 	for i := 0; i < 256; i++ {
 		i := uint8(i)
-		insns = append(insns, asm.Insn{i, i, i, i, i, i, i, i})
+		insns = append(insns, asm.Insn{Instruction: [8]uint8{i, i, i, i, i, i, i, i}})
 	}
 
-	fd, err := bpf.LoadBPFProgramFromInsns(insns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	fd, err := bpf.LoadBPFProgramFromInsns(insns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).To(HaveOccurred())
 	Expect(fd).To(BeZero())
 }
 
 const (
-	RCDrop           = 2
 	RCAllowedReached = 123
-	XDPDrop          = 1
+	RCDropReached    = 124
 	XDPPass          = 2
 )
 
 func packetWithPorts(proto int, src, dst string) packet {
-	parts := strings.Split(src, ":")
-	srcAddr := parts[0]
-	srcPort, err := strconv.Atoi(parts[1])
+	// Just using ResolveUDPAddr to parse a string to ip and port
+	srcAddr, err := net.ResolveUDPAddr("udp", src)
 	if err != nil {
 		panic(err)
 	}
-	parts = strings.Split(dst, ":")
-	dstAddr := parts[0]
-	dstPort, err := strconv.Atoi(parts[1])
+	dstAddr, err := net.ResolveUDPAddr("udp", dst)
 	if err != nil {
 		panic(err)
 	}
 	return packet{
 		protocol: proto,
-		srcAddr:  srcAddr,
-		srcPort:  srcPort,
-		dstAddr:  dstAddr,
-		dstPort:  dstPort,
+		srcAddr:  srcAddr.IP.String(),
+		srcPort:  srcAddr.Port,
+		dstAddr:  dstAddr.IP.String(),
+		dstPort:  dstAddr.Port,
 	}
 }
 
@@ -226,10 +229,19 @@ func icmpPktWithTypeCode(src, dst string, icmpType, icmpCode int) packet {
 }
 
 func packetNoPorts(proto int, src, dst string) packet {
+	// Just using ResolveUDPAddr to parse a string to ip and port
+	srcAddr := net.ParseIP(src)
+	if srcAddr == nil {
+		panic(fmt.Errorf("failed to parse src addr %v", src))
+	}
+	dstAddr := net.ParseIP(dst)
+	if dstAddr == nil {
+		panic(fmt.Errorf("failed to parse dst addr %v", dst))
+	}
 	return packet{
 		protocol: proto,
-		srcAddr:  src,
-		dstAddr:  dst,
+		srcAddr:  srcAddr.String(),
+		dstAddr:  dstAddr.String(),
 	}
 }
 
@@ -241,8 +253,16 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			icmpPkt("10.0.0.1", "10.0.0.2"),
-			packetNoPorts(253, "10.0.0.1", "10.0.0.2"),
-		},
+			packetNoPorts(253, "10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "no tiers-v6",
+		ForIPv6:    true,
+		DroppedPackets: []packet{
+			tcpPkt("[1001::1]:31245", "[1001::2]:80"),
+			tcpPkt("[1001::1]:80", "[1001::2]:31245"),
+			icmpPkt("[1001::1]", "[1001::2]"),
+			packetNoPorts(253, "1001::1", "1002::2")},
 	},
 	{
 		PolicyName: "empty tier has no impact",
@@ -267,8 +287,33 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			icmpPkt("10.0.0.1", "10.0.0.2"),
-			packetNoPorts(253, "10.0.0.1", "10.0.0.2"),
+			packetNoPorts(253, "10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "empty tier has no impact-v6",
+		ForIPv6:    true,
+		Policy: polprog.Rules{
+			Tiers: []polprog.Tier{
+				{
+					Name:      "empty tier",
+					EndAction: polprog.TierEndPass, // this would be set by the caller
+				},
+				{
+					Name: "allow",
+					Policies: []polprog.Policy{{
+						Name: "allow all",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{
+							Action: "Allow",
+						}}},
+					}},
+				},
+			},
 		},
+		AllowedPackets: []packet{
+			tcpPkt("[ffff::abcd:2]:31245", "[eeee::abcd:1]:80"),
+			tcpPkt("[ffff::abcd:2]:80", "[eeee::abcd:1]:31245"),
+			icmpPkt("[ffff::abcd:2]", "[eeee::abcd:1]"),
+			packetNoPorts(253, "ffff::abcd:2", "eeee::abcd:1")},
 	},
 	{
 		PolicyName: "unreachable tier",
@@ -301,6 +346,37 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "unreachable tier-v6",
+		ForIPv6:    true,
+		Policy: polprog.Rules{
+			Tiers: []polprog.Tier{
+				{
+					Name: "allow all",
+					Policies: []polprog.Policy{{
+						Name: "allow all",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{
+							Action: "Allow",
+						}}},
+					}},
+				},
+				{
+					Name: "unreachable",
+					Policies: []polprog.Policy{{
+						Name: "deny all",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{
+							Action: "Deny",
+						}}},
+					}},
+				},
+			},
+		},
+		AllowedPackets: []packet{
+			tcpPkt("[1001::1]:31245", "[1001::2]:80"),
+			tcpPkt("[1001::1]:80", "[1001::2]:31245"),
+			icmpPkt("[1001::1]", "[1001::2]"),
+			packetNoPorts(253, "1001::1", "1002::2")},
+	},
+	{
 		PolicyName: "pass to nowhere",
 		Policy: polprog.Rules{
 			Tiers: []polprog.Tier{
@@ -318,6 +394,26 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "pass to nowhere-v6",
+		ForIPv6:    true,
+		Policy: polprog.Rules{
+			Tiers: []polprog.Tier{
+				{
+					Name: "pass",
+					Policies: []polprog.Policy{{
+						Name:  "pass rule",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{Action: "Pass"}}},
+					}},
+				},
+			},
+		},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "pass to allow",
@@ -351,6 +447,38 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "pass to allow-v6",
+		ForIPv6:    true,
+		Policy: polprog.Rules{
+			Tiers: []polprog.Tier{
+				{
+					Name: "pass",
+					Policies: []polprog.Policy{{
+						Name: "pass through",
+						Rules: []polprog.Rule{
+							{Rule: &proto.Rule{Action: "Pass"}},
+							{Rule: &proto.Rule{Action: "Deny"}},
+						},
+					}},
+				},
+				{
+					Name: "allow",
+					Policies: []polprog.Policy{{
+						Name: "allow all",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{
+							Action: "Allow",
+						}}},
+					}},
+				},
+			},
+		},
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "pass to deny",
 		Policy: polprog.Rules{
 			Tiers: []polprog.Tier{
@@ -382,6 +510,38 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "pass to deny-v6",
+		ForIPv6:    true,
+		Policy: polprog.Rules{
+			Tiers: []polprog.Tier{
+				{
+					Name: "pass",
+					Policies: []polprog.Policy{{
+						Name: "pass through",
+						Rules: []polprog.Rule{
+							{Rule: &proto.Rule{Action: "Pass"}},
+							{Rule: &proto.Rule{Action: "Allow"}},
+						},
+					}},
+				},
+				{
+					Name: "allow",
+					Policies: []polprog.Policy{{
+						Name: "deny all",
+						Rules: []polprog.Rule{{Rule: &proto.Rule{
+							Action: "Deny",
+						}}},
+					}},
+				},
+			},
+		},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "explicit allow",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action: "Allow",
@@ -395,6 +555,20 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "explicit allow-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "explicit deny",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action: "Deny",
@@ -406,9 +580,22 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
+	{
+		PolicyName: "explicit deny-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Deny",
+		}}),
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
 
 	// Protocol match tests.
-
 	{
 		PolicyName: "allow tcp",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -423,6 +610,22 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "allow tcp - v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245")},
+		DroppedPackets: []packet{
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "allow !tcp",
@@ -440,6 +643,22 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245")},
 	},
 	{
+		PolicyName: "allow !tcp-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:      "Allow",
+			NotProtocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+		}}),
+		AllowedPackets: []packet{
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245")},
+	},
+	{
 		PolicyName: "allow udp",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:   "Allow",
@@ -454,9 +673,24 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
+	{
+		PolicyName: "allow udp-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "udp"}},
+		}}),
+		AllowedPackets: []packet{
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
 
 	// CIDR tests.
-
 	{
 		PolicyName: "allow 10.0.0.1/32",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -472,6 +706,24 @@ var polProgramTests = []polProgramTest{
 			packetNoPorts(253, "10.0.0.2", "10.0.0.2"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245")},
+	},
+	{
+		PolicyName: "allow ff01::1/128",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			SrcNet: []string{"ff02::1/128"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::3]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::3]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::3]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::3", "ff02::2")},
 	},
 	{
 		PolicyName: "allow from 10.0.0.0/8",
@@ -491,6 +743,24 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("11.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "allow ffe2::1/16",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			SrcNet: []string{"ffe2::1/16"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ffe2::1]:31245", "[ffe2::2]:80"),
+			udpPkt("[ffe2::1]:80", "[ffe2::2]:31245"),
+			icmpPkt("[ffe2::1]", "[ffe2::2]"),
+			packetNoPorts(253, "ffe2::1", "ffe2::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe1::3]:31245", "[ffe2::2]:80"),
+			udpPkt("[ffe1::3]:80", "[ffe2::2]:31245"),
+			icmpPkt("[ffe1::3]", "[ffe2::2]"),
+			packetNoPorts(253, "ffe1::3", "ffe2::2")},
+	},
+	{
 		PolicyName: "allow from CIDRs",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action: "Allow",
@@ -503,6 +773,24 @@ var polProgramTests = []polProgramTest{
 		DroppedPackets: []packet{
 			packetNoPorts(253, "10.0.0.2", "10.0.0.2"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245")},
+	},
+	{
+		PolicyName: "allow from CIDRs-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			SrcNet: []string{"ffee::1/16", "ffe2:0000:1111::1/64", "ffe2:0000:2222::1/80", "ffe2::f/128"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "ffee::1", "ffee::2"),
+			icmpPkt("[ffe2:0000:1111::1]", "[ffff::2]"),
+			udpPkt("[ffe2:0000:2222::1]:1024", "[ffe2::1]:80"),
+			tcpPkt("[ffe2::f]:31245", "[::2]:80")},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe0::2]:31245", "[ff01::2]:80"),
+			udpPkt("[ffe2:0000:1112::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ffe2:0000:2222:0010::1]", "[ff02::2]"),
+			packetNoPorts(253, "ffe2::e", "ff02::2")},
 	},
 	{
 		PolicyName: "allow from !CIDRs",
@@ -519,6 +807,24 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80")},
 	},
 	{
+		PolicyName: "allow from !CIDRs-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotSrcNet: []string{"ffee::1/16", "ffe2:0000:1111::1/64", "ffe2:0000:2222::1/80", "ffe2::f/128"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ffe0::2]:31245", "[ff01::2]:80"),
+			udpPkt("[ffe2:0000:1112::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ffe2:0000:2222:0010::1]", "[ff02::2]"),
+			packetNoPorts(253, "ffe2::e", "ff02::2")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "ffee::1", "ffee::2"),
+			icmpPkt("[ffe2:0000:1111::1]", "[ffff::2]"),
+			udpPkt("[ffe2:0000:2222::1]:1024", "[ffe2::1]:80"),
+			tcpPkt("[ffe2::f]:31245", "[::2]:80")},
+	},
+	{
 		PolicyName: "allow to CIDRs",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action: "Allow",
@@ -532,6 +838,24 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.2:12345", "123.0.0.1:1024")},
 	},
 	{
+		PolicyName: "allow to CIDRs-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			DstNet: []string{"ffee::1/16", "ffe2:0000:1111::1/64", "ffe2:0000:2222::1/80", "ffe2::f/128"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "ffee::2", "ffee::1"),
+			icmpPkt("[ffff::2]", "[ffe2:0000:1111::1]"),
+			udpPkt("[ffe2::1]:80", "[ffe2:0000:2222::1]:1024"),
+			tcpPkt("[::2]:80", "[ffe2::f]:31245")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff01::2]:80", "[ffe0::2]:31245"),
+			udpPkt("[ff02::2]:31245", "[ffe2:0000:1112::1]:80"),
+			icmpPkt("[ff02::2]", "[ffe2:0000:2222:0010::1]"),
+			packetNoPorts(253, "ff02::2", "ffe2::e")},
+	},
+	{
 		PolicyName: "allow to !CIDRs",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:    "Allow",
@@ -539,10 +863,32 @@ var polProgramTests = []polProgramTest{
 		}}),
 		AllowedPackets: []packet{
 			packetNoPorts(253, "10.0.0.1", "123.0.0.1"),
-			udpPkt("10.0.0.2:12345", "123.0.0.1:1024")},
+			udpPkt("10.0.0.2:12345", "123.0.0.1:1024"),
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 		DroppedPackets: []packet{
 			packetNoPorts(253, "10.0.0.2", "10.0.0.1"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245")},
+	},
+	{
+		PolicyName: "allow to !CIDRs-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotDstNet: []string{"ffee::1/16", "ffe2:0000:1111::1/64", "ffe2:0000:2222::1/80", "ffe2::f/128"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff01::2]:80", "[ffe0::2]:31245"),
+			udpPkt("[ff02::2]:31245", "[ffe2:0000:1112::1]:80"),
+			icmpPkt("[ff02::2]", "[ffe2:0000:2222:0010::1]"),
+			packetNoPorts(253, "ff02::2", "ffe2::e")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "ffee::2", "ffee::1"),
+			icmpPkt("[ffff::2]", "[ffe2:0000:1111::1]"),
+			udpPkt("[ffe2::1]:80", "[ffe2:0000:2222::1]:1024"),
+			tcpPkt("[::2]:80", "[ffe2::f]:31245")},
 	},
 	{
 		PolicyName: "allow from !10.0.0.0/8",
@@ -613,9 +959,166 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245")},
 	},
+	{
+		PolicyName: "allow to 0.0.0.0/0",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			DstNet: []string{"0.0.0.0/0"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "192.168.0.1", "123.0.0.2"),
+			tcpPkt("10.0.0.1:31245", "10.0.0.2:80"),
+			udpPkt("1.1.1.1:31245", "2.2.2.2:80"),
+			icmpPkt("172.16.1.1", "172.17.2.2")},
+		DroppedPackets: []packet{},
+	},
+	{
+		PolicyName: "allow to !0.0.0.0/0",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotDstNet: []string{"0.0.0.0/0"},
+		}}),
+		AllowedPackets: []packet{},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "192.168.0.1", "123.0.0.2"),
+			tcpPkt("10.0.0.1:31245", "10.0.0.2:80"),
+			udpPkt("1.1.1.1:31245", "2.2.2.2:80"),
+			icmpPkt("172.16.1.1", "172.17.2.2")},
+	},
+	{
+		PolicyName: "allow from !ffe2::1/8",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotSrcNet: []string{"ffe2::/8"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "2::1", "::1"),
+			icmpPkt("[ee00:2345::2]", "[::2]"),
+			tcpPkt("[f002::1]:31245", "[ff02::2]:80"),
+			udpPkt("[fa02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[::1]", "[ff01::2]"),
+			packetNoPorts(253, "f002::1", "ff02::2")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "ff02::1", "::1"),
+			icmpPkt("[ff00:2345::2]", "[::2]"),
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff01::1]", "[ff01::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
+		PolicyName: "allow from !ffe2::/112",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotSrcNet: []string{"ffe2::1:0/112"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "2::1", "::1"),
+			icmpPkt("[ee00:2345::2]", "[::2]"),
+			tcpPkt("[f002::2:1]:31245", "[ff02::2]:80"),
+			udpPkt("[fa02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[::1]", "[ff01::2]"),
+			packetNoPorts(253, "ffe2::2:1", "ff02::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff02::2]:80"),
+			packetNoPorts(253, "ffe2::1:1", "ff02::2")},
+	},
+	{
+		PolicyName: "allow to ff00::1/128",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			DstNet: []string{"ff00::1/128"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[f002::2:1]:31245", "[ff00::1]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::1]:31245"),
+			icmpPkt("[::1]", "[ff00::1]"),
+			packetNoPorts(253, "ffe2::2:1", "ff00::1")},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff02::2]:80"),
+			packetNoPorts(253, "ffe2::1:1", "ff00::2")},
+	},
+	{
+		PolicyName: "allow to ff00::/64",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			DstNet: []string{"ff00::/64"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[f002::2:1]:31245", "[ff00::1]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::2]:31245"),
+			icmpPkt("[::1]", "[ff00::ffff:1]"),
+			packetNoPorts(253, "ffe2::2:1", "ff00:0:0:0:f::1:2")},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff00:0:0:1:f::1:2]:80"),
+			packetNoPorts(253, "ffe2::1:1", "ff01::2")},
+	},
+	{
+		PolicyName: "allow to !ff00::1/64",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotDstNet: []string{"ff00::/64"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff00:0:0:1:f::1:2]:80"),
+			packetNoPorts(253, "ffe2::1:1", "ff01::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[f002::2:1]:31245", "[ff00::1]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::2]:31245"),
+			icmpPkt("[::1]", "[ff00::ffff:1]"),
+			packetNoPorts(253, "ffe2::2:1", "ff00:0:0:0:f::1:2")},
+	},
+	{
+		PolicyName: "allow to !ff00::1/16",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotDstNet: []string{"ff00::/16"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff10::1:2]:80"),
+			packetNoPorts(253, "ffe2::1:1", "ff01::2")},
+		DroppedPackets: []packet{
+			tcpPkt("[f002::2:1]:31245", "[ff00::1]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::2]:31245"),
+			icmpPkt("[::1]", "[ff00::ffff:1]"),
+			packetNoPorts(253, "ffe2::2:1", "ff00:0:0:0:f::1:2")},
+	},
+	{
+		PolicyName: "allow to ::/0",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action: "Allow",
+			DstNet: []string{"::/0"},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff10::1:2]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::2]:31245"),
+			icmpPkt("[::1]", "[ff00::ffff:1]"),
+			packetNoPorts(253, "ffe2::1:1", "ff01::2")},
+		DroppedPackets: []packet{},
+	},
+	{
+		PolicyName: "allow to !::/0",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:    "Allow",
+			NotDstNet: []string{"::/0"},
+		}}),
+		AllowedPackets: []packet{},
+		DroppedPackets: []packet{
+			tcpPkt("[ffe2::1:1]:31245", "[ff10::1:2]:80"),
+			udpPkt("[fa02::1]:80", "[ff00::2]:31245"),
+			icmpPkt("[::1]", "[ff00::ffff:1]"),
+			packetNoPorts(253, "ffe2::1:1", "ff01::2")},
+	},
 
 	// Port tests.
-
 	{
 		PolicyName: "allow from tcp:80",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -634,6 +1137,25 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "allow from tcp:80-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			SrcPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  80,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "allow from tcp:80-81",
@@ -656,6 +1178,26 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245")},
 	},
 	{
+		PolicyName: "allow from tcp:80-81-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			SrcPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  81,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:12345"),
+			tcpPkt("[ff02::1]:81", "[ff02::2]:23456")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "allow from tcp:0-80",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:   "Allow",
@@ -673,6 +1215,27 @@ var polProgramTests = []polProgramTest{
 			tcpPkt("10.0.0.2:81", "10.0.0.1:31245")},
 	},
 	{
+		PolicyName: "allow from tcp:0-80-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			SrcPorts: []*proto.PortRange{{
+				First: 0,
+				Last:  80,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:0", "[ff02::2]:12345"),
+			tcpPkt("[ff02::1]:30", "[ff02::2]:12345"),
+			tcpPkt("[ff02::1]:80", "[ff02::2]:23456")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:81", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "allow to tcp:80-65535",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:   "Allow",
@@ -688,6 +1251,26 @@ var polProgramTests = []polProgramTest{
 		DroppedPackets: []packet{
 			packetNoPorts(253, "10.0.0.2", "10.0.0.1"),
 			tcpPkt("10.0.0.1:31245", "10.0.0.2:79")},
+	},
+	{
+		PolicyName: "allow to tcp:80-65535-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			DstPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  65535,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:81", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:81", "[ff02::2]:65535")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:81", "[ff02::2]:79"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "allow to tcp:ranges",
@@ -712,6 +1295,30 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80")},
 	},
 	{
+		PolicyName: "allow to tcp:ranges-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			DstPorts: []*proto.PortRange{
+				{First: 80, Last: 81},
+				{First: 90, Last: 90},
+			},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:81"),
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:90")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:79"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:82"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:89"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:91"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "allow to tcp:!ranges",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:   "Allow",
@@ -734,6 +1341,30 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80")},
 	},
 	{
+		PolicyName: "allow to tcp:!ranges-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			NotDstPorts: []*proto.PortRange{
+				{First: 80, Last: 81},
+				{First: 90, Last: 90},
+			},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:79"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:82"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:89"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:91")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:80"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:81"),
+			tcpPkt("[ff02::1]:1001", "[ff02::2]:90"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:90"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		PolicyName: "allow from tcp:!80",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:   "Allow",
@@ -751,6 +1382,26 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.2:80", "10.0.0.1:31245"),
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
+	},
+	{
+		PolicyName: "allow from tcp:!80-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			NotSrcPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  80,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:90"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:90"),
+			udpPkt("[ff02::1]:31245", "[ff02::2]:90"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "allow to tcp:80",
@@ -772,6 +1423,26 @@ var polProgramTests = []polProgramTest{
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
 	{
+		PolicyName: "allow to tcp:80-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			DstPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  80,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:80")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:90"),
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:90"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
+	{
 		// BPF immediate values are signed, check that we don't get tripped up by a sign extension.
 		PolicyName: "allow to tcp:65535",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -787,6 +1458,26 @@ var polProgramTests = []polProgramTest{
 		DroppedPackets: []packet{
 			packetNoPorts(253, "10.0.0.2", "10.0.0.1"),
 			tcpPkt("10.0.0.2:80", "10.0.0.1:31245")},
+	},
+	{
+		// BPF immediate values are signed, check that we don't get tripped up by a sign extension.
+		PolicyName: "allow to tcp:65535-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			DstPorts: []*proto.PortRange{{
+				First: 65535,
+				Last:  65535,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:31245", "[ff02::2]:65535")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
 	},
 	{
 		PolicyName: "allow to tcp:!80",
@@ -807,8 +1498,29 @@ var polProgramTests = []polProgramTest{
 			udpPkt("10.0.0.1:31245", "10.0.0.2:80"),
 			icmpPkt("10.0.0.1", "10.0.0.2")},
 	},
+	{
+		PolicyName: "allow to tcp:!80-v6",
+		ForIPv6:    true,
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:   "Allow",
+			Protocol: &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			NotDstPorts: []*proto.PortRange{{
+				First: 80,
+				Last:  80,
+			}},
+		}}),
+		AllowedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:31245")},
+		DroppedPackets: []packet{
+			tcpPkt("[ff02::1]:80", "[ff02::2]:80"),
+			udpPkt("[ff02::1]:80", "[ff02::2]:31245"),
+			udpPkt("[ff02::1]:31245", "[ff02::2]:80"),
+			icmpPkt("[ff02::1]", "[ff02::2]"),
+			packetNoPorts(253, "ff02::1", "ff02::2")},
+	},
 
 	// IP set tests.
+	// TODO: Add test cases for IPv6
 	{
 		PolicyName: "allow from empty IP set",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -867,6 +1579,28 @@ var polProgramTests = []polProgramTest{
 		},
 	},
 	{
+		PolicyName: "allow from IP set - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:      "Allow",
+			SrcIpSetIds: []string{"setA"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "10::2", "10::1"),
+			tcpPkt("[10::2]:80", "[10::1]:31245"),
+			udpPkt("[10::2]:12345", "[123::1]:1024"),
+			udpPkt("[10::2]:80", "[10::1]:31245"),
+			udpPkt("[10::1]:31245", "[10::2]:80"),
+			//			icmpPkt("10::1", "10::2"),
+		},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::1"),
+			tcpPkt("[11::1]:12345", "[10::2]:8080")},
+		IPSets: map[string][]string{
+			"setA": {"10::0/16"},
+		},
+		ForIPv6: true,
+	},
+	{
 		PolicyName: "allow to IP set",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:      "Allow",
@@ -882,6 +1616,24 @@ var polProgramTests = []polProgramTest{
 		IPSets: map[string][]string{
 			"setA": {"11.0.0.0/8", "123.0.0.1/32"},
 		},
+	},
+	{
+		PolicyName: "allow to IP set - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:      "Allow",
+			DstIpSetIds: []string{"setA"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "11::2", "11::1"),
+			udpPkt("[10::2]:12345", "[123::1]:1024")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::1"),
+			tcpPkt("[11::1]:12345", "[10::2]:8080"),
+			udpPkt("[10::1]:31245", "[10::2]:80")},
+		IPSets: map[string][]string{
+			"setA": {"11::0/16", "123::1/128"},
+		},
+		ForIPv6: true,
 	},
 	{
 		PolicyName: "allow from !IP set",
@@ -962,6 +1714,28 @@ var polProgramTests = []polProgramTest{
 		},
 	},
 	{
+		PolicyName: "allow to named ports - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:               "Allow",
+			DstNamedPortIpSetIds: []string{"setA", "setB"},
+		}}),
+		AllowedPackets: []packet{
+			udpPkt("[10::2]:12345", "[123::1]:1024"),
+			tcpPkt("[10::1]:31245", "[10::2]:80")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::2"),    // Wrong proto, no ports
+			tcpPkt("[11::1]:12345", "[10::2]:8080"), // Wrong port
+			udpPkt("[10::1]:31245", "[10::2]:80"),   // Wrong proto
+			tcpPkt("[10::2]:80", "[10::1]:31245"),   // Src/dest confusion
+			tcpPkt("[10::2]:31245", "[10::1]:80"),   // Wrong dest
+		},
+		IPSets: map[string][]string{
+			"setA": {"10::2/128,tcp:80"},
+			"setB": {"123::1/128,udp:1024"},
+		},
+		ForIPv6: true,
+	},
+	{
 		PolicyName: "allow to mixed ports",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action: "Allow",
@@ -1031,6 +1805,7 @@ var polProgramTests = []polProgramTest{
 		},
 	},
 	// ICMP tests
+	// TODO: Add test cases for IPv6
 	{
 		PolicyName: "allow icmp packet with type 8",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
@@ -1488,6 +2263,10 @@ func (w polProgramTestWrapper) XDP() bool {
 	return w.p.Policy.ForXDP
 }
 
+func (w polProgramTestWrapper) ForIPv6() bool {
+	return w.p.ForIPv6
+}
+
 func wrap(p polProgramTest) polProgramTestWrapper {
 	return polProgramTestWrapper{p}
 }
@@ -1498,13 +2277,107 @@ func TestPolicyPrograms(t *testing.T) {
 	}
 }
 
-func TestHostPolicyPrograms(t *testing.T) {
+func TestExpandedPolicyPrograms(t *testing.T) {
+	RegisterTestingT(t)
+	for i, p := range polProgramTests {
+		for _, expander := range testExpanders {
+			expandedP := expander.Expand(p)
+			Expect(expandedP).NotTo(Equal(p))
+			t.Run(fmt.Sprintf("%s/%d:Policy=%s", expander.Name, i, p.PolicyName),
+				func(t *testing.T) {
+					// Expansions result ina  lot of debug output, disable that.
+					logLevel := log.GetLevel()
+					defer log.SetLevel(logLevel)
+					log.SetLevel(log.InfoLevel)
+
+					runTest(t, wrap(expandedP))
+				})
+		}
+	}
+}
+
+var testExpanders = []testExpander{
+	{
+		Name: "WithLargePrefixedTier",
+		Expand: func(p polProgramTest) polProgramTest {
+			out := p
+			initExtraTierOnce.Do(initExtraTier)
+			out.Policy.Tiers = append([]polprog.Tier{extraTier}, out.Policy.Tiers...)
+			return out
+		},
+	},
+}
+
+var extraTier polprog.Tier
+var initExtraTierOnce sync.Once
+
+func initExtraTier() {
+	const numExtraPols = 250
+	const numRulesPerPol = 50
+	pols := make([]polprog.Policy, 0, numExtraPols)
+	for i := 0; i < numExtraPols; i++ {
+		pol := polprog.Policy{
+			Name: fmt.Sprintf("pol-%d", i),
+		}
+		for j := 0; j < numRulesPerPol; j++ {
+			pol.Rules = append(pol.Rules, noOpRule(i*numRulesPerPol+j))
+		}
+		pols = append(pols, pol)
+	}
+	// Need a pass rule somewhere to send traffic to the tier under
+	// test.
+	passRule := polprog.Rule{
+		Rule: &proto.Rule{
+			Action: "pass",
+		},
+		MatchID: polprog.RuleMatchID(numExtraPols * numRulesPerPol),
+	}
+	pols[len(pols)-1].Rules = append(pols[len(pols)-1].Rules, passRule)
+	extraTier = polprog.Tier{
+		Name:     "extra tier",
+		Policies: pols,
+	}
+}
+func noOpRule(n int) polprog.Rule {
+	actions := []string{
+		"allow", "deny", "pass",
+	}
+	ports := []*proto.PortRange{
+		{First: 1, Last: int32(1 + (n % 8000))},
+	}
+	if n%1000 == 0 {
+		// Add lots of ports to a handful of rules.
+		for p := 0; p < 2000; p++ {
+			ports = append(ports, &proto.PortRange{
+				First: int32(p*2 + 10000),
+				Last:  int32(p*2 + 10001),
+			})
+		}
+	}
+	r := polprog.Rule{
+		Rule: &proto.Rule{
+			SrcIpSetIds: []string{"setNoOp"},
+			Protocol:    &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			Action:      actions[n%len(actions)],
+			DstPorts:    ports,
+		},
+		MatchID: polprog.RuleMatchID(n),
+	}
+	return r
+}
+
+type testExpander struct {
+	Name   string
+	Expand func(p polProgramTest) polProgramTest
+}
+
+func TestPolicyHostPolicyPrograms(t *testing.T) {
 	for i, p := range hostPolProgramTests {
 		t.Run(fmt.Sprintf("%d:Policy=%s", i, p.PolicyName), func(t *testing.T) { runTest(t, wrap(p)) })
 	}
 }
 
-func TestXDPPolicyPrograms(t *testing.T) {
+func TestPolicyXDPPolicyPrograms(t *testing.T) {
 	for i, p := range xdpPolProgramTests {
 		t.Run(fmt.Sprintf("%d:Policy=%s", i, p.PolicyName), func(t *testing.T) { runTest(t, wrap(p)) })
 	}
@@ -1517,6 +2390,7 @@ type polProgramTest struct {
 	DroppedPackets   []packet
 	UnmatchedPackets []packet
 	IPSets           map[string][]string
+	ForIPv6          bool
 }
 
 type packet struct {
@@ -1585,7 +2459,7 @@ func (p packet) StateIn() state.State {
 		preNATDstAddr = p.preNATDstAddr
 		preNATDstPort = p.preNATDstPort
 	}
-	flags := uint8(0)
+	flags := uint64(0)
 	if p.fromHostFlag {
 		flags |= polprog.FlagSrcIsHost
 	}
@@ -1593,27 +2467,32 @@ func (p packet) StateIn() state.State {
 		flags |= polprog.FlagDestIsHost
 	}
 
+	dstPort := 0
+	postNATDstPort := p.dstPort
 	if uint8(p.protocol) == 1 {
-		return state.State{
-			IPProto:        uint8(p.protocol),
-			SrcAddr:        ipUintFromString(p.srcAddr),
-			PostNATDstAddr: ipUintFromString(p.dstAddr),
-			SrcPort:        uint16(p.srcPort),
-			DstPort:        uint16(p.dstPort),
-			PreNATDstAddr:  ipUintFromString(preNATDstAddr),
-			PreNATDstPort:  uint16(preNATDstPort),
-			Flags:          flags,
-		}
+		dstPort = p.dstPort
+		preNATDstPort = 0
 	}
+
 	return state.State{
-		IPProto:        uint8(p.protocol),
-		SrcAddr:        ipUintFromString(p.srcAddr),
-		PostNATDstAddr: ipUintFromString(p.dstAddr),
-		SrcPort:        uint16(p.srcPort),
-		PostNATDstPort: uint16(p.dstPort),
-		PreNATDstAddr:  ipUintFromString(preNATDstAddr),
-		PreNATDstPort:  uint16(preNATDstPort),
-		Flags:          flags,
+		IPProto:         uint8(p.protocol),
+		SrcAddr:         ipUintFromString(p.srcAddr, 0),
+		SrcAddr1:        ipUintFromString(p.srcAddr, 1),
+		SrcAddr2:        ipUintFromString(p.srcAddr, 2),
+		SrcAddr3:        ipUintFromString(p.srcAddr, 3),
+		PostNATDstAddr:  ipUintFromString(p.dstAddr, 0),
+		PostNATDstAddr1: ipUintFromString(p.dstAddr, 1),
+		PostNATDstAddr2: ipUintFromString(p.dstAddr, 2),
+		PostNATDstAddr3: ipUintFromString(p.dstAddr, 3),
+		SrcPort:         uint16(p.srcPort),
+		DstPort:         uint16(dstPort),
+		PostNATDstPort:  uint16(postNATDstPort),
+		PreNATDstAddr:   ipUintFromString(preNATDstAddr, 0),
+		PreNATDstAddr1:  ipUintFromString(preNATDstAddr, 1),
+		PreNATDstAddr2:  ipUintFromString(preNATDstAddr, 2),
+		PreNATDstAddr3:  ipUintFromString(preNATDstAddr, 3),
+		PreNATDstPort:   uint16(preNATDstPort),
+		Flags:           flags,
 	}
 }
 
@@ -1622,25 +2501,38 @@ func (p packet) MatchStateOut(stateOut state.State) {
 	expectedStateOut := p.StateIn()
 
 	// Zero parts we do not care about
-
 	expectedStateOut.PolicyRC = 0 // PolicyRC tested by the caller
-
 	stateOut.PolicyRC = 0
-
 	Expect(stateOut).To(Equal(expectedStateOut), "policy program modified unexpected parts of the state")
 }
 
-func ipUintFromString(addrStr string) uint32 {
+func ipUintFromString(addrStr string, section int) uint32 {
 	if addrStr == "" {
 		return 0
 	}
-	addr := net.ParseIP(addrStr)
-	return binary.LittleEndian.Uint32(addr.To4())
+
+	addrBytes := net.ParseIP(addrStr).To4()
+	if addrBytes != nil {
+		if section > 0 {
+			return 0
+		}
+		return binary.LittleEndian.Uint32(addrBytes)
+	}
+	addrBytes = net.ParseIP(addrStr).To16()
+	return binary.LittleEndian.Uint32(addrBytes[section*4 : (section+1)*4])
 }
 
-func TestIPUintFromString(t *testing.T) {
+func TestPolicyIPUintFromString(t *testing.T) {
 	RegisterTestingT(t)
-	Expect(ipUintFromString("10.0.0.1")).To(Equal(uint32(0x0100000a)))
+	Expect(ipUintFromString("10.0.0.1", 0)).To(Equal(uint32(0x0100000a)))
+	Expect(ipUintFromString("10.0.0.1", 1)).To(Equal(uint32(0)))
+	Expect(ipUintFromString("10.0.0.1", 2)).To(Equal(uint32(0)))
+	Expect(ipUintFromString("10.0.0.1", 3)).To(Equal(uint32(0)))
+
+	Expect(ipUintFromString("ffff:8888:4444::2222:1111:0000", 0)).To(Equal(uint32(0x8888ffff)))
+	Expect(ipUintFromString("ffff:8888:4444::2222:1111:0000", 1)).To(Equal(uint32(0x00004444)))
+	Expect(ipUintFromString("ffff:8888:4444::2222:1111:0000", 2)).To(Equal(uint32(0x22220000)))
+	Expect(ipUintFromString("ffff:8888:4444::2222:1111:0000", 3)).To(Equal(uint32(0x00001111)))
 }
 
 type testPolicy interface {
@@ -1650,6 +2542,7 @@ type testPolicy interface {
 	DroppedPackets() []testCase
 	UnmatchedPackets() []testCase
 	XDP() bool
+	ForIPv6() bool
 }
 
 type testCase interface {
@@ -1658,7 +2551,9 @@ type testCase interface {
 	MatchStateOut(stateOut state.State)
 }
 
-func runTest(t *testing.T, tp testPolicy) {
+var nextPolProgIdx atomic.Int64
+
+func runTest(t *testing.T, tp testPolicy, polprogOpts ...polprog.Option) {
 	RegisterTestingT(t)
 
 	// The prog builder refuses to allocate IDs as a precaution, give it an allocator that forces allocations.
@@ -1666,30 +2561,99 @@ func runTest(t *testing.T, tp testPolicy) {
 	forceAlloc := &forceAllocator{alloc: realAlloc}
 
 	// Make sure the maps are available.
-	cleanIPSetMap()
 	// FIXME should clean up the maps at the end of each test but recreating the maps seems to be racy
+	if tp.ForIPv6() {
+		cleanIPSetMapV6()
+		setUpIPSetsV6(tp.IPSets(), realAlloc, ipsMapV6)
+	} else {
+		cleanIPSetMap()
+		setUpIPSets(tp.IPSets(), realAlloc, ipsMap)
+	}
 
-	setUpIPSets(tp.IPSets(), realAlloc, ipsMap)
+	if policyJumpMap != nil {
+		_ = policyJumpMap.Close()
+	}
+	policyJumpMap = jump.Map()
+	_ = unix.Unlink(policyJumpMap.Path())
+	err := policyJumpMap.EnsureExists()
+	Expect(err).NotTo(HaveOccurred())
 
 	// Build the program.
-	pg := polprog.NewBuilder(forceAlloc, ipsMap.MapFD(), testStateMap.MapFD(), tcJumpMap.MapFD())
+	allowIdx := tcdefs.ProgIndexAllowed
+	denyIdx := tcdefs.ProgIndexDrop
+
+	ipsfd := ipsMap.MapFD()
+
+	staticProgsMap := maps.NewPinnedMap(maps.MapParameters{
+		Type:       "prog_array",
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 32,
+		Name:       "teststatic",
+	})
+	err = staticProgsMap.EnsureExists()
+	defer func() {
+		_ = staticProgsMap.Close()
+	}()
+	Expect(err).NotTo(HaveOccurred())
+
+	polProgIdx := int(nextPolProgIdx.Add(1))
+	stride := jump.TCMaxEntryPoints
+	polprogOpts = append(polprogOpts, polprog.WithPolicyMapIndexAndStride(int(polProgIdx), stride))
+
+	polprogOpts = append(polprogOpts, polprog.WithAllowDenyJumps(allowIdx, denyIdx))
+	if tp.ForIPv6() {
+		polprogOpts = append(polprogOpts, polprog.WithIPv6())
+		ipsfd = ipsMapV6.MapFD()
+	}
+
+	pg := polprog.NewBuilder(
+		forceAlloc,
+		ipsfd,
+		testStateMap.MapFD(),
+		staticProgsMap.MapFD(),
+		policyJumpMap.MapFD(),
+		polprogOpts...,
+	)
 	insns, err := pg.Instructions(tp.Policy())
 	Expect(err).NotTo(HaveOccurred(), "failed to assemble program")
 
-	// Load the program into the kernel.  We don't pin it so it'll be removed when the
-	// test process exits (or by the defer).
-	polProgFD, err := bpf.LoadBPFProgramFromInsns(insns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
-	Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
-	Expect(polProgFD).NotTo(BeZero())
+	// Load the program(s) into the kernel.
+	var polProgFDs []bpf.ProgFD
 	defer func() {
-		err := polProgFD.Close()
+		var errs []error
+		for _, polProgFD := range polProgFDs {
+			err := polProgFD.Close()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+		Expect(errs).To(BeEmpty())
+	}()
+	for i, p := range insns {
+		polProgFD, err := bpf.LoadBPFProgramFromInsns(p, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+		Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
+		Expect(polProgFD).NotTo(BeZero())
+		polProgFDs = append(polProgFDs, polProgFD)
+		err = policyJumpMap.Update(
+			jump.Key(polprog.SubProgramJumpIdx(polProgIdx, i, stride)),
+			jump.Value(polProgFD.FD()),
+		)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to add policy sub program %d/%d", i, len(insns)))
+	}
+
+	// Give the policy program somewhere to jump to.
+	allowProgIdx := tcdefs.ProgIndexAllowed
+	epiFD := installAllowedProgram(staticProgsMap, allowProgIdx)
+	defer func() {
+		err := epiFD.Close()
 		Expect(err).NotTo(HaveOccurred())
 	}()
 
-	// Give the policy program somewhere to jump to.
-	epiFD := installAllowedProgram(tcJumpMap)
+	dropProgIdx := tcdefs.ProgIndexDrop
+	dropFD := installDropProgram(staticProgsMap, dropProgIdx)
 	defer func() {
-		err := epiFD.Close()
+		err := dropFD.Close()
 		Expect(err).NotTo(HaveOccurred())
 	}()
 
@@ -1697,30 +2661,26 @@ func runTest(t *testing.T, tp testPolicy) {
 	for _, tc := range tp.AllowedPackets() {
 		t.Run(fmt.Sprintf("should allow %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			runProgram(tc, testStateMap, polProgFD, RCAllowedReached, state.PolicyAllow)
+			runProgram(tc, testStateMap, polProgFDs[0], RCAllowedReached, state.PolicyAllow)
 		})
 	}
 	for _, tc := range tp.DroppedPackets() {
 		t.Run(fmt.Sprintf("should drop %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			if tp.XDP() {
-				runProgram(tc, testStateMap, polProgFD, XDPDrop, state.PolicyDeny)
-			} else {
-				runProgram(tc, testStateMap, polProgFD, RCDrop, state.PolicyDeny)
-			}
+			runProgram(tc, testStateMap, polProgFDs[0], RCDropReached, state.PolicyDeny)
 		})
 	}
 	for _, tc := range tp.UnmatchedPackets() {
 		t.Run(fmt.Sprintf("should not match %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			runProgram(tc, testStateMap, polProgFD, XDPPass, state.PolicyNoMatch)
+			runProgram(tc, testStateMap, polProgFDs[0], XDPPass, state.PolicyNoMatch)
 		})
 	}
 }
 
 // installAllowedProgram installs a trivial BPF program into the jump table that returns RCAllowedReached.
-func installAllowedProgram(jumpMap bpf.Map) bpf.ProgFD {
-	b := asm.NewBlock()
+func installAllowedProgram(jumpMap maps.Map, jumpMapindex int) bpf.ProgFD {
+	b := asm.NewBlock(false)
 
 	// Load the RC into the return register.
 	b.MovImm64(asm.R0, RCAllowedReached)
@@ -1729,19 +2689,42 @@ func installAllowedProgram(jumpMap bpf.Map) bpf.ProgFD {
 
 	epiInsns, err := b.Assemble()
 	Expect(err).NotTo(HaveOccurred())
-	epiFD, err := bpf.LoadBPFProgramFromInsns(epiInsns, "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	epiFD, err := bpf.LoadBPFProgramFromInsns(epiInsns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
 	Expect(epiFD).NotTo(BeZero())
 
 	jumpValue := make([]byte, 4)
 	binary.LittleEndian.PutUint32(jumpValue, uint32(epiFD))
-	err = jumpMap.Update([]byte{1, 0, 0, 0}, jumpValue)
+	err = jumpMap.Update([]byte{byte(jumpMapindex), 0, 0, 0}, jumpValue)
 	Expect(err).NotTo(HaveOccurred())
 
 	return epiFD
 }
 
-func runProgram(tc testCase, stateMap bpf.Map, progFD bpf.ProgFD, expProgRC int, expPolRC state.PolicyResult) {
+// installDropProgram installs a trivial BPF program into the jump table that returns RCDropReached.
+func installDropProgram(jumpMap maps.Map, jumpMapindex int) bpf.ProgFD {
+	b := asm.NewBlock(false)
+
+	// Load the RC into the return register.
+	b.MovImm64(asm.R0, RCDropReached)
+	// Exit!
+	b.Exit()
+
+	epiInsns, err := b.Assemble()
+	Expect(err).NotTo(HaveOccurred())
+	dropFD, err := bpf.LoadBPFProgramFromInsns(epiInsns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
+	Expect(dropFD).NotTo(BeZero())
+
+	jumpValue := make([]byte, 4)
+	binary.LittleEndian.PutUint32(jumpValue, uint32(dropFD))
+	err = jumpMap.Update([]byte{byte(jumpMapindex), 0, 0, 0}, jumpValue)
+	Expect(err).NotTo(HaveOccurred())
+
+	return dropFD
+}
+
+func runProgram(tc testCase, stateMap maps.Map, progFD bpf.ProgFD, expProgRC int, expPolRC state.PolicyResult) {
 	// The policy program takes its input from the state map (rather than looking at the
 	// packet).  Set up the state map.
 	stateIn := tc.StateIn()
@@ -1767,12 +2750,23 @@ func runProgram(tc testCase, stateMap bpf.Map, progFD bpf.ProgFD, expProgRC int,
 	tc.MatchStateOut(stateOut)
 }
 
-func setUpIPSets(ipSets map[string][]string, alloc *idalloc.IDAllocator, ipsMap bpf.Map) {
+func setUpIPSets(ipSets map[string][]string, alloc *idalloc.IDAllocator, ipsMap maps.Map) {
 	for name, members := range ipSets {
 		id := alloc.GetOrAlloc(name)
 		for _, m := range members {
 			entry := ipsets.ProtoIPSetMemberToBPFEntry(id, m)
-			err := ipsMap.Update(entry[:], ipsets.DummyValue)
+			err := ipsMap.Update(entry.AsBytes(), ipsets.DummyValue)
+			Expect(err).NotTo(HaveOccurred())
+		}
+	}
+}
+
+func setUpIPSetsV6(ipSets map[string][]string, alloc *idalloc.IDAllocator, ipsMap maps.Map) {
+	for name, members := range ipSets {
+		id := alloc.GetOrAlloc(name)
+		for _, m := range members {
+			entry := ipsets.ProtoIPSetMemberToBPFEntryV6(id, m)
+			err := ipsMapV6.Update(entry.AsBytes(), ipsets.DummyValue)
 			Expect(err).NotTo(HaveOccurred())
 		}
 	}
@@ -1782,15 +2776,32 @@ func cleanIPSetMap() {
 	// Clean out any existing IP sets.  (The other maps have a fixed number of keys that
 	// we set as needed.)
 	var keys [][]byte
-	err := ipsMap.Iter(func(k, v []byte) bpf.IteratorAction {
+	err := ipsMap.Iter(func(k, v []byte) maps.IteratorAction {
 		kCopy := make([]byte, len(k))
 		copy(kCopy, k)
 		keys = append(keys, kCopy)
-		return bpf.IterNone
+		return maps.IterNone
 	})
 	Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
 	for _, k := range keys {
 		err = ipsMap.Delete(k)
+		Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
+	}
+}
+
+func cleanIPSetMapV6() {
+	// Clean out any existing IP sets.  (The other maps have a fixed number of keys that
+	// we set as needed.)
+	var keys [][]byte
+	err := ipsMapV6.Iter(func(k, v []byte) maps.IteratorAction {
+		kCopy := make([]byte, len(k))
+		copy(kCopy, k)
+		keys = append(keys, kCopy)
+		return maps.IterNone
+	})
+	Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
+	for _, k := range keys {
+		err = ipsMapV6.Delete(k)
 		Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
 	}
 }

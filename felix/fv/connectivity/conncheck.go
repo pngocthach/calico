@@ -19,7 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -40,23 +40,24 @@ import (
 // ConnectivityChecker records a set of connectivity expectations and supports calculating the
 // actual state of the connectivity between the given workloads.  It is expected to be used like so:
 //
-//     var cc = &connectivity.Checker{}
-//     cc.Expect(None, w[2], w[0], 1234)
-//     cc.Expect(Some, w[1], w[0], 5678)
-//     cc.Expect(Some, w[1], w[0], 4321, ExpectWithABC, ExpectWithXYZ)
-//     cc.CheckConnectivity()
-//
+//	var cc = &connectivity.Checker{}
+//	cc.Expect(None, w[2], w[0], 1234)
+//	cc.Expect(Some, w[1], w[0], 5678)
+//	cc.Expect(Some, w[1], w[0], 4321, ExpectWithABC, ExpectWithXYZ)
+//	cc.CheckConnectivity()
 type Checker struct {
 	ReverseDirection bool
 	Protocol         string // "tcp" or "udp"
 	expectations     []Expectation
 	CheckSNAT        bool
 	RetriesDisabled  bool
+	StaggerStartBy   time.Duration
 
 	// OnFail, if set, will be called instead of ginkgo.Fail().  (Useful for testing the checker itself.)
 	OnFail func(msg string)
 
 	description string
+	init        func()       // called before testing starts
 	beforeRetry func()       // called when a test fails and before it is retried
 	finalTest   func() error // called after connectivity test, if it is successful, may fail the test.
 }
@@ -68,6 +69,13 @@ type CheckerOpt func(*Checker)
 func CheckWithDescription(desc string) CheckerOpt {
 	return func(c *Checker) {
 		c.description = desc
+	}
+}
+
+func CheckWithInit(f func()) CheckerOpt {
+	return func(c *Checker) {
+		log.Debug("CheckWithInit set")
+		c.init = f
 	}
 }
 
@@ -140,8 +148,9 @@ func (c *Checker) expect(expected Expected, from ConnectionSource, to Connection
 	}
 
 	e := Expectation{
-		From:     from,
-		Expected: expected,
+		From:      from,
+		Expected:  expected,
+		ipVersion: 4,
 	}
 
 	if expected {
@@ -171,42 +180,67 @@ func (c *Checker) ResetExpectations() {
 // ActualConnectivity calculates the current connectivity for all the expected paths.  It returns a
 // slice containing one response for each attempted check (or nil if the check failed) along with
 // a same-length slice containing a pretty-printed description of the check and its result.
-func (c *Checker) ActualConnectivity() ([]*Result, []string) {
+func (c *Checker) ActualConnectivity(isARetry bool) ([]*Result, []string) {
 	UnactivatedCheckers.Discard(c)
 	var wg sync.WaitGroup
 	responses := make([]*Result, len(c.expectations))
 	pretty := make([]string, len(c.expectations))
+
+	p := "tcp"
+	if c.Protocol != "" {
+		p = c.Protocol
+	}
+
+	// Pre-calculate the options for each connectivity check...
+	preCalcOpts := make([][]CheckOption, len(c.expectations))
+	for i, exp := range c.expectations {
+		opts := []CheckOption{
+			WithDuration(exp.ExpectedPacketLoss.Duration),
+		}
+
+		if exp.sendLen > 0 || exp.recvLen > 0 {
+			opts = append(opts, WithSendLen(exp.sendLen), WithRecvLen(exp.recvLen))
+		}
+
+		if exp.srcPort != 0 {
+			opts = append(opts, WithSourcePort(strconv.Itoa(int(exp.srcPort))))
+		}
+		preCalcOpts[i] = opts
+	}
+
+	if isARetry {
+		// Give all the checkers a chance to run some pre-test cleanup.  For example, removing conntrack entries that
+		// might have been leaked by an earlier run.  Important to do this first rather than in-line to avoid
+		// one checker running its cleanup in parallel with another actually doing its check.
+		log.Debug("Retry, calling pre-retry cleanup functions.")
+		for i, exp := range c.expectations {
+			wg.Add(1)
+			go func(i int, exp Expectation) {
+				defer ginkgo.GinkgoRecover()
+				defer wg.Done()
+				exp.From.PreRetryCleanup(exp.DestIP(), exp.To.Port, p, preCalcOpts[i]...)
+			}(i, exp)
+		}
+		wg.Wait()
+	}
+
+	// Actually run the checks and format the results.
 	for i, exp := range c.expectations {
 		wg.Add(1)
 		go func(i int, exp Expectation) {
 			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
-			p := "tcp"
-			if c.Protocol != "" {
-				p = c.Protocol
-			}
-
-			var res *Result
-
-			opts := []CheckOption{
-				WithDuration(exp.ExpectedPacketLoss.Duration),
-			}
-
-			if exp.sendLen > 0 || exp.recvLen > 0 {
-				opts = append(opts, WithSendLen(exp.sendLen), WithRecvLen(exp.recvLen))
-			}
-
-			if exp.srcPort != 0 {
-				opts = append(opts, WithSourcePort(strconv.Itoa(int(exp.srcPort))))
-			}
-
-			res = exp.From.CanConnectTo(exp.To.IP, exp.To.Port, p, opts...)
-
+			res := exp.From.CanConnectTo(exp.DestIP(), exp.To.Port, p, preCalcOpts[i]...)
 			pretty[i] += fmt.Sprintf("%s -> %s = %v", exp.From.SourceName(), exp.To.TargetName, res.HasConnectivity())
 
 			if res != nil {
 				if c.CheckSNAT {
-					srcIP := strings.Split(res.LastResponse.SourceAddr, ":")[0]
+					var srcIP string
+					if res.LastResponse.SourceAddr != "" && res.LastResponse.SourceAddr[0] == '[' {
+						srcIP = strings.Split(res.LastResponse.SourceAddr[1:], "]")[0]
+					} else {
+						srcIP = strings.Split(res.LastResponse.SourceAddr, ":")[0]
+					}
 					pretty[i] += " (from " + srcIP + ")"
 				}
 				if res.ClientMTU.Start != 0 {
@@ -222,6 +256,7 @@ func (c *Checker) ActualConnectivity() ([]*Result, []string) {
 
 			responses[i] = res
 		}(i, exp)
+		time.Sleep(c.StaggerStartBy)
 	}
 	wg.Wait()
 	return responses, pretty
@@ -240,6 +275,9 @@ func (c *Checker) ExpectedConnectivityPretty() []string {
 			if exp.clientMTUStart != 0 || exp.clientMTUEnd != 0 {
 				result[i] += fmt.Sprintf(" (client MTU %d -> %d)", exp.clientMTUStart, exp.clientMTUEnd)
 			}
+		}
+		if exp.ipVersion == 6 {
+			result[i] += " (with IPv6)"
 		}
 		if exp.ExpectedPacketLoss.Duration > 0 {
 			if exp.ExpectedPacketLoss.MaxNumber >= 0 {
@@ -278,7 +316,7 @@ func (c *Checker) CheckConnectivityWithTimeout(timeout time.Duration, opts ...in
 }
 
 func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout time.Duration, opts ...interface{}) {
-
+	log.Info("Starting connectivity check...")
 	for _, o := range opts {
 		switch v := o.(type) {
 		case string:
@@ -299,8 +337,14 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 	var actualConnPretty []string
 	var finalErr error
 
-	for !c.RetriesDisabled && time.Since(start) < timeout || completedAttempts < 2 {
-		actualConn, actualConnPretty = c.ActualConnectivity()
+	if c.init != nil {
+		c.init()
+	}
+
+	for {
+		checkStartTime := time.Now()
+		isARetry := completedAttempts > 0
+		actualConn, actualConnPretty = c.ActualConnectivity(isARetry)
 		failed := false
 		finalErr = nil
 		expConnectivity = c.ExpectedConnectivityPretty()
@@ -314,6 +358,8 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 			}
 		}
 
+		completedAttempts++
+
 		if !failed {
 			if c.finalTest != nil {
 				finalErr = c.finalTest()
@@ -323,10 +369,24 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 			}
 			if !failed {
 				// Success!
+				log.WithField("attempts", completedAttempts).Info("Connectivity check passed.")
 				return
 			}
 		}
-		completedAttempts++
+
+		if c.RetriesDisabled {
+			break
+		}
+
+		// Check the timeout before we execute the retry function since the retry function might take a while,
+		// effectively cutting down the timeout.  Since one check should take ~2s we also check that we started
+		// the iteration close to the end of the.  Better to be a little permissive than flaky!
+		if time.Since(start) > timeout &&
+			checkStartTime.Sub(start) > timeout-2*time.Second &&
+			completedAttempts >= 2 {
+			break
+		}
+
 		if c.beforeRetry != nil {
 			log.Debug("calling beforeRetry")
 			c.beforeRetry()
@@ -346,6 +406,9 @@ func (c *Checker) CheckConnectivityWithTimeoutOffset(callerSkip int, timeout tim
 	if c.description != "" {
 		message += "\nDescription:\n" + c.description
 	}
+
+	log.Warn("Connectivity check failed: " + message)
+	message += fmt.Sprintf("\n\n Test took %s and %d tries.\n", time.Since(start), completedAttempts)
 
 	if c.OnFail != nil {
 		c.OnFail(message)
@@ -385,7 +448,11 @@ type Response struct {
 }
 
 func (r *Response) SourceIP() string {
-	return strings.Split(r.SourceAddr, ":")[0]
+	if r.SourceAddr[0] != '[' {
+		return strings.Split(r.SourceAddr, ":")[0]
+	}
+
+	return strings.Split(r.SourceAddr[1:], "]")[0]
 }
 
 type ConnectionTarget interface {
@@ -407,21 +474,29 @@ func (s TargetIP) ToMatcher(explicitPort ...uint16) *Matcher {
 	}
 }
 
+type TargetIPv4AsIPv6 string
+
+func (s TargetIPv4AsIPv6) ToMatcher(explicitPort ...uint16) *Matcher {
+	return TargetIP("::ffff:" + s).ToMatcher(explicitPort...)
+}
+
 func HaveConnectivityTo(target ConnectionTarget, explicitPort ...uint16) types.GomegaMatcher {
 	return target.ToMatcher(explicitPort...)
 }
 
 type Matcher struct {
-	IP, Port, TargetName, Protocol string
+	IP, Port, TargetName, Protocol, IP6 string
 }
 
 type ConnectionSource interface {
+	PreRetryCleanup(ip, port, protocol string, opts ...CheckOption)
 	CanConnectTo(ip, port, protocol string, opts ...CheckOption) *Result
 	SourceName() string
 	SourceIPs() []string
 }
 
 func (m *Matcher) Match(actual interface{}) (success bool, err error) {
+	actual.(ConnectionSource).PreRetryCleanup(m.IP, m.Port, m.Protocol)
 	success = actual.(ConnectionSource).CanConnectTo(m.IP, m.Port, m.Protocol) != nil
 	return
 }
@@ -483,7 +558,7 @@ func ExpectWithClientAdjustedMTU(from, to int) ExpectationOption {
 	}
 }
 
-// ExpectWithLoss asserts that the connection has a certain loos rate
+// ExpectWithLoss asserts that the connection has a certain loss rate
 func ExpectWithLoss(duration time.Duration, maxPacketLossPercent float64, maxPacketLossNumber int) ExpectationOption {
 	Expect(duration.Seconds()).NotTo(BeZero(),
 		"Packet loss test must have a duration")
@@ -507,6 +582,12 @@ func ExpectWithPorts(ports ...uint16) ExpectationOption {
 	}
 }
 
+func ExpectWithIPVersion(ipVersion int) ExpectationOption {
+	return func(e *Expectation) {
+		e.ipVersion = ipVersion
+	}
+}
+
 type Expectation struct {
 	From               ConnectionSource // Workload or Container
 	To                 *Matcher         // Workload or IP, + port
@@ -525,12 +606,21 @@ type Expectation struct {
 	srcPort uint16
 
 	ErrorStr string
+
+	ipVersion int
 }
 
 type ExpPacketLoss struct {
 	Duration   time.Duration // how long test will run
 	MaxPercent float64       // 10 means 10%. -1 means field not valid.
 	MaxNumber  int           // 10 means 10 packets. -1 means field not valid.
+}
+
+func (e Expectation) DestIP() string {
+	if e.ipVersion == 6 {
+		return e.To.IP6
+	}
+	return e.To.IP
 }
 
 func (e Expectation) Matches(response *Result, checkSNAT bool) bool {
@@ -599,7 +689,7 @@ func (e Expectation) Matches(response *Result, checkSNAT bool) bool {
 	return true
 }
 
-var UnactivatedCheckers = set.New()
+var UnactivatedCheckers = set.New[*Checker]()
 
 // MTUPair is a pair of MTU value recorded before and after data were transferred
 type MTUPair struct {
@@ -659,7 +749,8 @@ type CheckCmd struct {
 	ipSource   string
 	portSource string
 
-	duration time.Duration
+	duration time.Duration // Duration for long running stream tests
+	timeout  time.Duration // Timeout for one-off pings.
 
 	sendLen int
 	recvLen int
@@ -676,10 +767,11 @@ func (cmd *CheckCmd) run(cName string, logMsg string) *Result {
 		cmd.ip, cmd.port, cmd.protocol, cmd.sendLen, cmd.recvLen)
 
 	args := []string{"exec", cName,
-		"/test-connection", "--protocol=" + cmd.protocol,
+		"test-connection", "--protocol=" + cmd.protocol,
 		fmt.Sprintf("--duration=%d", int(cmd.duration.Seconds())),
 		fmt.Sprintf("--sendlen=%d", cmd.sendLen),
 		fmt.Sprintf("--recvlen=%d", cmd.recvLen),
+		fmt.Sprintf("--timeout=%f", cmd.timeout.Seconds()),
 		cmd.nsPath, cmd.ip, cmd.port,
 	}
 
@@ -693,6 +785,7 @@ func (cmd *CheckCmd) run(cName string, logMsg string) *Result {
 
 	// Run 'test-connection' to the target.
 	connectionCmd := utils.Command("docker", args...)
+	connectionCmd.Env = []string{"GODEBUG=netdns=1"}
 
 	outPipe, err := connectionCmd.StdoutPipe()
 	Expect(err).NotTo(HaveOccurred())
@@ -708,12 +801,12 @@ func (cmd *CheckCmd) run(cName string, logMsg string) *Result {
 
 	go func() {
 		defer wg.Done()
-		wOut, outErr = ioutil.ReadAll(outPipe)
+		wOut, outErr = io.ReadAll(outPipe)
 	}()
 
 	go func() {
 		defer wg.Done()
-		wErr, errErr = ioutil.ReadAll(errPipe)
+		wErr, errErr = io.ReadAll(errPipe)
 	}()
 
 	wg.Wait()
@@ -777,14 +870,22 @@ func WithRecvLen(l int) CheckOption {
 	}
 }
 
+func WithTimeout(t time.Duration) CheckOption {
+	return func(c *CheckCmd) {
+		c.timeout = t
+	}
+}
+
 // Check executes the connectivity check
 func Check(cName, logMsg, ip, port, protocol string, opts ...CheckOption) *Result {
 
+	const defaultPingTimeout = 2 * time.Second
 	cmd := CheckCmd{
 		nsPath:   "-",
 		ip:       ip,
 		port:     port,
 		protocol: protocol,
+		timeout:  defaultPingTimeout,
 	}
 
 	for _, opt := range opts {
@@ -834,7 +935,6 @@ func IsMessagePartOfStream(msg string) bool {
 
 // Runtime abstracts *containers.Container to avoid import loops
 type Runtime interface {
-	EnsureBinary(name string)
 	ExecMayFail(cmd ...string) error
 }
 
@@ -850,6 +950,7 @@ type PersistentConnection struct {
 	SourcePort          int
 	MonitorConnectivity bool
 	NamespacePath       string
+	Timeout             time.Duration
 
 	loopFile string
 	runCmd   *exec.Cmd
@@ -883,8 +984,6 @@ func (pc *PersistentConnection) Start() error {
 		namespacePath = "-"
 	}
 
-	// Ensure that the host has the 'test-connection' binary.
-	pc.Runtime.EnsureBinary("test-connection")
 	permConnIdx++
 	n := fmt.Sprintf("%s-pc%d", pc.RuntimeName, permConnIdx)
 	loopFile := fmt.Sprintf("/tmp/%s-loop", n)
@@ -897,7 +996,7 @@ func (pc *PersistentConnection) Start() error {
 	args := []string{
 		"exec",
 		pc.RuntimeName,
-		"/test-connection",
+		"test-connection",
 		namespacePath,
 		pc.IP,
 		fmt.Sprintf("%d", pc.Port),
@@ -908,17 +1007,28 @@ func (pc *PersistentConnection) Start() error {
 	if pc.MonitorConnectivity {
 		args = append(args, "--log-pongs")
 	}
+	if pc.Timeout > 0 {
+		args = append(args, fmt.Sprintf("--timeout=%d", pc.Timeout/time.Second))
+	}
 	runCmd := utils.Command(
 		"docker",
 		args...,
 	)
-	logName := fmt.Sprintf("permanent connection %s", n)
+	logName := fmt.Sprintf("persistent connection %s", n)
 	stdout, err := runCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to start output logging for %s", logName)
 	}
+	stderr, err := runCmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to start error logging for %s", logName)
+	}
+	log.WithField("name", logName).Info("Started")
+
 	stdoutReader := bufio.NewReader(stdout)
 	go func() {
+		log.WithField("name", logName).Info("stdout reader started")
+		defer log.WithField("name", logName).Info("stdout reader exited")
 		for {
 			line, err := stdoutReader.ReadString('\n')
 			if err != nil {
@@ -933,6 +1043,20 @@ func (pc *PersistentConnection) Start() error {
 				pc.pongCount++
 				pc.Unlock()
 			}
+		}
+	}()
+	stderrReader := bufio.NewReader(stderr)
+	go func() {
+		log.WithField("name", logName).Info("stderr reader started")
+		defer log.WithField("name", logName).Info("stderr reader exited")
+		for {
+			line, err := stderrReader.ReadString('\n')
+			if err != nil {
+				log.WithError(err).Info("End of permanent connection stderr")
+				return
+			}
+			line = strings.TrimSpace(string(line))
+			log.Infof("%s stderr: %s", logName, line)
 		}
 	}()
 	if err := runCmd.Start(); err != nil {
@@ -965,5 +1089,6 @@ func (pc *PersistentConnection) LastPongTime() time.Time {
 func (pc *PersistentConnection) PongCount() int {
 	pc.Lock()
 	defer pc.Unlock()
+	log.WithField("name", pc.Name).Infof("pong count %d", pc.pongCount)
 	return pc.pongCount
 }

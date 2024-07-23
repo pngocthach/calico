@@ -15,6 +15,8 @@
 package routetable_test
 
 import (
+	"golang.org/x/sys/unix"
+
 	"github.com/projectcalico/calico/felix/logutils"
 	. "github.com/projectcalico/calico/felix/routetable"
 
@@ -59,7 +61,6 @@ var _ = Describe("RouteTable v6", func() {
 			[]string{"^cali.*"},
 			6,
 			dataplane.NewMockNetlink,
-			false,
 			10*time.Second,
 			dataplane.AddStaticArpEntry,
 			dataplane,
@@ -69,6 +70,7 @@ var _ = Describe("RouteTable v6", func() {
 			true,
 			0,
 			logutils.NewSummarizer("test"),
+			dataplane,
 		)
 	})
 
@@ -85,6 +87,7 @@ var _ = Describe("RouteTable v6", func() {
 			Type:      syscall.RTN_UNICAST,
 			Protocol:  syscall.RTPROT_KERNEL,
 			Scope:     netlink.SCOPE_LINK,
+			Table:     unix.RT_TABLE_MAIN,
 		}
 		rt.SetRoutes(noopLink.LinkAttrs.Name, []Target{
 			{CIDR: ip.MustParseCIDROrIP("10.0.0.4/32"), DestMAC: mac1},
@@ -99,6 +102,7 @@ var _ = Describe("RouteTable v6", func() {
 			Type:      syscall.RTN_UNICAST,
 			Protocol:  FelixRouteProtocol,
 			Scope:     netlink.SCOPE_LINK,
+			Table:     unix.RT_TABLE_MAIN,
 		}
 		dataplane.AddMockRoute(&deleteRoute)
 
@@ -125,7 +129,6 @@ var _ = Describe("RouteTable", func() {
 			[]string{"^cali.*"},
 			4,
 			dataplane.NewMockNetlink,
-			false,
 			10*time.Second,
 			dataplane.AddStaticArpEntry,
 			dataplane,
@@ -135,6 +138,7 @@ var _ = Describe("RouteTable", func() {
 			true,
 			0,
 			logutils.NewSummarizer("test"),
+			dataplane,
 			WithRouteCleanupGracePeriod(10*time.Second),
 		)
 	})
@@ -163,19 +167,20 @@ var _ = Describe("RouteTable", func() {
 	})
 
 	Describe("with some interfaces", func() {
-		var cali1, cali3, eth0 *mocknetlink.MockLink
+		var cali1, cali2, cali3, eth0 *mocknetlink.MockLink
 		var gatewayRoute, cali1Route, cali1Route2, cali3Route netlink.Route
 		BeforeEach(func() {
-			eth0 = dataplane.AddIface(0, "eth0", true, true)
-			cali1 = dataplane.AddIface(1, "cali1", true, true)
-			dataplane.AddIface(2, "cali2", true, true)
-			cali3 = dataplane.AddIface(3, "cali3", true, true)
+			eth0 = dataplane.AddIface(2, "eth0", true, true)
+			cali1 = dataplane.AddIface(3, "cali1", true, true)
+			cali2 = dataplane.AddIface(4, "cali2", true, true)
+			cali3 = dataplane.AddIface(5, "cali3", true, true)
 			cali1Route = netlink.Route{
 				LinkIndex: cali1.LinkAttrs.Index,
 				Dst:       mustParseCIDR("10.0.0.1/32"),
 				Type:      syscall.RTN_UNICAST,
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&cali1Route)
 			cali3Route = netlink.Route{
@@ -184,6 +189,7 @@ var _ = Describe("RouteTable", func() {
 				Type:      syscall.RTN_UNICAST,
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&cali3Route)
 			gatewayRoute = netlink.Route{
@@ -192,6 +198,7 @@ var _ = Describe("RouteTable", func() {
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
 				Gw:        net.ParseIP("12.0.0.1"),
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&gatewayRoute)
 		})
@@ -236,7 +243,7 @@ var _ = Describe("RouteTable", func() {
 			))
 		})
 		It("Should clear out a source address when source address is not set", func() {
-			updateLink := dataplane.AddIface(5, "cali5", true, true)
+			updateLink := dataplane.AddIface(6, "cali5", true, true)
 			updateRoute := netlink.Route{
 				LinkIndex: updateLink.LinkAttrs.Index,
 				Dst:       mustParseCIDR("10.0.0.5/32"),
@@ -244,6 +251,7 @@ var _ = Describe("RouteTable", func() {
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
 				Src:       net.ParseIP("192.168.0.1"),
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&updateRoute)
 			rt.SetRoutes(updateLink.LinkAttrs.Name, []Target{
@@ -257,7 +265,6 @@ var _ = Describe("RouteTable", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(dataplane.UpdatedRouteKeys).To(HaveKey(mocknetlink.KeyForRoute(&updateRoute)))
 			Expect(dataplane.RouteKeyToRoute[mocknetlink.KeyForRoute(&updateRoute)]).To(Equal(fixedRoute))
-
 		})
 		Describe("With a device route source address set", func() {
 			deviceRouteSource := "192.168.0.1"
@@ -268,7 +275,6 @@ var _ = Describe("RouteTable", func() {
 					[]string{"^cali.*"},
 					4,
 					dataplane.NewMockNetlink,
-					false,
 					10*time.Second,
 					dataplane.AddStaticArpEntry,
 					dataplane,
@@ -278,6 +284,7 @@ var _ = Describe("RouteTable", func() {
 					true,
 					0,
 					logutils.NewSummarizer("test"),
+					dataplane,
 				)
 			})
 			It("Should delete routes without a source address", func() {
@@ -285,6 +292,11 @@ var _ = Describe("RouteTable", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Expect(dataplane.DeletedRouteKeys).To(HaveKey(mocknetlink.KeyForRoute(&cali3Route)))
 				Expect(dataplane.DeletedRouteKeys).To(HaveKey(mocknetlink.KeyForRoute(&cali1Route)))
+			})
+			It("Should enable strict mode", func() {
+				err := rt.Apply()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(dataplane.StrictEnabled).To(BeTrue())
 			})
 			It("Should add routes with a source address", func() {
 				// Route that needs to be added
@@ -294,19 +306,20 @@ var _ = Describe("RouteTable", func() {
 				})
 				err := rt.Apply()
 				Expect(err).ToNot(HaveOccurred())
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.6/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.6/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.6/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
 					Src:       deviceRouteSourceAddress,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 				Expect(dataplane.HasStaticArpEntry(ip.MustParseCIDROrIP("10.0.0.6/32"), mac1, "cali6")).To(BeTrue())
 			})
 			It("Should not remove routes with a source address", func() {
 				// Route that should be left alone
-				noopLink := dataplane.AddIface(4, "cali4", true, true)
+				noopLink := dataplane.AddIface(6, "cali4", true, true)
 				noopRoute := netlink.Route{
 					LinkIndex: noopLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.4/32"),
@@ -314,6 +327,7 @@ var _ = Describe("RouteTable", func() {
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
 					Src:       deviceRouteSourceAddress,
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(noopLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.4/32"), DestMAC: mac1},
@@ -328,13 +342,14 @@ var _ = Describe("RouteTable", func() {
 			})
 			It("Should update source addresses from nil to a given source", func() {
 				// Route that needs to be updated
-				updateLink := dataplane.AddIface(5, "cali5", true, true)
+				updateLink := dataplane.AddIface(6, "cali5", true, true)
 				updateRoute := netlink.Route{
 					LinkIndex: updateLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.5/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(updateLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1},
@@ -353,7 +368,7 @@ var _ = Describe("RouteTable", func() {
 
 			It("Should update source addresses from an old source to a new one", func() {
 				// Route that needs to be updated
-				updateLink := dataplane.AddIface(5, "cali5", true, true)
+				updateLink := dataplane.AddIface(6, "cali5", true, true)
 				updateRoute := netlink.Route{
 					LinkIndex: updateLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.5/32"),
@@ -361,6 +376,7 @@ var _ = Describe("RouteTable", func() {
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
 					Src:       net.ParseIP("192.168.0.2"),
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(updateLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1},
@@ -376,6 +392,48 @@ var _ = Describe("RouteTable", func() {
 				Expect(dataplane.RouteKeyToRoute[mocknetlink.KeyForRoute(&updateRoute)]).To(Equal(fixedRoute))
 				Expect(dataplane.HasStaticArpEntry(ip.MustParseCIDROrIP("10.0.0.5/32"), mac1, "cali5")).To(BeTrue())
 			})
+
+			It("should not delete route with source address if target has the same source", func() {
+				noopLink := dataplane.AddIface(7, "cali7", true, true)
+				noopRoute := netlink.Route{
+					LinkIndex: noopLink.LinkAttrs.Index,
+					Dst:       mustParseCIDR("10.0.0.5/32"),
+					Type:      syscall.RTN_UNICAST,
+					Protocol:  FelixRouteProtocol,
+					Scope:     netlink.SCOPE_LINK,
+					Src:       net.ParseIP("192.168.0.2"),
+					Table:     unix.RT_TABLE_MAIN,
+				}
+				rt.SetRoutes(noopLink.LinkAttrs.Name, []Target{
+					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1, Src: ip.FromString("192.168.0.2")},
+				})
+				dataplane.AddMockRoute(&noopRoute)
+				err := rt.Apply()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(dataplane.DeletedRouteKeys).ToNot(HaveKey(mocknetlink.KeyForRoute(&noopRoute)))
+				Expect(dataplane.UpdatedRouteKeys).ToNot(HaveKey(mocknetlink.KeyForRoute(&noopRoute)))
+			})
+
+			It("should delete route with different source address", func() {
+				noopLink := dataplane.AddIface(8, "cali8", true, true)
+				noopRoute := netlink.Route{
+					LinkIndex: noopLink.LinkAttrs.Index,
+					Dst:       mustParseCIDR("10.0.0.5/32"),
+					Type:      syscall.RTN_UNICAST,
+					Protocol:  FelixRouteProtocol,
+					Scope:     netlink.SCOPE_LINK,
+					Src:       net.ParseIP("192.168.0.2"),
+					Table:     unix.RT_TABLE_MAIN,
+				}
+				rt.SetRoutes(noopLink.LinkAttrs.Name, []Target{
+					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1, Src: ip.FromString("192.168.0.3")},
+				})
+				dataplane.AddMockRoute(&noopRoute)
+				err := rt.Apply()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(dataplane.DeletedRouteKeys).To(HaveKey(mocknetlink.KeyForRoute(&noopRoute)))
+			})
+
 		})
 
 		Describe("With a device route protocol set", func() {
@@ -386,7 +444,6 @@ var _ = Describe("RouteTable", func() {
 					[]string{"^cali.*"},
 					4,
 					dataplane.NewMockNetlink,
-					false,
 					10*time.Second,
 					dataplane.AddStaticArpEntry,
 					dataplane,
@@ -396,6 +453,7 @@ var _ = Describe("RouteTable", func() {
 					true,
 					0,
 					logutils.NewSummarizer("test"),
+					dataplane,
 				)
 			})
 			It("Should delete routes without a protocol", func() {
@@ -412,12 +470,13 @@ var _ = Describe("RouteTable", func() {
 				})
 				err := rt.Apply()
 				Expect(err).ToNot(HaveOccurred())
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.6/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.6/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.6/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 			It("Should add multiple routes with a protocol", func() {
@@ -429,19 +488,21 @@ var _ = Describe("RouteTable", func() {
 				})
 				err := rt.Apply()
 				Expect(err).ToNot(HaveOccurred())
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.6/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.6/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.6/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.7/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.7/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.7/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 			It("Should add multiple routes with a protocol after persistent failures", func() {
@@ -452,7 +513,7 @@ var _ = Describe("RouteTable", func() {
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.7"), DestMAC: mac1},
 				})
 				// Persist failures, this will apply the deltas to the cache but will be out of sync with the dataplane.
-				dataplane.FailuresToSimulate = mocknetlink.FailNextRouteAdd
+				dataplane.FailuresToSimulate = mocknetlink.FailNextRouteAdd | mocknetlink.FailNextRouteReplace
 				dataplane.PersistFailures = true
 				err := rt.Apply()
 				Expect(err).To(HaveOccurred())
@@ -462,30 +523,33 @@ var _ = Describe("RouteTable", func() {
 				dataplane.PersistFailures = false
 				err = rt.Apply()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.6/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.6/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.6/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
-				Expect(dataplane.RouteKeyToRoute["254-6-10.0.0.7/32"]).To(Equal(netlink.Route{
+				Expect(dataplane.RouteKeyToRoute["254-10.0.0.7/32"]).To(Equal(netlink.Route{
 					LinkIndex: addLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.7/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 			It("Should not remove routes with a protocol", func() {
 				// Route that should be left alone
-				noopLink := dataplane.AddIface(4, "cali4", true, true)
+				noopLink := dataplane.AddIface(6, "cali4", true, true)
 				noopRoute := netlink.Route{
 					LinkIndex: noopLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.4/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  deviceRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(noopLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.4/32"), DestMAC: mac1},
@@ -499,12 +563,13 @@ var _ = Describe("RouteTable", func() {
 			})
 			It("Should update protocol from nil to a given protocol", func() {
 				// Route that needs to be updated
-				updateLink := dataplane.AddIface(5, "cali5", true, true)
+				updateLink := dataplane.AddIface(6, "cali5", true, true)
 				updateRoute := netlink.Route{
 					LinkIndex: updateLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.5/32"),
 					Type:      syscall.RTN_UNICAST,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(updateLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1},
@@ -522,13 +587,14 @@ var _ = Describe("RouteTable", func() {
 
 			It("Should update protocol from an old protocol to a new one", func() {
 				// Route that needs to be updated
-				updateLink := dataplane.AddIface(5, "cali5", true, true)
+				updateLink := dataplane.AddIface(6, "cali5", true, true)
 				updateRoute := netlink.Route{
 					LinkIndex: updateLink.LinkAttrs.Index,
 					Dst:       mustParseCIDR("10.0.0.5/32"),
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  64,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}
 				rt.SetRoutes(updateLink.LinkAttrs.Name, []Target{
 					{CIDR: ip.MustParseCIDROrIP("10.0.0.5"), DestMAC: mac1},
@@ -598,7 +664,7 @@ var _ = Describe("RouteTable", func() {
 				err := rt.Apply()
 				Expect(err).NotTo(HaveOccurred())
 
-				dataplane.FailuresToSimulate = mocknetlink.FailNextRouteAdd
+				dataplane.FailuresToSimulate = mocknetlink.FailNextRouteAdd | mocknetlink.FailNextRouteReplace
 				dataplane.PersistFailures = true
 				rt.RouteUpdate("cali3", Target{
 					CIDR: ip.MustParseCIDROrIP("10.20.30.40"),
@@ -618,6 +684,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 
@@ -631,6 +698,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 		})
@@ -656,6 +724,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 				Expect(dataplane.RouteKeyToRoute).To(ContainElement(netlink.Route{
 					LinkIndex: cali3.LinkAttrs.Index,
@@ -663,6 +732,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 
@@ -689,6 +759,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 				Expect(dataplane.RouteKeyToRoute).To(ContainElement(netlink.Route{
 					LinkIndex: cali3.LinkAttrs.Index,
@@ -696,6 +767,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 
@@ -721,6 +793,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 				Expect(dataplane.RouteKeyToRoute).To(ContainElement(netlink.Route{
 					LinkIndex: cali3.LinkAttrs.Index,
@@ -728,6 +801,7 @@ var _ = Describe("RouteTable", func() {
 					Type:      syscall.RTN_UNICAST,
 					Protocol:  FelixRouteProtocol,
 					Scope:     netlink.SCOPE_LINK,
+					Table:     unix.RT_TABLE_MAIN,
 				}))
 			})
 		})
@@ -807,35 +881,38 @@ var _ = Describe("RouteTable", func() {
 					Expect(dataplane.FailuresToSimulate).To(Equal(mocknetlink.FailNone))
 				})
 				It("should keep correct route", func() {
-					Expect(dataplane.RouteKeyToRoute["254-1-10.0.0.1/32"]).To(Equal(netlink.Route{
-						LinkIndex: 1,
+					Expect(dataplane.RouteKeyToRoute["254-10.0.0.1/32"]).To(Equal(netlink.Route{
+						LinkIndex: cali1.LinkAttrs.Index,
 						Dst:       &ip1,
 						Type:      syscall.RTN_UNICAST,
 						Protocol:  FelixRouteProtocol,
 						Scope:     netlink.SCOPE_LINK,
+						Table:     unix.RT_TABLE_MAIN,
 					}))
-					Expect(dataplane.AddedRouteKeys.Contains("254-1-10.0.0.1/32")).To(BeFalse())
+					Expect(dataplane.AddedRouteKeys.Contains("254-10.0.0.1/32")).To(BeFalse())
 				})
 				It("should add new route", func() {
-					Expect(dataplane.RouteKeyToRoute).To(HaveKey("254-2-10.0.0.2/32"))
-					Expect(dataplane.RouteKeyToRoute["254-2-10.0.0.2/32"]).To(Equal(netlink.Route{
-						LinkIndex: 2,
+					Expect(dataplane.RouteKeyToRoute).To(HaveKey("254-10.0.0.2/32"))
+					Expect(dataplane.RouteKeyToRoute["254-10.0.0.2/32"]).To(Equal(netlink.Route{
+						LinkIndex: cali2.LinkAttrs.Index,
 						Dst:       &ip2,
 						Type:      syscall.RTN_UNICAST,
 						Protocol:  FelixRouteProtocol,
 						Scope:     netlink.SCOPE_LINK,
+						Table:     unix.RT_TABLE_MAIN,
 					}))
 				})
 				It("should update changed route", func() {
-					Expect(dataplane.RouteKeyToRoute).To(HaveKey("254-3-10.0.1.3/32"))
-					Expect(dataplane.RouteKeyToRoute["254-3-10.0.1.3/32"]).To(Equal(netlink.Route{
-						LinkIndex: 3,
+					Expect(dataplane.RouteKeyToRoute).To(HaveKey("254-10.0.1.3/32"))
+					Expect(dataplane.RouteKeyToRoute["254-10.0.1.3/32"]).To(Equal(netlink.Route{
+						LinkIndex: cali3.LinkAttrs.Index,
 						Dst:       &ip13,
 						Type:      syscall.RTN_UNICAST,
 						Protocol:  FelixRouteProtocol,
 						Scope:     netlink.SCOPE_LINK,
+						Table:     unix.RT_TABLE_MAIN,
 					}))
-					Expect(dataplane.DeletedRouteKeys.Contains("254-3-10.0.0.3/32")).To(BeTrue())
+					Expect(dataplane.DeletedRouteKeys.Contains("254-10.0.0.3/32")).To(BeTrue())
 					Eventually(dataplane.GetDeletedConntrackEntries).Should(Equal([]net.IP{net.ParseIP("10.0.0.3").To4()}))
 				})
 				It("should have expected number of routes at the end", func() {
@@ -845,6 +922,7 @@ var _ = Describe("RouteTable", func() {
 							dataplane.RouteKeyToRoute))
 				})
 				if failFlags&(mocknetlink.FailNextSetSocketTimeout|
+					mocknetlink.FailNextSetStrict|
 					mocknetlink.FailNextNewNetlink|
 					mocknetlink.FailNextLinkByName|
 					mocknetlink.FailNextLinkList|
@@ -868,6 +946,7 @@ var _ = Describe("RouteTable", func() {
 							Dst:       mustParseCIDR("10.0.0.22/32"),
 							Type:      syscall.RTN_UNICAST,
 							Scope:     netlink.SCOPE_LINK,
+							Table:     unix.RT_TABLE_MAIN,
 						}
 						dataplane.AddMockRoute(&cali1Route2)
 						err := rt.Apply()
@@ -914,13 +993,14 @@ var _ = Describe("RouteTable", func() {
 		var cali1 *mocknetlink.MockLink
 		var cali1Route netlink.Route
 		BeforeEach(func() {
-			cali1 = dataplane.AddIface(1, "cali1", false, false)
+			cali1 = dataplane.AddIface(2, "cali1", false, false)
 			cali1Route = netlink.Route{
 				LinkIndex: cali1.LinkAttrs.Index,
 				Dst:       mustParseCIDR("10.0.0.1/32"),
 				Type:      syscall.RTN_UNICAST,
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&cali1Route)
 		})
@@ -974,7 +1054,7 @@ var _ = Describe("RouteTable", func() {
 
 				// Set interface up
 				rt.OnIfaceStateChanged("cali1", ifacemonitor.StateUp)
-				cali1 = dataplane.AddIface(1, "cali1", true, true)
+				dataplane.SetIface("cali1", true, true)
 
 				// Now, the apply should work.
 				err = rt.Apply()
@@ -982,6 +1062,26 @@ var _ = Describe("RouteTable", func() {
 				Expect(dataplane.RouteKeyToRoute).To(BeEmpty())
 			})
 		}
+	})
+
+	Describe("with an interface that disappears", func() {
+		BeforeEach(func() {
+			// Add an interface so that hte route table tries to list the routes associated with it.
+			dataplane.AddIface(2, "cali1", true, true)
+			// But trigger the interface to disappear just before the list call.  This will trigger
+			// a list operation with no interface, resulting in an ENODEV.
+			dataplane.DeleteInterfaceAfterLinkByName = true
+		})
+		It("it should suppress the ENODEV error", func() {
+			rt.RouteUpdate("cali1", Target{
+				CIDR: ip.MustParseCIDROrIP("10.0.20.0/24"),
+			})
+			err := rt.Apply()
+			Expect(err).NotTo(HaveOccurred())
+			// Check that we really hit the case we intended to hit.
+			Expect(dataplane.HitRouteListFilteredNoDev).To(BeTrue(),
+				"RouteListFiltered wasn't called with missing device?  Perhaps test needs updating.")
+		})
 	})
 })
 
@@ -1000,7 +1100,6 @@ var _ = Describe("RouteTable (main table)", func() {
 			[]string{"^cali.*"},
 			4,
 			dataplane.NewMockNetlink,
-			false,
 			10*time.Second,
 			dataplane.AddStaticArpEntry,
 			dataplane,
@@ -1010,6 +1109,7 @@ var _ = Describe("RouteTable (main table)", func() {
 			true,
 			0,
 			logutils.NewSummarizer("test"),
+			dataplane,
 			WithRouteCleanupGracePeriod(10*time.Second),
 		)
 	})
@@ -1022,14 +1122,15 @@ var _ = Describe("RouteTable (main table)", func() {
 		var cali1, eth0 *mocknetlink.MockLink
 		var gatewayRoute, cali1Route, cali1RouteTable100 netlink.Route
 		BeforeEach(func() {
-			eth0 = dataplane.AddIface(0, "eth0", true, true)
-			cali1 = dataplane.AddIface(1, "cali1", true, true)
+			eth0 = dataplane.AddIface(2, "eth0", true, true)
+			cali1 = dataplane.AddIface(3, "cali1", true, true)
 			cali1Route = netlink.Route{
 				LinkIndex: cali1.LinkAttrs.Index,
 				Dst:       mustParseCIDR("10.0.0.1/32"),
 				Type:      syscall.RTN_UNICAST,
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&cali1Route)
 			cali1RouteTable100 = netlink.Route{
@@ -1047,6 +1148,7 @@ var _ = Describe("RouteTable (main table)", func() {
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
 				Gw:        net.ParseIP("12.0.0.1"),
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&gatewayRoute)
 		})
@@ -1100,7 +1202,6 @@ var _ = Describe("RouteTable (table 100)", func() {
 			[]string{"^cali$", InterfaceNone}, // exact interface match
 			4,
 			dataplane.NewMockNetlink,
-			false,
 			10*time.Second,
 			dataplane.AddStaticArpEntry,
 			dataplane,
@@ -1110,6 +1211,7 @@ var _ = Describe("RouteTable (table 100)", func() {
 			true,
 			100,
 			logutils.NewSummarizer("test"),
+			dataplane,
 			WithRouteCleanupGracePeriod(10*time.Second),
 		)
 	})
@@ -1118,18 +1220,19 @@ var _ = Describe("RouteTable (table 100)", func() {
 		Expect(rt).ToNot(BeNil())
 	})
 
-	Describe("with some interfaces", func() {
+	Describe("with some interfaces and routes", func() {
 		var cali, eth0 *mocknetlink.MockLink
-		var gatewayRoute, caliRoute, caliRouteTable100, throwRoute netlink.Route
+		var gatewayRoute, caliRoute, caliRouteTable100, throwRoute, caliRouteTable100SameAsThrow netlink.Route
 		BeforeEach(func() {
-			eth0 = dataplane.AddIface(0, "eth0", true, true)
-			cali = dataplane.AddIface(1, "cali", true, true)
+			eth0 = dataplane.AddIface(2, "eth0", true, true)
+			cali = dataplane.AddIface(3, "cali", true, true)
 			caliRoute = netlink.Route{
 				LinkIndex: cali.LinkAttrs.Index,
 				Dst:       mustParseCIDR("10.0.0.1/32"),
 				Type:      syscall.RTN_UNICAST,
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&caliRoute)
 			caliRouteTable100 = netlink.Route{
@@ -1147,6 +1250,7 @@ var _ = Describe("RouteTable (table 100)", func() {
 				Protocol:  FelixRouteProtocol,
 				Scope:     netlink.SCOPE_LINK,
 				Gw:        net.ParseIP("12.0.0.1"),
+				Table:     unix.RT_TABLE_MAIN,
 			}
 			dataplane.AddMockRoute(&gatewayRoute)
 			throwRoute = netlink.Route{
@@ -1158,6 +1262,16 @@ var _ = Describe("RouteTable (table 100)", func() {
 				Table:     100,
 			}
 			dataplane.AddMockRoute(&throwRoute)
+
+			// Used in tests but not added to the dataplane at the start.
+			caliRouteTable100SameAsThrow = netlink.Route{
+				LinkIndex: cali.LinkAttrs.Index,
+				Dst:       mustParseCIDR("10.10.10.10/32"),
+				Type:      syscall.RTN_UNICAST,
+				Protocol:  FelixRouteProtocol,
+				Scope:     netlink.SCOPE_LINK,
+				Table:     100,
+			}
 		})
 		It("should tidy up non-link routes immediately and wait for the route cleanup delay for interface routes", func() {
 			t.SetAutoIncrement(0 * time.Second)
@@ -1209,6 +1323,50 @@ var _ = Describe("RouteTable (table 100)", func() {
 			})
 		})
 
+		Describe("after configuring a throw route and then deleting and recreating the route via cali", func() {
+			JustBeforeEach(func() {
+				rt.RouteUpdate(InterfaceNone, Target{
+					CIDR: ip.MustParseCIDROrIP("10.10.10.10/32"),
+					Type: TargetTypeThrow,
+				})
+				err := rt.Apply()
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("the throw route should be removed and the interface route added", func() {
+				// Modify the action associated with a particular destination.
+				for ii := 0; ii < 100; ii++ {
+					rt.RouteRemove(InterfaceNone, ip.MustParseCIDROrIP("10.10.10.10/32"))
+					rt.RouteUpdate("cali", Target{
+						CIDR: ip.MustParseCIDROrIP("10.10.10.10/32"),
+					})
+					err := rt.Apply()
+					Expect(err).ToNot(HaveOccurred())
+					Expect(dataplane.RouteKeyToRoute).To(ConsistOf(caliRoute, gatewayRoute, caliRouteTable100SameAsThrow))
+
+					rt.RouteRemove("cali", ip.MustParseCIDROrIP("10.10.10.10/32"))
+					rt.RouteUpdate(InterfaceNone, Target{
+						CIDR: ip.MustParseCIDROrIP("10.10.10.10/32"),
+						Type: TargetTypeThrow,
+					})
+					err = rt.Apply()
+					Expect(err).ToNot(HaveOccurred())
+					Expect(dataplane.RouteKeyToRoute).To(ConsistOf(caliRoute, gatewayRoute, throwRoute))
+				}
+			})
+		})
+
+		Describe("throw route configured in dataplane, actual route is via cali", func() {
+			It("the throw route should be removed and the interface route added", func() {
+				rt.RouteUpdate("cali", Target{
+					CIDR: ip.MustParseCIDROrIP("10.10.10.10/32"),
+				})
+				err := rt.Apply()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(dataplane.RouteKeyToRoute).To(ConsistOf(caliRoute, gatewayRoute, caliRouteTable100SameAsThrow))
+			})
+		})
+
 		Describe("after configuring an existing throw route and then deleting it", func() {
 			JustBeforeEach(func() {
 				rt.RouteUpdate(InterfaceNone, Target{
@@ -1254,8 +1412,8 @@ var _ = Describe("RouteTable (table 100)", func() {
 					Scope:     netlink.SCOPE_UNIVERSE,
 					Table:     100,
 				}))
-				Expect(dataplane.AddedRouteKeys.Contains("100-0-10.10.10.10/32")).To(BeTrue())
-				Expect(dataplane.DeletedRouteKeys.Contains("100-0-10.10.10.10/32")).To(BeTrue())
+				Expect(dataplane.AddedRouteKeys.Contains("100-10.10.10.10/32")).To(BeTrue())
+				Expect(dataplane.DeletedRouteKeys.Contains("100-10.10.10.10/32")).To(BeTrue())
 			})
 		})
 
@@ -1284,9 +1442,37 @@ var _ = Describe("RouteTable (table 100)", func() {
 					Scope:     netlink.SCOPE_UNIVERSE,
 					Table:     100,
 				}))
-				Expect(dataplane.AddedRouteKeys.Contains("100-0-10.10.10.10/32")).To(BeTrue())
-				Expect(dataplane.DeletedRouteKeys.Contains("100-0-10.10.10.10/32")).To(BeTrue())
+				Expect(dataplane.AddedRouteKeys.Contains("100-10.10.10.10/32")).To(BeTrue())
+				Expect(dataplane.DeletedRouteKeys.Contains("100-10.10.10.10/32")).To(BeTrue())
 			})
+		})
+	})
+
+	Describe("with an interface but no routes", func() {
+		var cali *mocknetlink.MockLink
+		var caliRoute netlink.Route
+		BeforeEach(func() {
+			cali = dataplane.AddIface(2, "cali", true, true)
+			caliRoute = netlink.Route{
+				LinkIndex: cali.LinkAttrs.Index,
+				Dst:       mustParseCIDR("10.0.0.1/32"),
+				Type:      syscall.RTN_UNICAST,
+				Protocol:  FelixRouteProtocol,
+				Scope:     netlink.SCOPE_LINK,
+				Table:     100,
+			}
+		})
+		It("should create the table as needed", func() {
+			// In "strict" mode, RouteListFiltered returns an error if the routing table doesn't exist.
+			// Check that is handled and that we proceed to create the route (and thus create the routing table).
+			rt.RouteUpdate("cali", Target{
+				CIDR: ip.MustParseCIDROrIP("10.0.0.1/32"),
+			})
+			err := rt.Apply()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(dataplane.RouteKeyToRoute).To(ConsistOf(caliRoute))
+			Expect(dataplane.HitRouteListFilteredNoTable).To(BeTrue(),
+				"Expected first call to RouteListFiltered to be before routing table created.")
 		})
 	})
 })
@@ -1308,7 +1494,6 @@ var _ = Describe("Tests to verify ip version is policed", func() {
 				[]string{"^cali$", InterfaceNone},
 				5, // invalid IP version
 				dataplane.NewMockNetlink,
-				false,
 				10*time.Second,
 				dataplane.AddStaticArpEntry,
 				dataplane,
@@ -1318,6 +1503,7 @@ var _ = Describe("Tests to verify ip version is policed", func() {
 				true,
 				100,
 				logutils.NewSummarizer("test"),
+				dataplane,
 			)
 		}).To(Panic())
 	})

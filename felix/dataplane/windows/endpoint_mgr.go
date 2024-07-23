@@ -73,7 +73,7 @@ type endpointManager struct {
 	hns             hnsInterface
 
 	// pendingIPSetUpdate stores any ipset id which has been updated.
-	pendingIPSetUpdate set.Set
+	pendingIPSetUpdate set.Set[string]
 
 	// pendingHostAddrs is either nil if no update is pending for the host addresses, or it contains the new set of IPs.
 	pendingHostAddrs []string
@@ -84,7 +84,6 @@ type endpointManager struct {
 type hnsInterface interface {
 	GetHNSSupportedFeatures() hns.HNSSupportedFeatures
 	HNSListEndpointRequest() ([]hns.HNSEndpoint, error)
-	GetAttachedContainerIDs(endpoint *hns.HNSEndpoint) ([]string, error)
 }
 
 func newEndpointManager(hns hnsInterface, policysets policysets.PolicySetsDataplane) *endpointManager {
@@ -118,7 +117,7 @@ func newEndpointManager(hns hnsInterface, policysets policysets.PolicySetsDatapl
 		addressToEndpointId: make(map[string]string),
 		activeWlEndpoints:   map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{},
 		pendingWlEpUpdates:  map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint{},
-		pendingIPSetUpdate:  set.New(),
+		pendingIPSetUpdate:  set.New[string](),
 		hostAddrs:           hostIPv4s,
 	}
 }
@@ -192,15 +191,10 @@ func (m *endpointManager) RefreshHnsEndpointCache(forceRefresh bool) error {
 		// Some CNI plugins do not clear endpoint properly when a pod has been torn down.
 		// In that case, it is possible Felix sees multiple endpoints with the same IP.
 		// We need to filter out inactive endpoints that do not attach to any container.
-		containers, err := m.hns.GetAttachedContainerIDs(&endpoint)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"id":   endpoint.Id,
-				"name": endpoint.Name,
-			}).Warn("Failed to get attached containers")
-			continue
-		}
-		if len(containers) == 0 {
+		// An endpoint is considered to be active if its state is Attached or AttachedSharing.
+		// Note: Endpoint.State attribute is dependent on HNS v1 api. If hcsshim upgrades to HNS v2
+		// api this will break. We then need to Reach out to Microsoft to facilate the change via HNS.
+		if endpoint.State.String() != "Attached" && endpoint.State.String() != "AttachedSharing" {
 			log.WithFields(log.Fields{
 				"id":   endpoint.Id,
 				"name": endpoint.Name,
@@ -297,8 +291,7 @@ func (m *endpointManager) ProcessPolicyProfileUpdate(policySetId string) {
 // have already been processed by the various managers and we should now have a complete picture
 // of the policy/rules to be applied for each pending endpoint.
 func (m *endpointManager) CompleteDeferredWork() error {
-	m.pendingIPSetUpdate.Iter(func(item interface{}) error {
-		id := item.(string)
+	m.pendingIPSetUpdate.Iter(func(id string) error {
 		m.ProcessIpSetUpdate(id)
 		return set.RemoveItem
 	})

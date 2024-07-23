@@ -97,16 +97,30 @@ type BGPPeerSpec struct {
 	// restart timeout.  When not specified, the BIRD default of 120s is used.
 	MaxRestartTime *metav1.Duration `json:"maxRestartTime,omitempty"`
 	// Maximum number of local AS numbers that are allowed in the AS path for received routes.
-	// This removes BGP loop prevention and should only be used if absolutely necesssary.
+	// This removes BGP loop prevention and should only be used if absolutely necessary.
 	// +optional
 	NumAllowedLocalASNumbers *int32 `json:"numAllowedLocalASNumbers,omitempty"`
+	// TTLSecurity enables the generalized TTL security mechanism (GTSM) which protects against spoofed packets by
+	// ignoring received packets with a smaller than expected TTL value. The provided value is the number of hops
+	// (edges) between the peers.
+	// +optional
+	TTLSecurity *uint8 `json:"ttlSecurity,omitempty"`
+
+	// Add an exact, i.e. /32, static route toward peer IP in order to prevent route flapping.
+	// ReachableBy contains the address of the gateway which peer can be reached by.
+	// +optional
+	ReachableBy string `json:"reachableBy,omitempty" validate:"omitempty,reachableBy"`
+
+	// The ordered set of BGPFilters applied on this BGP peer.
+	// +optional
+	Filters []string `json:"filters,omitempty" validate:"omitempty,dive,name"`
 }
 
 type SourceAddress string
 
 const (
 	SourceAddressUseNodeIP SourceAddress = "UseNodeIP"
-	SourceAddressNone                    = "None"
+	SourceAddressNone      SourceAddress = "None"
 )
 
 // BGPPassword contains ways to specify a BGP password.

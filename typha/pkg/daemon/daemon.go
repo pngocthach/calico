@@ -16,9 +16,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
-	"math/rand"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -31,8 +28,10 @@ import (
 	"github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
+	"github.com/projectcalico/calico/libcalico-go/lib/metricsserver"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -143,9 +142,6 @@ func (t *TyphaDaemon) InitializeAndServeForever(cxt context.Context) error {
 
 // DoEarlyRuntimeSetup does early runtime/logging configuration that needs to happen before we do any work.
 func (t *TyphaDaemon) DoEarlyRuntimeSetup() {
-	// Go's RNG is not seeded by default.  Do that now.
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	// Special-case handling for environment variable-configured logging:
 	// Initialise early so we can trace out config parsing.
 	t.ConfigureEarlyLogging()
@@ -357,7 +353,7 @@ func (t *TyphaDaemon) addSyncerPipeline(
 	cache := snapcache.New(snapcache.Config{
 		MaxBatchSize:     t.ConfigParams.SnapshotCacheMaxBatchSize,
 		HealthAggregator: t.healthAggregator,
-		HealthName:       string(syncerType),
+		Name:             string(syncerType),
 	})
 
 	pipeline := &syncerPipeline{
@@ -393,7 +389,10 @@ func (t *TyphaDaemon) CreateServer() {
 			NewClientFallBehindGracePeriod: t.ConfigParams.ServerNewClientFallBehindGracePeriod,
 			PingInterval:                   t.ConfigParams.ServerPingIntervalSecs,
 			PongTimeout:                    t.ConfigParams.ServerPongTimeoutSecs,
+			HandshakeTimeout:               t.ConfigParams.ServerHandshakeTimeoutSecs,
 			DropInterval:                   t.ConfigParams.ConnectionDropIntervalSecs,
+			ShutdownTimeout:                t.ConfigParams.ShutdownTimeoutSecs,
+			ShutdownMaxDropInterval:        t.ConfigParams.ShutdownConnectionDropIntervalMaxSecs,
 			MaxConns:                       t.ConfigParams.MaxConnectionsUpperLimit,
 			Port:                           t.ConfigParams.ServerPort,
 			HealthAggregator:               t.healthAggregator,
@@ -424,9 +423,16 @@ func (t *TyphaDaemon) Start(cxt context.Context) {
 	}
 	log.Info("Started the datastore Syncer/cache layer/server.")
 
+	if t.ConfigParams.DebugPort != 0 {
+		debugserver.StartDebugPprofServer(t.ConfigParams.DebugHost, t.ConfigParams.DebugPort)
+	}
 	if t.ConfigParams.PrometheusMetricsEnabled {
 		log.Info("Prometheus metrics enabled.  Starting server.")
-		go servePrometheusMetrics(t.ConfigParams)
+		t.configurePrometheusMetrics()
+		go metricsserver.ServePrometheusMetricsForever(
+			t.ConfigParams.PrometheusMetricsHost,
+			t.ConfigParams.PrometheusMetricsPort,
+		)
 	}
 
 	if t.ConfigParams.HealthEnabled {
@@ -438,6 +444,21 @@ func (t *TyphaDaemon) Start(cxt context.Context) {
 	}
 }
 
+func (t *TyphaDaemon) configurePrometheusMetrics() {
+	if t.ConfigParams.PrometheusGoMetricsEnabled && t.ConfigParams.PrometheusProcessMetricsEnabled {
+		log.Info("Including Golang & Process metrics")
+	} else {
+		if !t.ConfigParams.PrometheusGoMetricsEnabled {
+			log.Info("Discarding Golang metrics")
+			prometheus.Unregister(collectors.NewGoCollector())
+		}
+		if !t.ConfigParams.PrometheusProcessMetricsEnabled {
+			log.Info("Discarding process metrics")
+			prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		}
+	}
+}
+
 // WaitAndShutDown waits for OS signals or context.Done() and exits as appropriate.
 func (t *TyphaDaemon) WaitAndShutDown(cxt context.Context) {
 	// Hook and process the signals we care about
@@ -445,16 +466,24 @@ func (t *TyphaDaemon) WaitAndShutDown(cxt context.Context) {
 	signal.Notify(usr1SignalChan, syscall.SIGUSR1)
 	termChan := make(chan os.Signal, 1)
 	signal.Notify(termChan, syscall.SIGTERM)
+	serverFinished := make(chan struct{})
+	go func() {
+		defer close(serverFinished)
+		t.Server.Finished.Wait()
+	}()
 	for {
 		select {
 		case <-termChan:
-			log.Fatal("Received SIGTERM, shutting down")
+			log.Warn("Received SIGTERM, shutting down")
+			t.Server.ShutDownGracefully()
 		case <-usr1SignalChan:
 			log.Info("Received SIGUSR1, emitting heap profile")
 			dumpHeapMemoryProfile(t.ConfigParams)
 		case <-cxt.Done():
 			log.Info("Context asked us to stop.")
 			return
+		case <-serverFinished:
+			log.Fatal("Server has shut down.")
 		}
 	}
 }
@@ -535,33 +564,5 @@ func dumpHeapMemoryProfile(configParams *config.Config) {
 			}
 			logCxt.Info("Finished writing memory profile")
 		}
-	}
-}
-
-// TODO Typha: Share with Felix.
-func servePrometheusMetrics(configParams *config.Config) {
-	for {
-		log.WithFields(log.Fields{
-			"host": configParams.PrometheusMetricsHost,
-			"port": configParams.PrometheusMetricsPort,
-		}).Info("Starting prometheus metrics endpoint")
-		if configParams.PrometheusGoMetricsEnabled && configParams.PrometheusProcessMetricsEnabled {
-			log.Info("Including Golang & Process metrics")
-		} else {
-			if !configParams.PrometheusGoMetricsEnabled {
-				log.Info("Discarding Golang metrics")
-				prometheus.Unregister(collectors.NewGoCollector())
-			}
-			if !configParams.PrometheusProcessMetricsEnabled {
-				log.Info("Discarding process metrics")
-				prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-			}
-		}
-		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(fmt.Sprintf("[%v]:%v",
-			configParams.PrometheusMetricsHost, configParams.PrometheusMetricsPort), nil)
-		log.WithError(err).Error(
-			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1 * time.Second)
 	}
 }

@@ -31,12 +31,11 @@ type EndpointStatusReporter struct {
 	hostname           string
 	region             string
 	endpointUpdates    <-chan interface{}
-	inSync             <-chan bool
 	stop               chan bool
 	datastore          datastore
 	epStatusIDToStatus map[model.Key]string
-	queuedDirtyIDs     set.Set
-	activeDirtyIDs     set.Set
+	queuedDirtyIDs     set.Set[model.Key]
+	activeDirtyIDs     set.Set[model.Key]
 	reportingDelay     time.Duration
 	resyncInterval     time.Duration
 	resyncTicker       stoppable
@@ -48,7 +47,6 @@ type EndpointStatusReporter struct {
 func NewEndpointStatusReporter(hostname string,
 	region string,
 	endpointUpdates <-chan interface{},
-	inSync <-chan bool,
 	datastore datastore,
 	reportingDelay time.Duration,
 	resyncInterval time.Duration) *EndpointStatusReporter {
@@ -60,7 +58,6 @@ func NewEndpointStatusReporter(hostname string,
 		hostname,
 		region,
 		endpointUpdates,
-		inSync,
 		datastore,
 		resyncSchedulingTicker,
 		resyncSchedulingTicker.C,
@@ -76,7 +73,6 @@ func NewEndpointStatusReporter(hostname string,
 func newEndpointStatusReporterWithTickerChans(hostname string,
 	region string,
 	endpointUpdates <-chan interface{},
-	inSync <-chan bool,
 	datastore datastore,
 	resyncTicker stoppable,
 	resyncTickerChan <-chan time.Time,
@@ -89,11 +85,10 @@ func newEndpointStatusReporterWithTickerChans(hostname string,
 		region:             region,
 		endpointUpdates:    endpointUpdates,
 		datastore:          datastore,
-		inSync:             inSync,
 		stop:               make(chan bool),
 		epStatusIDToStatus: make(map[model.Key]string),
-		queuedDirtyIDs:     set.New(),
-		activeDirtyIDs:     set.New(),
+		queuedDirtyIDs:     set.New[model.Key](),
+		activeDirtyIDs:     set.New[model.Key](),
 		resyncTicker:       resyncTicker,
 		resyncTickerC:      resyncTickerChan,
 		rateLimitTicker:    rateLimitTicker,
@@ -136,6 +131,8 @@ func (esr *EndpointStatusReporter) loopHandlingEndpointStatusUpdates() {
 loop:
 	for {
 		updatesAllowed := false
+
+	selectUpdates:
 		select {
 		case <-esr.stop:
 			log.Info("Stopping endpoint status reporter")
@@ -147,9 +144,6 @@ loop:
 			resyncRequested = true
 		case <-esr.rateLimitTickerC:
 			updatesAllowed = true
-		case inSync := <-esr.inSync:
-			log.Debug("Datamodel in sync, enabling status resync")
-			datamodelInSync = datamodelInSync || inSync
 		case msg := <-esr.endpointUpdates:
 			var statID model.Key
 			var status string
@@ -182,6 +176,9 @@ loop:
 					Hostname:   esr.hostname,
 					EndpointID: msg.Id.EndpointId,
 				}
+			case *proto.DataplaneInSync:
+				datamodelInSync = true
+				break selectUpdates
 			default:
 				log.Panicf("Unexpected message: %#v", msg)
 			}
@@ -219,13 +216,13 @@ loop:
 				log.WithField("numDirtyEndpoints", esr.activeDirtyIDs.Len()).Debug(
 					"Unthrottled and updates pending")
 				var statID model.Key
-				esr.activeDirtyIDs.Iter(func(item interface{}) error {
-					statID = item.(model.Key)
+				esr.activeDirtyIDs.Iter(func(item model.Key) error {
+					statID = item
 					return set.StopIteration
 				})
 				// Then try to write the update to the datastore.
 				// Note: the update could be a deletion, in which case
-				// the read from the cache wil return nil.
+				// the read from the cache will return nil.
 				err := esr.writeEndpointStatus(ctx, statID,
 					esr.epStatusIDToStatus[statID])
 				if err != nil {
@@ -244,11 +241,11 @@ loop:
 				// queued set.
 				log.WithField("numQueuedUpdates", esr.queuedDirtyIDs.Len()).Debug(
 					"Copying queued set to dirty set")
-				esr.queuedDirtyIDs.Iter(func(item interface{}) error {
+				esr.queuedDirtyIDs.Iter(func(item model.Key) error {
 					esr.activeDirtyIDs.Add(item)
 					return nil
 				})
-				esr.queuedDirtyIDs = set.New()
+				esr.queuedDirtyIDs = set.New[model.Key]()
 			}
 		}
 	}
@@ -334,7 +331,7 @@ func (esr *EndpointStatusReporter) writeEndpointStatus(ctx context.Context, epID
 		logCxt.Info("Deleting endpoint status")
 		_, err = esr.datastore.Delete(ctx, epID, "")
 		if _, ok := err.(errors.ErrorResourceDoesNotExist); ok {
-			// Ignore non-existent resource.
+			// Ignore nonexistent resource.
 			err = nil
 		}
 	}

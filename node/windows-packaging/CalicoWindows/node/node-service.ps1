@@ -15,8 +15,40 @@
 # This script is run from the main Calico folder.
 . .\config.ps1
 
-ipmo .\libs\calico\calico.psm1
-ipmo .\libs\hns\hns.psm1
+ipmo .\libs\calico\calico.psm1 -Force
+ipmo .\libs\hns\hns.psm1 -Force -DisableNameChecking
+
+function Get-TokenRefresherPid()
+{
+    return $(Get-WmiObject Win32_Process -Filter "name = 'calico-node.exe'" | Select-Object CommandLine, ProcessId | Where-Object -Property CommandLine -match ".*calico-node.exe.*-monitor-token.*").ProcessId
+}
+
+function Start-TokenRefresher()
+{
+    Write-Host "Starting Calico token refresher..."
+    Start-Process -NoNewWindow .\calico-node.exe -ArgumentList "-monitor-token"
+    Write-Host "Calico token refresher running on PID" $(Get-TokenRefresherPid)
+}
+
+function Ensure-TokenRefresher()
+{
+    if (-not $(Get-TokenRefresherPid))
+    {
+        Write-Host "Calico token refresher is not running, restarting it"
+        Start-TokenRefresher
+    }
+}
+
+function Restart-TokenRefresher()
+{
+    $tokenRefresherPid = Get-TokenRefresherPid
+    if ($tokenRefresherPid)
+    {
+        Write-Host "Restarting Calico token refresher"
+        Stop-Process -force -Id $tokenRefresherPid
+    }
+    Start-TokenRefresher
+}
 
 $lastBootTime = Get-LastBootTime
 $Stored = Get-StoredLastBootTime
@@ -118,6 +150,9 @@ if ($env:CALICO_NETWORKING_BACKEND -EQ "windows-bgp" -OR $env:CALICO_NETWORKING_
     }
 }
 
+# For Windows, we expect the nodename file to exist in the root directory of the
+# Calico for Windows installation. The CNI config field 'nodename_file' will
+# always be $RootDir\nodename
 $env:CALICO_NODENAME_FILE = ".\nodename"
 
 # We use this setting as a trigger for the other scripts to proceed.
@@ -125,17 +160,22 @@ Set-StoredLastBootTime $lastBootTime
 $Stored = Get-StoredLastBootTime
 Write-Host "Stored new lastBootTime $Stored"
 
-# The old version of Calico upgrade service may still be running.
-while (Get-UpgradeService)
-{
+# The old version of Calico upgrade service may still be running
+# so try to remove it while it exists.
+#
+# Upgrade service is not needed if node is running in a hostprocess container.
+if (-not $env:CONTAINER_SANDBOX_MOUNT_POINT) {
+    while (Get-UpgradeService)
+    {
 
-    Remove-UpgradeService
-    if ($LastExitCode -EQ 0) {
-        Write-Host "CalicoUpgrade service removed"
-        break
+        Remove-UpgradeService
+        if ($LastExitCode -EQ 0) {
+            Write-Host "CalicoUpgrade service removed"
+            break
+        }
+        Start-Sleep 5
+        Write-Host "Failed to clean up old CalicoUpgrade service, retrying..."
     }
-    Start-Sleep 5
-    Write-Host "Failed to clean up old CalicoUpgrade service, retrying..."
 }
 
 # Run the startup script whenever kubelet (re)starts. This makes sure that we refresh our Node annotations if
@@ -157,6 +197,10 @@ while ($True)
                 if ($LastExitCode -EQ 0)
                 {
                     Write-Host "Calico node initialisation succeeded; monitoring kubelet for restarts..."
+                    # Token refresher only needs to run in hostprocess containers
+                    if ($env:CONTAINER_SANDBOX_MOUNT_POINT) {
+                        Restart-TokenRefresher
+                    }
                     break
                 }
 
@@ -171,13 +215,9 @@ while ($True)
         $kubeletPid = -1
     }
 
-    if (!(Get-UpgradeService)) {
-        # If upgrade service has not been running, check if we should run upgrade service.
-        .\calico-node.exe -should-install-windows-upgrade
-        if ($LastExitCode -EQ 0) {
-            Install-UpgradeService
-            Start-Service CalicoUpgrade
-        }
+    # Token refresher only needs to run in hostprocess containers
+    if ($env:CONTAINER_SANDBOX_MOUNT_POINT) {
+        Ensure-TokenRefresher
     }
 
     Start-Sleep 10

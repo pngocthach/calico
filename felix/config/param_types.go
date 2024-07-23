@@ -39,6 +39,7 @@ import (
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/stringutils"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 const (
@@ -47,6 +48,7 @@ const (
 
 type Metadata struct {
 	Name              string
+	DefaultString     string
 	Default           interface{}
 	ZeroValue         interface{}
 	NonZero           bool
@@ -106,7 +108,7 @@ type IntParam struct {
 }
 
 func (p *IntParam) Parse(raw string) (interface{}, error) {
-	value, err := strconv.ParseInt(raw, 0, 64)
+	value, err := strconv.ParseInt(raw, 0, 32)
 	if err != nil {
 		err = p.parseFailed(raw, "invalid int")
 		return nil, err
@@ -264,6 +266,11 @@ type FileParam struct {
 }
 
 func (p *FileParam) Parse(raw string) (interface{}, error) {
+	// Use GetHostPath to use/resolve the CONTAINER_SANDBOX_MOUNT_POINT env var
+	// if running on Windows HPC.
+	// FIXME: this will no longer be needed when containerd v1.6 is EOL'd
+	raw = winutils.GetHostPath(raw)
+
 	if p.Executable {
 		// Special case: for executable files, we search our directory
 		// and the system path.
@@ -591,7 +598,8 @@ func (r *RegionParam) Parse(raw string) (result interface{}, err error) {
 	return raw, nil
 }
 
-// linux can support route-tables with indices up to 0xfffffff, however, using all of them would likely blow up, so cap the limit at 65535
+// linux can support route-table indices up to 0xFFFFFFFF
+// however, using 0xFFFFFFFF tables would require too much computation, so the total number of designated tables is capped at 0xFFFF
 const routeTableMaxLinux = 0xffffffff
 const routeTableRangeMaxTables = 0xffff
 
@@ -690,4 +698,45 @@ type KeyValueListParam struct {
 func (p *KeyValueListParam) Parse(raw string) (result interface{}, err error) {
 	result, err = stringutils.ParseKeyValueList(raw)
 	return
+}
+
+type KeyDurationListParam struct {
+	Metadata
+}
+
+func (p *KeyDurationListParam) Parse(raw string) (result interface{}, err error) {
+	result, err = stringutils.ParseKeyDurationList(raw)
+	return
+}
+
+type StringSliceParam struct {
+	Metadata
+	ValidationRegex *regexp.Regexp
+}
+
+func (p *StringSliceParam) Parse(raw string) (result interface{}, err error) {
+	log.WithField("StringSliceParam raw", raw).Info("StringSliceParam")
+	values := strings.Split(raw, ",")
+
+	resultSlice := []string{}
+	for _, in := range values {
+		val := strings.Trim(in, " ")
+		if len(val) == 0 {
+			continue
+		}
+
+		// Validate string slice entry as necessary.
+		if p.ValidationRegex != nil {
+			match := p.ValidationRegex.MatchString(val)
+			if !match {
+				err = p.parseFailed(raw,
+					fmt.Sprintf("invalid entry does not match regex %s", p.ValidationRegex.String()))
+				return
+			}
+		}
+
+		resultSlice = append(resultSlice, val)
+	}
+
+	return resultSlice, nil
 }

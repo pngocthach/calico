@@ -24,7 +24,7 @@ import (
 
 // This file contains helper functions for projectcalico printer package.
 
-// The followings are helper functions copied from k8s.io/kubernetes
+// The following are helper functions copied from k8s.io/kubernetes
 
 // translateTimestampSince returns the elapsed time since timestamp in
 // human-readable approximation.
@@ -34,14 +34,4 @@ func translateTimestampSince(timestamp metav1.Time) string {
 	}
 
 	return duration.HumanDuration(time.Since(timestamp.Time))
-}
-
-// translateTimestampUntil returns the elapsed time until timestamp in
-// human-readable approximation.
-func translateTimestampUntil(timestamp metav1.Time) string {
-	if timestamp.IsZero() {
-		return "<unknown>"
-	}
-
-	return duration.HumanDuration(time.Until(timestamp.Time))
 }

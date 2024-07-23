@@ -13,7 +13,8 @@
 # limitations under the License.
 param
 (
-    [bool][parameter(Mandatory=$false)]$ExceptUpgradeService = $false
+    [bool][parameter(Mandatory=$false)]$ExceptUpgradeService = $false,
+    [bool][parameter(Mandatory=$false)]$CleanupForHostProcessInstall = $false
 )
 
 ipmo "$PSScriptRoot\libs\calico\calico.psm1" -Force
@@ -23,6 +24,18 @@ ipmo "$PSScriptRoot\libs\calico\calico.psm1" -Force
 Test-CalicoConfiguration
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# If running in a hostprocess container, remove Calico CNI if installed.
+# Skip the rest of the logic that applies to manual installations only,
+# unless this is being run by the hostprocess installation itself (which
+# will pass the -CleanupForHostProcessInstall param).
+if (($env:CONTAINER_SANDBOX_MOUNT_POINT) -and ($env:CALICO_NETWORKING_BACKEND -NE "none") -and (-Not $CleanupForHostProcessInstall))
+{
+    if ($env:CALICO_NETWORKING_BACKEND -NE "none") {
+        Remove-CNIPlugin
+    }
+    exit $lastexitcode
+}
 
 Write-Host "Stopping Calico if it is running..."
 & $PSScriptRoot\stop-calico.ps1 -ExceptUpgradeService $ExceptUpgradeService
@@ -44,4 +57,5 @@ if (-Not $ExceptUpgradeService) {
     Remove-UpgradeService
 }
 
+Get-Module 'calico' | Remove-Module -Force
 Write-Host "Done."

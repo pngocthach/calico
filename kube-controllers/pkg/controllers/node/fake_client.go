@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -99,6 +99,11 @@ func (f *FakeCalicoClient) WorkloadEndpoints() clientv3.WorkloadEndpointInterfac
 	panic("not implemented")
 }
 
+// BGPFilter returns an interface for managing BGPFilter resources.
+func (f *FakeCalicoClient) BGPFilter() clientv3.BGPFilterInterface {
+	panic("not implemented")
+}
+
 // BGPPeers returns an interface for managing BGP peer resources.
 func (f *FakeCalicoClient) BGPPeers() clientv3.BGPPeerInterface {
 	panic("not implemented")
@@ -134,7 +139,15 @@ func (f *FakeCalicoClient) CalicoNodeStatus() clientv3.CalicoNodeStatusInterface
 	panic("not implemented")
 }
 
+func (f *FakeCalicoClient) IPAMConfig() clientv3.IPAMConfigInterface {
+	panic("not implemented")
+}
+
 func (f *FakeCalicoClient) IPReservations() clientv3.IPReservationInterface {
+	panic("not implemented")
+}
+
+func (f *FakeCalicoClient) BlockAffinities() clientv3.BlockAffinityInterface {
 	panic("not implemented")
 }
 
@@ -340,7 +353,7 @@ func (f *fakeIPAMClient) GetUtilization(ctx context.Context, args ipam.GetUtiliz
 }
 
 // EnsureBlock returns single IPv4/IPv6 IPAM block for a host as specified by the provided BlockArgs.
-// If there is no block allocated already for this host, allocate one and return its' CIDR.
+// If there is no block allocated already for this host, allocate one and return its CIDR.
 // Otherwise, return the CIDR of the IPAM block allocated for this host.
 // It returns IPv4, IPv6 block CIDR and any error encountered.
 func (f *fakeIPAMClient) EnsureBlock(ctx context.Context, args ipam.BlockArgs) (*cnet.IPNet, *cnet.IPNet, error) {

@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -48,7 +48,7 @@ func ReachDestination(dest string, version int) (*net.IPNet, error) {
 
 	// Get a full list of interface and IPs and find the CIDR matching the
 	// found IP.
-	ifaces, err := GetInterfaces(nil, nil, version)
+	ifaces, err := GetInterfaces(gonet.Interfaces, nil, nil, version)
 	if err != nil {
 		return nil, err
 	}

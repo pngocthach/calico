@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2022 Tigera, Inc. All rights reserved.
 
 package v3
 
@@ -34,6 +34,8 @@ var (
 		&IPReservationList{},
 		&BGPConfiguration{},
 		&BGPConfigurationList{},
+		&BGPFilter{},
+		&BGPFilterList{},
 		&BGPPeer{},
 		&BGPPeerList{},
 		&Profile{},
@@ -48,6 +50,12 @@ var (
 		&NetworkSetList{},
 		&CalicoNodeStatus{},
 		&CalicoNodeStatusList{},
+		&IPAMConfiguration{},
+		&IPAMConfigurationList{},
+		&BlockAffinity{},
+		&BlockAffinityList{},
+		&BGPFilter{},
+		&BGPFilterList{},
 	}
 )
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -29,6 +28,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/projectcalico/calico/felix/bpf/hook"
+	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -36,27 +37,52 @@ import (
 type AttachedProgInfo struct {
 	Object string `json:"object"`
 	Hash   string `json:"hash"`
-	ID     string `json:"id"`
+	ID     int    `json:"id"`
 	Config string `json:"config"`
 }
 
 // AttachPointInfo describes what we need to know about an attach point
 type AttachPointInfo interface {
 	IfaceName() string
-	HookName() string
+	HookName() hook.Hook
 	Config() string
 }
 
-var (
-	// These are possible hooks for a bpf program. "ingress" and "egress" imply TC program
-	// and each one reflects traffic direction. "xdp" implies xdp programs.
-	runtimeJSONsuffixes = []string{"ingress", "egress", "xdp"}
-)
+type AttachPoint struct {
+	Hook        hook.Hook
+	PolicyIdxV4 int
+	PolicyIdxV6 int
+	Iface       string
+	LogLevel    string
+}
+
+func (ap *AttachPoint) LogVal() string {
+	return ap.LogLevel
+}
+
+func (ap *AttachPoint) IfaceName() string {
+	return ap.Iface
+}
+
+func (ap *AttachPoint) HookName() hook.Hook {
+	return ap.Hook
+}
+
+func (ap *AttachPoint) PolicyJmp(ipFamily proto.IPVersion) int {
+	if ipFamily == proto.IPVersion_IPV6 {
+		return ap.PolicyIdxV6
+	}
+	return ap.PolicyIdxV4
+}
+
+type AttachResult interface {
+	ProgID() int
+}
 
 // AlreadyAttachedProg checks that the program we are going to attach has the
 // same parameters as what we remembered about the currently attached.
-func AlreadyAttachedProg(a AttachPointInfo, object, id string) (bool, error) {
-	bytesToRead, err := ioutil.ReadFile(RuntimeJSONFilename(a.IfaceName(), a.HookName()))
+func AlreadyAttachedProg(a AttachPointInfo, object string, id int) (bool, error) {
+	bytesToRead, err := os.ReadFile(RuntimeJSONFilename(a.IfaceName(), a.HookName()))
 	if err != nil {
 		// If file does not exist, just ignore the err code, and return false
 		if os.IsNotExist(err) {
@@ -96,7 +122,7 @@ func AlreadyAttachedProg(a AttachPointInfo, object, id string) (bool, error) {
 }
 
 // RememberAttachedProg stores the attached programs parameters in a file.
-func RememberAttachedProg(a AttachPointInfo, object, id string) error {
+func RememberAttachedProg(a AttachPointInfo, object string, id int) error {
 	hash, err := sha256OfFile(object)
 	if err != nil {
 		return err
@@ -118,7 +144,7 @@ func RememberAttachedProg(a AttachPointInfo, object, id string) error {
 		return err
 	}
 
-	if err = ioutil.WriteFile(RuntimeJSONFilename(a.IfaceName(), a.HookName()), bytesToWrite, 0600); err != nil {
+	if err = os.WriteFile(RuntimeJSONFilename(a.IfaceName(), a.HookName()), bytesToWrite, 0600); err != nil {
 		return err
 	}
 
@@ -127,7 +153,7 @@ func RememberAttachedProg(a AttachPointInfo, object, id string) error {
 
 // ForgetAttachedProg removes what we store about the iface/hook
 // program.
-func ForgetAttachedProg(iface, hook string) error {
+func ForgetAttachedProg(iface string, hook hook.Hook) error {
 	err := os.Remove(RuntimeJSONFilename(iface, hook))
 	// If the hash file does not exist, just ignore the err code, and return false
 	if err != nil && !os.IsNotExist(err) {
@@ -139,7 +165,7 @@ func ForgetAttachedProg(iface, hook string) error {
 // ForgetIfaceAttachedProg removes information we store about any programs
 // associated with an iface.
 func ForgetIfaceAttachedProg(iface string) error {
-	for _, hook := range runtimeJSONsuffixes {
+	for _, hook := range hook.All {
 		err := ForgetAttachedProg(iface, hook)
 		if err != nil {
 			return err
@@ -160,9 +186,9 @@ func CleanAttachedProgDir() {
 		log.Errorf("Failed to get list of interfaces. err=%v", err)
 	}
 
-	expectedJSONFiles := set.New()
+	expectedJSONFiles := set.New[string]()
 	for _, iface := range interfaces {
-		for _, hook := range runtimeJSONsuffixes {
+		for _, hook := range hook.All {
 			expectedJSONFiles.Add(RuntimeJSONFilename(iface.Name, hook))
 		}
 	}
@@ -190,14 +216,10 @@ func CleanAttachedProgDir() {
 }
 
 // RuntimeJSONFilename returns filename where we store information about
-// attached program. The filename is [iface name]_[tc_hook name | xdp].json, for
-// example, eth0_tc_egress.json
-func RuntimeJSONFilename(iface, hook string) string {
-	filename := path.Join(RuntimeProgDir, iface+"_tc_"+hook+".json")
-	if strings.ToLower(hook) == "xdp" {
-		return path.Join(RuntimeProgDir, iface+"_xdp.json")
-	}
-	return filename
+// attached program. The filename is [iface name]_[hook].json, for
+// example, eth0_egress.json
+func RuntimeJSONFilename(iface string, hook hook.Hook) string {
+	return path.Join(RuntimeProgDir, fmt.Sprintf("%s_%s.json", iface, hook))
 }
 
 func sha256OfFile(name string) (string, error) {
@@ -205,10 +227,53 @@ func sha256OfFile(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to open BPF object to calculate its hash: %w", err)
 	}
+	defer f.Close()
 	hasher := sha256.New()
 	_, err = io.Copy(hasher, f)
 	if err != nil {
 		return "", fmt.Errorf("failed to read BPF object to calculate its hash: %w", err)
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// EPAttachInfo tells what programs are attached to an endpoint.
+type EPAttachInfo struct {
+	Ingress int
+	Egress  int
+	XDP     int
+	XDPMode string
+}
+
+// ListCalicoAttached list all programs that are attached to TC or XDP and are
+// related to Calico. That is, they have jumpmap pinned in our dir hierarchy.
+func ListCalicoAttached() (map[string]EPAttachInfo, error) {
+	aTC, aXDP, err := ListTcXDPAttachedProgs()
+	if err != nil {
+		return nil, err
+	}
+
+	ai := make(map[string]EPAttachInfo)
+
+	for _, p := range aTC {
+		if strings.HasPrefix(p.Name, "cali") {
+			info := ai[p.DevName]
+			if p.Kind == "clsact/egress" {
+				info.Egress = p.ID
+			} else {
+				info.Ingress = p.ID
+			}
+			ai[p.DevName] = info
+		}
+	}
+
+	for _, p := range aXDP {
+		if strings.HasPrefix(p.Name, "cali") {
+			info := ai[p.DevName]
+			info.XDP = p.ID
+			info.XDPMode = p.Mode
+			ai[p.DevName] = info
+		}
+	}
+
+	return ai, nil
 }

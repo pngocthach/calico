@@ -26,10 +26,10 @@ If you'd like to run the build and tests locally outside of a container, you'll 
 
 Contributions to this code are welcome!  The code in this repository can be built and tested using the Makefile.
 
-- `make docker-image` will produce a docker image containing the artifacts suitable for deploying to kubernetes.
-- `make binary` will build just the controller binary so it can be run locally.
+- `make image` will produce a docker image containing the artifacts suitable for deploying to kubernetes.
+- `make build` will build just the controller binary so it can be run locally.
 
 For more information, see `make help`.
 
-[controllers-src]: https://github.com/projectcalico/kube-controllers/tree/master/pkg/controllers
+[controllers-src]: https://github.com/projectcalico/calico/tree/master/kube-controllers/pkg/controllers
 [calico-docs]: https://docs.projectcalico.org/latest/reference/kube-controllers/configuration

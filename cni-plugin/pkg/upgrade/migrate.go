@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -64,9 +63,9 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 
 	// Check to see if the system is still using host-local
 	// by checking the existence of the path.
-	log.Info("checking host-local IPAM data dir dir existence...")
+	log.Info("checking host-local IPAM data dir existence...")
 	if _, err := os.Stat(ipAllocPath); err != nil && os.IsNotExist(err) {
-		log.Info("host-local IPAM data dir dir not found; no migration necessary, successfully exiting...")
+		log.Info("host-local IPAM data dir not found; no migration necessary, successfully exiting...")
 		return nil
 	}
 
@@ -147,7 +146,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 	}
 
 	// Open k8s-pod-directory to check for emptiness.
-	log.Info("checking if host-local IPAM data dir dir is empty...")
+	log.Info("checking if host-local IPAM data dir is empty...")
 	ipamDir, err := os.Open(ipAllocPath)
 	if err != nil {
 		return fmt.Errorf("failed to open host-local IPAM data dir dir: %s", err)
@@ -252,7 +251,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 
 	// Read in all the files in the host-local directory.
 	log.Info("reading files from host-local IPAM data dir...")
-	files, err := ioutil.ReadDir(ipAllocPath)
+	files, err := os.ReadDir(ipAllocPath)
 	if err != nil {
 		return fmt.Errorf("failed to read path %s: %s", ipAllocPath, err)
 	}
@@ -286,7 +285,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 		}
 
 		// The contents are the container ID.
-		b, err := ioutil.ReadFile(fname)
+		b, err := os.ReadFile(fname)
 		if err != nil {
 			return fmt.Errorf("failed to read file %s: %s", fname, err)
 		}
@@ -305,7 +304,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 
 		// Store allocation to Calico datastore.
 		handleID := utils.GetHandleID("k8s-pod-network", containerID, "")
-		logCtxt.Info("assinging pod IP to Calico IPAM...")
+		logCtxt.Info("assigning pod IP to Calico IPAM...")
 		if err = c.IPAM().AssignIP(ctxt, ipam.AssignIPArgs{
 			IP:       *ip,
 			HandleID: &handleID,

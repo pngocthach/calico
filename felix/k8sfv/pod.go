@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -66,9 +67,9 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 	// the link but then LinkByName wouldn't find it.  It's not clear why doing that helps but it
 	// may be that the kernel enforces consistency when you re-use the same socket, or, it may be
 	// that load causes the issue and we put less load on the kernel.
-	handle, err := netlink.NewHandle()
+	handle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
 	panicIfError(err)
-	defer handle.Delete()
+	defer handle.Close()
 
 	name := spec.name
 	if name == "" {
@@ -125,8 +126,10 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 		log.WithField("podNamespace", podNamespace).Debug("Created namespace")
 
 		// Create a veth pair.
+		la := netlink.NewLinkAttrs()
+		la.Name = interfaceName
 		veth := &netlink.Veth{
-			LinkAttrs: netlink.LinkAttrs{Name: interfaceName},
+			LinkAttrs: la,
 			PeerName:  "p" + interfaceName[1:],
 		}
 

@@ -25,6 +25,7 @@ import (
 
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/routes"
+	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
 )
 
 func TestICMPttlExceeded(t *testing.T) {
@@ -38,7 +39,7 @@ func TestICMPttlExceeded(t *testing.T) {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.Retval).To(Equal(0))
 
-		Expect(res.dataOut).To(HaveLen(134)) // eth + ip + 64 + udp + ip + icmp
+		Expect(res.dataOut).To(HaveLen(110)) // eth + ip(60) + udp + ip + icmp
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		fmt.Printf("pktR = %+v\n", pktR)
@@ -54,7 +55,7 @@ func TestICMPttlExceededFromHEP(t *testing.T) {
 	iphdr := *ipv4Default
 	iphdr.TTL = 1
 
-	_, ipv4, l4, _, pktBytes, err := testPacket(nil, &iphdr, nil, nil)
+	_, ipv4, l4, _, pktBytes, err := testPacketV4(nil, &iphdr, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 
 	udp := l4.(*layers.UDP)
@@ -74,6 +75,7 @@ func TestICMPttlExceededFromHEP(t *testing.T) {
 	)
 	Expect(err).NotTo(HaveOccurred())
 
+	skbMark = 0
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
@@ -84,11 +86,13 @@ func TestICMPttlExceededFromHEP(t *testing.T) {
 
 		checkICMPttlExceeded(pktR, ipv4)
 	})
+	expectMark(tcdefs.MarkSeenBypassForward)
 
+	skbMark = 0
 	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		// Insert a reverse route for the source workload.
 		rtKey := routes.NewKey(srcV4CIDR).AsBytes()
-		rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload, 1).AsBytes()
+		rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
 		err = rtMap.Update(rtKey, rtVal)
 		defer func() {
 			err := rtMap.Delete(rtKey)
@@ -105,6 +109,7 @@ func TestICMPttlExceededFromHEP(t *testing.T) {
 
 		checkICMPttlExceeded(pktR, ipv4)
 	})
+	expectMark(tcdefs.MarkSeenBypassForward)
 }
 
 func checkICMPttlExceeded(pktR gopacket.Packet, ipv4 *layers.IPv4) {

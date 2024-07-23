@@ -17,7 +17,6 @@ package conversion
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -31,6 +30,7 @@ import (
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/json"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
@@ -121,9 +121,9 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 
 	// Build the labels map.  Start with the pod labels, and append two additional labels for
 	// namespace and orchestrator matches.
-	labels := pod.Labels
-	if labels == nil {
-		labels = make(map[string]string, 2)
+	labels := make(map[string]string)
+	for k, v := range pod.Labels {
+		labels[k] = v
 	}
 	labels[apiv3.LabelNamespace] = pod.Namespace
 	labels[apiv3.LabelOrchestrator] = apiv3.OrchestratorKubernetes
@@ -136,7 +136,6 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	// Pull out floating IP annotation
 	var floatingIPs []libapiv3.IPNAT
 	if annotation, ok := pod.Annotations["cni.projectcalico.org/floatingIPs"]; ok && len(podIPNets) > 0 {
-
 		// Parse Annotation data
 		var ips []string
 		err := json.Unmarshal([]byte(annotation), &ips)
@@ -182,13 +181,9 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	}
 
 	// Handle source IP spoofing annotation
-	var requestedSourcePrefixes []string
-	if annotation, ok := pod.Annotations["cni.projectcalico.org/allowedSourcePrefixes"]; ok && annotation != "" {
-		// Parse Annotation data
-		err := json.Unmarshal([]byte(annotation), &requestedSourcePrefixes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%s' as JSON: %s", annotation, err)
-		}
+	sourcePrefixes, err := HandleSourceIPSpoofingAnnotation(pod.Annotations)
+	if err != nil {
+		return nil, err
 	}
 
 	// Map any named ports through.
@@ -250,7 +245,14 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 		Ports:                      endpointPorts,
 		IPNATs:                     floatingIPs,
 		ServiceAccountName:         pod.Spec.ServiceAccountName,
-		AllowSpoofedSourcePrefixes: requestedSourcePrefixes,
+		AllowSpoofedSourcePrefixes: sourcePrefixes,
+	}
+
+	if v, ok := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]; ok {
+		if wep.Annotations == nil {
+			wep.Annotations = make(map[string]string)
+		}
+		wep.Annotations["k8s.v1.cni.cncf.io/network-status"] = v
 	}
 
 	// Embed the workload endpoint into a KVPair.
@@ -264,4 +266,28 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 		Revision: pod.ResourceVersion,
 	}
 	return &kvp, nil
+}
+
+// HandleSourceIPSpoofingAnnotation parses the allowedSourcePrefixes annotation if present,
+// and returns the allowed prefixes as a slice of strings.
+func HandleSourceIPSpoofingAnnotation(annot map[string]string) ([]string, error) {
+	var sourcePrefixes []string
+	if annotation, ok := annot["cni.projectcalico.org/allowedSourcePrefixes"]; ok && annotation != "" {
+		// Parse Annotation data
+		var requestedSourcePrefixes []string
+		err := json.Unmarshal([]byte(annotation), &requestedSourcePrefixes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse '%s' as JSON: %s", annotation, err)
+		}
+
+		// Filter out any invalid entries and normalize the CIDRs.
+		for _, prefix := range requestedSourcePrefixes {
+			if _, n, err := cnet.ParseCIDR(prefix); err != nil {
+				return nil, fmt.Errorf("failed to parse '%s' as a CIDR: %s", prefix, err)
+			} else {
+				sourcePrefixes = append(sourcePrefixes, n.String())
+			}
+		}
+	}
+	return sourcePrefixes, nil
 }

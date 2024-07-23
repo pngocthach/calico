@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,6 +57,15 @@ func (r *DefaultRuleRenderer) ProtoRulesToIptablesRules(protoRules []*proto.Rule
 	for _, protoRule := range protoRules {
 		rules = append(rules, r.ProtoRuleToIptablesRules(protoRule, ipVersion)...)
 	}
+	// Strip off any return rules at the end of the chain.  No matter their
+	// match criteria, they're effectively no-ops.
+	for len(rules) > 0 {
+		if _, ok := rules[len(rules)-1].Action.(iptables.ReturnAction); ok {
+			rules = rules[:len(rules)-1]
+		} else {
+			break
+		}
+	}
 	if len(chainComments) > 0 {
 		if len(rules) == 0 {
 			rules = append(rules, iptables.Rule{})
@@ -65,6 +74,7 @@ func (r *DefaultRuleRenderer) ProtoRulesToIptablesRules(protoRules []*proto.Rule
 	}
 	return rules
 }
+
 func filterNets(mixedCIDRs []string, ipVersion uint8) (filtered []string, filteredAll bool) {
 	if len(mixedCIDRs) == 0 {
 		return nil, false
@@ -523,8 +533,8 @@ func (r *DefaultRuleRenderer) CalculateActions(pRule *proto.Rule, ipVersion uint
 		mark = r.IptablesMarkPass
 		actions = append(actions, iptables.ReturnAction{})
 	case "deny":
-		// Deny maps to DROP.
-		actions = append(actions, iptables.DropAction{})
+		// Deny maps to DROP/REJECT.
+		actions = append(actions, r.IptablesFilterDenyAction())
 	case "log":
 		// This rule should log.
 		actions = append(actions, iptables.LogAction{

@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -140,10 +140,13 @@ func calculateDefaultFelixSyncerEntries(cs kubernetes.Interface, dt apiconfig.Da
 				},
 			})
 
+			uid, err := conversion.ConvertUID(ns.UID)
+			Expect(err).NotTo(HaveOccurred())
+
 			// And expect a v3 profile for each namespace.
 			prof := apiv3.Profile{
 				TypeMeta:   metav1.TypeMeta{Kind: "Profile", APIVersion: "projectcalico.org/v3"},
-				ObjectMeta: metav1.ObjectMeta{Name: name, UID: ns.UID, CreationTimestamp: ns.CreationTimestamp},
+				ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, CreationTimestamp: ns.CreationTimestamp},
 				Spec: apiv3.ProfileSpec{
 					LabelsToApply: map[string]string{
 						"pcns.projectcalico.org/name":      ns.Name,
@@ -181,10 +184,13 @@ func calculateDefaultFelixSyncerEntries(cs kubernetes.Interface, dt apiconfig.Da
 					},
 				})
 
+				uid, err := conversion.ConvertUID(sa.UID)
+				Expect(err).NotTo(HaveOccurred())
+
 				//  We also expect one v3 Profile to be present for each ServiceAccount.
 				prof := apiv3.Profile{
 					TypeMeta:   metav1.TypeMeta{Kind: "Profile", APIVersion: "projectcalico.org/v3"},
-					ObjectMeta: metav1.ObjectMeta{Name: name, UID: sa.UID, CreationTimestamp: sa.CreationTimestamp},
+					ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, CreationTimestamp: sa.CreationTimestamp},
 					Spec: apiv3.ProfileSpec{
 						LabelsToApply: map[string]string{
 							"pcsa.projectcalico.org/name": sa.Name,
@@ -268,7 +274,7 @@ var _ = testutils.E2eDatastoreDescribe("Felix syncer tests", testutils.Datastore
 
 			// Expect the correct updates - should have a new entry for each of these entries. Note that we don't do
 			// any more update checks below because we filter out host related updates since they are chatty outside
-			// of our control (and a lot of the tests below are focussed on host data), instead the tests below will
+			// of our control (and a lot of the tests below are focused on host data), instead the tests below will
 			// just check the final cache entry.
 			var expectedEvents []api.Update
 			for _, r := range defaultCacheEntries {

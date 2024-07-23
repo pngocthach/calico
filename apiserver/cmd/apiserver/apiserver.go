@@ -22,7 +22,11 @@ import (
 	"os"
 	"runtime"
 
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/cli"
 	"k8s.io/component-base/logs"
+
 	"k8s.io/klog/v2"
 
 	"github.com/projectcalico/calico/apiserver/cmd/apiserver/server"
@@ -32,13 +36,23 @@ func main() {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
+	// The ConsistentListFromCache feature gate requires our resourceStore
+	// to support method RequestWatchProgress, which it does not.  Force-disable
+	// the gate.
+	err := feature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{string(features.ConsistentListFromCache): false})
+	if err != nil {
+		klog.Errorf("Error setting feature gates: %v.", err)
+		logs.FlushLogs()
+		os.Exit(1)
+	}
+
 	if len(os.Getenv("GOMAXPROCS")) == 0 {
 		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
-	err := server.Version()
+	err = server.Version()
 	if err != nil {
-		klog.Errorf("Error printing version info.")
+		klog.Errorf("Error printing version info: %v.", err)
 		logs.FlushLogs()
 	}
 
@@ -49,9 +63,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := cmd.Execute(); err != nil {
-		klog.Errorf("server exited unexpectedly (%s)", err)
-		logs.FlushLogs()
-		os.Exit(1)
-	}
+	code := cli.Run(cmd)
+	os.Exit(code)
 }

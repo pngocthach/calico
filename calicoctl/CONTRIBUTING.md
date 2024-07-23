@@ -12,7 +12,7 @@ you to do them before we can merge it.
 
 If you plan to contribute in the form of documentation or code, we need you to
 sign our Contributor License Agreement before we can accept your contribution. 
-You will be prompted to do this as part of the PR process on Github.
+You will be prompted to do this as part of the PR process on GitHub.
 
 ## Mailing lists and chat
 
@@ -48,7 +48,6 @@ a bad thing):
    might also be useful.
 -  Details of your OS.
 -  Environment details such as GCE, bare metal, VirtualBox.
-
 
 ## Contributing code and documentation
 

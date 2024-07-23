@@ -46,6 +46,7 @@ type Workload struct {
 	Name                  string
 	InterfaceName         string
 	IP                    string
+	IP6                   string
 	Ports                 string
 	DefaultPort           string
 	runCmd                *exec.Cmd
@@ -58,6 +59,31 @@ type Workload struct {
 	SpoofName             string
 	SpoofWorkloadEndpoint *api.WorkloadEndpoint
 	MTU                   int
+	isRunning             bool
+	isSpoofing            bool
+	listenAnyIP           bool
+	pid                   string
+
+	cleanupLock sync.Mutex
+}
+
+func (w *Workload) GetIP() string {
+	return w.IP
+}
+
+func (w *Workload) GetInterfaceName() string {
+	return w.InterfaceName
+}
+
+func (w *Workload) GetSpoofInterfaceName() string {
+	if w.isSpoofing {
+		return w.SpoofInterfaceName
+	}
+	return ""
+}
+
+func (w *Workload) Runs() bool {
+	return w.isRunning
 }
 
 var workloadIdx = 0
@@ -69,43 +95,79 @@ func (w *Workload) Stop() {
 	if w == nil {
 		log.Info("Stop no-op because nil workload")
 	} else {
-		log.WithField("workload", w).Info("Stop")
-		output, err := w.C.ExecOutput("cat", fmt.Sprintf("/tmp/%v", w.Name))
-		Expect(err).NotTo(HaveOccurred(), "failed to run docker exec command to get workload pid")
-		pid := strings.TrimSpace(output)
-		w.C.Exec("kill", pid)
-		_ = w.C.ExecMayFail("ip", "link", "del", w.InterfaceName)
-		_ = w.C.ExecMayFail("ip", "netns", "del", w.NamespaceID())
-		_, err = w.runCmd.Process.Wait()
-		if err != nil {
-			log.WithField("workload", w).Error("failed to wait for process")
+		log.WithField("workload", w.Name).Info("Stop")
+		_ = w.C.ExecMayFail("sh", "-c", fmt.Sprintf("kill -9 %s & ip link del %s & ip netns del %s & wait", w.pid, w.InterfaceName, w.NamespaceID()))
+		// Killing the process inside the container should cause our long-running
+		// docker exec command to exit.  Do the Wait on a background goroutine,
+		// so we can time it out, just in case.
+		waitDone := make(chan struct{})
+		go func() {
+			defer close(waitDone)
+			_, err := w.runCmd.Process.Wait()
+			if err != nil {
+				log.WithField("workload", w.Name).Error("Failed to wait for docker exec, attempting to kill it.")
+				_ = w.runCmd.Process.Kill()
+			}
+		}()
+
+		select {
+		case <-waitDone:
+			log.WithField("workload", w.Name).Info("Workload stopped")
+		case <-time.After(10 * time.Second):
+			log.WithField("workload", w.Name).Error("Workload docker exec failed to exit?  Killing it.")
+			_ = w.runCmd.Process.Kill()
 		}
-		log.WithField("workload", w).Info("Workload now stopped")
+
+		w.isRunning = false
 	}
 }
 
-func RunWithMTU(c *infrastructure.Felix, name, profile, ip, ports, protocol string, mtu int) (w *Workload) {
-	w, err := run(c, name, profile, ip, ports, protocol, mtu)
+func Run(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opts ...Opt) (w *Workload) {
+	w, err := run(c, name, profile, ip, ports, protocol, opts...)
 	if err != nil {
 		log.WithError(err).Info("Starting workload failed, retrying")
-		w, err = run(c, name, profile, ip, ports, protocol, mtu)
+		w, err = run(c, name, profile, ip, ports, protocol, opts...)
 	}
 	Expect(err).NotTo(HaveOccurred())
 
 	return w
 }
 
-func Run(c *infrastructure.Felix, name, profile, ip, ports, protocol string) (w *Workload) {
-	return RunWithMTU(c, name, profile, ip, ports, protocol, defaultMTU)
+type Opt func(*Workload)
+
+func WithMTU(mtu int) Opt {
+	return func(w *Workload) {
+		w.MTU = mtu
+	}
 }
 
-func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, mtu ...int) *Workload {
+func WithIPv6Address(ipv6 string) Opt {
+	return func(w *Workload) {
+		w.IP6 = ipv6
+	}
+}
+
+func WithListenAnyIP() Opt {
+	return func(w *Workload) {
+		w.listenAnyIP = true
+	}
+}
+
+// WithHostNetworked force the workload to be host-networked even if the listen IP is
+// different than the host IP.
+func WithHostNetworked() Opt {
+	return func(w *Workload) {
+		w.InterfaceName = ""
+	}
+}
+
+func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opts ...Opt) *Workload {
 	workloadIdx++
 	n := fmt.Sprintf("%s-idx%v", name, workloadIdx)
 	interfaceName := conversion.NewConverter().VethNameForWorkload(profile, n)
 	spoofN := fmt.Sprintf("%s-spoof%v", name, workloadIdx)
 	spoofIfaceName := conversion.NewConverter().VethNameForWorkload(profile, spoofN)
-	if c.IP == ip {
+	if c.IP == ip || c.IPv6 == ip {
 		interfaceName = ""
 		spoofIfaceName = ""
 	}
@@ -126,35 +188,38 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, mtu
 	wep.Spec.InterfaceName = interfaceName
 	wep.Spec.Profiles = []string{profile}
 
-	specifiedMTU := defaultMTU
-	if len(mtu) == 1 && mtu[0] > 0 {
-		specifiedMTU = mtu[0]
-	}
-
-	return &Workload{
+	workload := &Workload{
 		C:                  c.Container,
 		Name:               n,
+		IP:                 ip,
 		SpoofName:          spoofN,
 		InterfaceName:      interfaceName,
 		SpoofInterfaceName: spoofIfaceName,
-		IP:                 ip,
 		Ports:              ports,
 		Protocol:           protocol,
 		WorkloadEndpoint:   wep,
-		MTU:                specifiedMTU,
+		MTU:                defaultMTU,
 	}
+
+	for _, o := range opts {
+		o(workload)
+	}
+
+	if workload.IP6 != "" {
+		wep.Spec.IPNetworks = append(wep.Spec.IPNetworks, workload.IP6+"/128")
+	}
+
+	c.Workloads = append(c.Workloads, workload)
+	return workload
 }
 
-func run(c *infrastructure.Felix, name, profile, ip, ports, protocol string, mtu int) (w *Workload, err error) {
-	w = New(c, name, profile, ip, ports, protocol, mtu)
+func run(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opts ...Opt) (w *Workload, err error) {
+	w = New(c, name, profile, ip, ports, protocol, opts...)
 	return w, w.Start()
 }
 
 func (w *Workload) Start() error {
 	var err error
-
-	// Ensure that the host has the 'test-workload' binary.
-	w.C.EnsureBinary("test-workload")
 
 	// Start the workload.
 	log.WithField("workload", w).Info("About to run workload")
@@ -163,21 +228,26 @@ func (w *Workload) Start() error {
 		protoArg = "--protocol=" + w.Protocol
 	}
 
-	var mtuArg string
-	if w.MTU != 0 {
-		mtuArg = fmt.Sprintf("--mtu=%d", w.MTU)
+	wIP := w.IP
+	if w.IP6 != "" {
+		wIP = wIP + "," + w.IP6
 	}
-	w.runCmd = utils.Command("docker", "exec", w.C.Name,
-		"sh", "-c",
-		fmt.Sprintf("echo $$ > /tmp/%v; exec /test-workload %v '%v' '%v' '%v' %v",
-			w.Name,
-			protoArg,
-			w.InterfaceName,
-			w.IP,
-			w.Ports,
-			mtuArg,
-		),
+	command := fmt.Sprintf("echo $$; exec test-workload %v '%v' '%v' '%v'",
+		protoArg,
+		w.InterfaceName,
+		wIP,
+		w.Ports,
 	)
+
+	if w.MTU != 0 {
+		command += fmt.Sprintf(" --mtu=%d", w.MTU)
+	}
+
+	if w.listenAnyIP {
+		command += " --listen-any-ip"
+	}
+
+	w.runCmd = utils.Command("docker", "exec", w.C.Name, "sh", "-c", command)
 	w.outPipe, err = w.runCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("Getting StdoutPipe failed: %v", err)
@@ -209,13 +279,19 @@ func (w *Workload) Start() error {
 		}
 	}()
 
+	pid, err := stdoutReader.ReadString('\n')
+	if err != nil {
+		// (Only) if we fail here, wait for the stderr to be output before returning.
+		defer errDone.Wait()
+		return fmt.Errorf("reading PID from stdout failed: %w", err)
+	}
+	w.pid = strings.TrimSpace(pid)
+
 	namespacePath, err := stdoutReader.ReadString('\n')
 	if err != nil {
 		// (Only) if we fail here, wait for the stderr to be output before returning.
 		defer errDone.Wait()
-		if err != nil {
-			return fmt.Errorf("Reading from stdout failed: %v", err)
-		}
+		return fmt.Errorf("reading from stdout failed: %w", err)
 	}
 
 	w.namespacePath = strings.TrimSpace(namespacePath)
@@ -231,6 +307,7 @@ func (w *Workload) Start() error {
 		}
 	}()
 
+	w.isRunning = true
 	log.WithField("workload", w).Info("Workload now running")
 
 	return nil
@@ -260,6 +337,8 @@ func (w *Workload) AddSpoofInterface() {
 	w.Exec("ip", "route", "add", "default", "via", "169.254.169.254")
 	// Add static ARP entry, otherwise connections fail at the ARP stage because the host won't respond.
 	w.Exec("arp", "-i", "spoof0", "-s", "169.254.169.254", "ee:ee:ee:ee:ee:ee")
+
+	w.isSpoofing = true
 }
 
 func (w *Workload) UseSpoofInterface(spoof bool) {
@@ -293,7 +372,9 @@ func (w *Workload) RemoveFromDatastore(client client.Interface) {
 // ConfigureInInfra creates the workload endpoint for this Workload.
 func (w *Workload) ConfigureInInfra(infra infrastructure.DatastoreInfra) {
 	wep := w.WorkloadEndpoint
-	wep.Namespace = "default"
+	if wep.Namespace == "" {
+		wep.Namespace = "default"
+	}
 	wep.Spec.Workload = w.Name
 	wep.Spec.Endpoint = w.Name
 	wep.Spec.InterfaceName = w.InterfaceName
@@ -352,14 +433,31 @@ func (w *Workload) SourceName() string {
 }
 
 func (w *Workload) SourceIPs() []string {
-	return []string{w.IP}
+	ips := []string{}
+	if w.IP != "" {
+		ips = append(ips, w.IP)
+	}
+	if w.IP6 != "" {
+		ips = append(ips, w.IP6)
+	}
+	return ips
+}
+
+func (w *Workload) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
+	anyPort := w.conncheckAnyPort()
+	anyPort.PreRetryCleanup(ip, port, protocol, opts...)
 }
 
 func (w *Workload) CanConnectTo(ip, port, protocol string, opts ...connectivity.CheckOption) *connectivity.Result {
+	anyPort := w.conncheckAnyPort()
+	return anyPort.CanConnectTo(ip, port, protocol, opts...)
+}
+
+func (w *Workload) conncheckAnyPort() Port {
 	anyPort := Port{
 		Workload: w,
 	}
-	return anyPort.CanConnectTo(ip, port, protocol, opts...)
+	return anyPort
 }
 
 func (w *Workload) Port(port uint16) *Port {
@@ -435,9 +533,6 @@ func (w *Workload) LatencyTo(ip, port string) (time.Duration, string) {
 }
 
 func (w *Workload) SendPacketsTo(ip string, count int, size int) (error, string) {
-	if strings.Contains(ip, ":") {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
 	c := fmt.Sprintf("%d", count)
 	s := fmt.Sprintf("%d", size)
 	_, err := w.ExecOutput("ping", "-c", c, "-W", "1", "-s", s, ip)
@@ -488,14 +583,12 @@ func (w *Workload) StartSideService() *SideService {
 }
 
 func startSideService(w *Workload) (*SideService, error) {
-	// Ensure that the host has the 'test-workload' binary.
-	w.C.EnsureBinary("test-workload")
 	sideServIdx++
 	n := fmt.Sprintf("%s-ss%d", w.Name, sideServIdx)
 	pidFile := fmt.Sprintf("/tmp/%s-pid", n)
 
 	testWorkloadShArgs := []string{
-		"/test-workload",
+		"test-workload",
 	}
 	if w.Protocol == "udp" {
 		testWorkloadShArgs = append(testWorkloadShArgs, "--udp")
@@ -536,6 +629,7 @@ func startSideService(w *Workload) (*SideService, error) {
 type PersistentConnectionOpts struct {
 	SourcePort          int
 	MonitorConnectivity bool
+	Timeout             time.Duration
 }
 
 func (w *Workload) StartPersistentConnection(ip string, port int,
@@ -550,6 +644,7 @@ func (w *Workload) StartPersistentConnection(ip string, port int,
 		NamespacePath:       w.namespacePath,
 		SourcePort:          opts.SourcePort,
 		MonitorConnectivity: opts.MonitorConnectivity,
+		Timeout:             opts.Timeout,
 	}
 
 	err := pc.Start()
@@ -571,6 +666,7 @@ func (w *Workload) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 	}
 	return &connectivity.Matcher{
 		IP:         w.IP,
+		IP6:        w.IP6,
 		Port:       port,
 		TargetName: fmt.Sprintf("%s on port %s", w.Name, port),
 		Protocol:   "tcp",
@@ -643,9 +739,19 @@ type SpoofedWorkload struct {
 	SpoofedSourceIP string
 }
 
+func (s *SpoofedWorkload) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
+	opts = s.appendSourceIPOpt(opts)
+	s.Workload.preRetryCleanupInner(ip, port, protocol, "(spoofed)", opts...)
+}
+
 func (s *SpoofedWorkload) CanConnectTo(ip, port, protocol string, opts ...connectivity.CheckOption) *connectivity.Result {
+	opts = s.appendSourceIPOpt(opts)
+	return s.Workload.canConnectToInner(ip, port, protocol, "(spoofed)", opts...)
+}
+
+func (s *SpoofedWorkload) appendSourceIPOpt(opts []connectivity.CheckOption) []connectivity.CheckOption {
 	opts = append(opts, connectivity.WithSourceIP(s.SpoofedSourceIP))
-	return canConnectTo(s.Workload, ip, port, protocol, "(spoofed)", opts...)
+	return opts
 }
 
 type Port struct {
@@ -664,18 +770,32 @@ func (p *Port) SourceIPs() []string {
 	return []string{p.IP}
 }
 
+func (p *Port) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
+	opts = p.maybeAppendPortOpt(opts)
+	p.Workload.preRetryCleanupInner(ip, port, protocol, "(with source port)", opts...)
+}
+
 // Return if a connection is good and packet loss string "PacketLoss[xx]".
 // If it is not a packet loss test, packet loss string is "".
 func (p *Port) CanConnectTo(ip, port, protocol string, opts ...connectivity.CheckOption) *connectivity.Result {
+	opts = p.maybeAppendPortOpt(opts)
+	return p.Workload.canConnectToInner(ip, port, protocol, "(with source port)", opts...)
+}
+
+func (p *Port) maybeAppendPortOpt(opts []connectivity.CheckOption) []connectivity.CheckOption {
 	if p.Port != 0 {
 		opts = append(opts, connectivity.WithSourcePort(strconv.Itoa(int(p.Port))))
 	}
-	return canConnectTo(p.Workload, ip, port, protocol, "(with source port)", opts...)
+	return opts
 }
 
-func canConnectTo(w *Workload, ip, port, protocol, logSuffix string, opts ...connectivity.CheckOption) *connectivity.Result {
-
+func (w *Workload) preRetryCleanupInner(ip, port, protocol, logSuffix string, opts ...connectivity.CheckOption) {
 	if protocol == "udp" || protocol == "sctp" {
+		// Defensive, we might get called in parallel for different ports, avoid trying to run
+		// clashing cleanup commands at the same time.
+		w.cleanupLock.Lock()
+		defer w.cleanupLock.Unlock()
+
 		// If this is a retry then we may have stale conntrack entries and we don't want those
 		// to influence the connectivity check.  UDP lacks a sequence number, so conntrack operates
 		// on a simple timer. In the case of SCTP, conntrack appears to match packets even when
@@ -686,14 +806,14 @@ func canConnectTo(w *Workload, ip, port, protocol, logSuffix string, opts ...con
 			_ = w.C.ExecMayFail("conntrack", "-D", "-p", protocol, "-s", w.IP, "-d", ip)
 		}
 	}
+}
 
+func (w *Workload) canConnectToInner(ip, port, protocol, logSuffix string, opts ...connectivity.CheckOption) *connectivity.Result {
 	logMsg := "Connection test"
 
 	// enforce the name space as we want to execute it in the workload
 	opts = append(opts, connectivity.WithNamespacePath(w.namespacePath))
 	logMsg += " " + logSuffix
-
-	w.C.EnsureBinary(connectivity.BinaryName)
 
 	return connectivity.Check(w.C.Name, logMsg, ip, port, protocol, opts...)
 }
@@ -708,6 +828,7 @@ func (p *Port) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 		IP:         p.Workload.IP,
 		Port:       fmt.Sprint(p.Port),
 		TargetName: fmt.Sprintf("%s on port %d", p.Workload.Name, p.Port),
+		IP6:        p.Workload.IP6,
 	}
 }
 

@@ -43,6 +43,7 @@ func RunFlannelMigrationController(kconfigfile string, nodeName, subnetEnv strin
 		"-e", "DATASTORE_TYPE=kubernetes",
 		"-e", "ENABLED_CONTROLLERS=flannelmigration",
 		"-e", "LOG_LEVEL=debug",
+		"-e", "FLANNEL_DAEMONSET_NAMESPACE=kube-system",
 		"-e", fmt.Sprintf("POD_NODE_NAME=%s", nodeName),
 		"-e", fmt.Sprintf("FLANNEL_SUBNET_ENV=%s", subnetEnv),
 		"-e", fmt.Sprintf("DEBUG_WAIT_BEFORE_START=%d", waitBeforeStart),
@@ -72,7 +73,7 @@ func (n FlannelNode) getFlannelAnnotations() map[string]string {
 	jsonString, err := json.Marshal(map[string]string{"VtepMac": n.VtepMac})
 	Expect(err).ShouldNot(HaveOccurred())
 	return map[string]string{
-		"flannel.alpha.coreos.com/backend-data": fmt.Sprintf("%s", jsonString),
+		"flannel.alpha.coreos.com/backend-data": string(jsonString),
 		"flannel.alpha.coreos.com/backend-type": n.BackEnd,
 		"flannel.alpha.coreos.com/public-ip":    n.PublicIP,
 	}
@@ -108,9 +109,10 @@ func (f *FlannelCluster) Reset() {
 }
 
 func (f *FlannelCluster) AddFlannelNode(nodeName, podCidr, backend, mac, ip string, labels map[string]string, isMaster bool) *v1.Node {
-	defaultLabels := map[string]string{"beta.kubernetes.io/os": "linux"}
+	defaultLabels := map[string]string{"kubernetes.io/os": "linux"}
 	if isMaster {
 		defaultLabels["node-role.kubernetes.io/master"] = ""
+		defaultLabels["node-role.kubernetes.io/control-plane"] = ""
 	}
 	for k, v := range labels {
 		defaultLabels[k] = v

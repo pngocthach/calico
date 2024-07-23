@@ -60,23 +60,22 @@ func MetricsPortReachable(felix *infrastructure.Felix, bpf bool) bool {
 //
 // - When there is no policy or endpoint configuration, the port should be reachable.
 //
-// - When there is a local workload endpoint, the port should be reachable.  (Existence of workload
-//   endpoints should make no difference to reachability to ports on the host itself.)
+//   - When there is a local workload endpoint, the port should be reachable.  (Existence of workload
+//     endpoints should make no difference to reachability to ports on the host itself.)
 //
-// - When a host endpoint is configured for the host's interface (eth0) or for
-//   all-interfaces, but not yet any policy, the port should be unreachable.
+//   - When a host endpoint is configured for the host's interface (eth0) or for
+//     all-interfaces, but not yet any policy, the port should be unreachable.
 //
 //   - When pre-DNAT policy is then configured, to allow ingress to some other
 //     port, it should still be unreachable again.
 //
 //   - When pre-DNAT policy is then configured, to allow ingress to the metrics port, it should be
 //     reachable again.
-//
 var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconfig.DatastoreType{apiconfig.EtcdV3, apiconfig.Kubernetes}, func(getInfra infrastructure.InfraFactory) {
 	var (
 		bpfEnabled           = os.Getenv("FELIX_FV_ENABLE_BPF") == "true"
 		infra                infrastructure.DatastoreInfra
-		felix                *infrastructure.Felix
+		tc                   infrastructure.TopologyContainers
 		client               client.Interface
 		metricsPortReachable func() bool
 	)
@@ -86,25 +85,25 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 
 		options := infrastructure.DefaultTopologyOptions()
 		options.NeedNodeIP = bpfEnabled
-		felix, client = infrastructure.StartSingleNodeTopology(options, infra)
+		tc, client = infrastructure.StartSingleNodeTopology(options, infra)
 
 		metricsPortReachable = func() bool {
-			return MetricsPortReachable(felix, bpfEnabled)
+			return MetricsPortReachable(tc.Felixes[0], bpfEnabled)
 		}
 
 		if bpfEnabled {
-			Eventually(felix.NumTCBPFProgsEth0, "5s", "200ms").Should(Equal(2))
+			Eventually(tc.Felixes[0].NumTCBPFProgsEth0, "5s", "200ms").Should(Equal(2))
 		}
 	})
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
 			infra.DumpErrorData()
-			felix.Exec("iptables-save", "-c")
-			felix.Exec("ip", "r")
-			felix.Exec("ip", "a")
+			tc.Felixes[0].Exec("iptables-save", "-c")
+			tc.Felixes[0].Exec("ip", "r")
+			tc.Felixes[0].Exec("ip", "a")
 		}
-		felix.Stop()
+		tc.Stop()
 		infra.Stop()
 	})
 
@@ -113,7 +112,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 	})
 
 	It("with a local workload, port should be reachable", func() {
-		w := workload.Run(felix, "w", "default", "10.65.0.2", "8055", "tcp")
+		w := workload.Run(tc.Felixes[0], "w", "default", "10.65.0.2", "8055", "tcp")
 		w.ConfigureInInfra(infra)
 		Eventually(metricsPortReachable, "10s", "1s").Should(BeTrue(), "Not reachable with workload running")
 		w.Stop()
@@ -178,7 +177,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 			hostEp := api.NewHostEndpoint()
 			hostEp.Name = "host-endpoint-1"
 			hostEp.Labels = map[string]string{"host-endpoint": "true"}
-			hostEp.Spec.Node = felix.Hostname
+			hostEp.Spec.Node = tc.Felixes[0].Hostname
 			hostEp.Spec.InterfaceName = "eth0"
 			_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())
@@ -192,7 +191,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 			hostEp := api.NewHostEndpoint()
 			hostEp.Name = "all-interfaces-hostendpoint"
 			hostEp.Labels = map[string]string{"host-endpoint": "true"}
-			hostEp.Spec.Node = felix.Hostname
+			hostEp.Spec.Node = tc.Felixes[0].Hostname
 			hostEp.Spec.InterfaceName = "*"
 			_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())

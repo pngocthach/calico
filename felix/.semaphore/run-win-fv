@@ -16,7 +16,7 @@
 
 set -ex
 
-FV_DIR="/home/semaphore/process/testing/winfv"
+FV_DIR="/home/semaphore/calico/process/testing/winfv"
 
 pushd ${FV_DIR}
 # Prepare local files
@@ -50,7 +50,8 @@ ${SCP_CMD} -r ubuntu@${MASTER_IP}:/home/ubuntu/report /home/semaphore
 
 ls -ltr ./report
 mkdir /home/semaphore/fv.log
-mv /home/semaphore/report/*.log /home/semaphore/fv.log
+# check if *.log glob contains any files so that mv doesn't fail
+compgen -G /home/semaphore/report/*.log > /dev/null && mv /home/semaphore/report/*.log /home/semaphore/fv.log
 
 # Stop for debug
 echo "Check for pause file..."
@@ -60,10 +61,18 @@ do
     sleep 30
 done
 
+# Print relevant snippets from logs
+log_regexps='(?<!Decode)Failure|SUCCESS|FV-TEST-START'
+compgen -G /home/semaphore/fv.log/*.log > /dev/null && \
+for log_file in /home/semaphore/fv.log/*.log; do
+    prefix="[$(basename ${log_file})]"
+    cat ${log_file} | iconv -f UTF-16 -t UTF-8 | sed 's/\r$//g' | grep --line-buffered --perl ${log_regexps} -B 2 -A 15 | sed 's/.*/'"${prefix}"' &/g'
+done;
+
 # Search for error code file
 if [ -f /home/semaphore/report/error-codes ];
 then
-    echo "Windows FV return error."
+    echo "Windows FV returned error(s)."
     exit 1
 fi
 

@@ -23,9 +23,9 @@ import (
 )
 
 // Iter extracts the filename from the parsed args and
-// -  invokes the callback for each manifest files in the directory if the filename in the parsed arguments is a
-//    directory (updating the arguments to include the specific file)
-// -  otherwise just invoke the callback with the unmodified arguments.
+//   - invokes the callback for each manifest files in the directory if the filename in the parsed arguments is a
+//     directory (updating the arguments to include the specific file)
+//   - otherwise just invoke the callback with the unmodified arguments.
 func Iter(parsedArgs map[string]interface{}, cb func(map[string]interface{}) error) error {
 	// File name is specified.
 	f, ok := parsedArgs["--filename"].(string)
@@ -55,7 +55,7 @@ func Iter(parsedArgs map[string]interface{}, cb func(map[string]interface{}) err
 			}
 
 			if info.IsDir() {
-				// Return nil or SkipDir dpending on whether or not we are recursively following directories (note that
+				// Return nil or SkipDir depending on whether or not we are recursively following directories (note that
 				// we need to explicitly handle the root directory to ensure we do at least one layer of directory
 				// walking by default).
 				if recursive || path == f {

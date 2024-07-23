@@ -15,9 +15,12 @@
 package proxy
 
 import (
+	"fmt"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/felix/ip"
 )
 
 // Option defines Proxy options
@@ -64,6 +67,48 @@ func WithImmediateSync() Option {
 func WithDSREnabled() Option {
 	return makeKubeProxyOption(func(kp *KubeProxy) error {
 		kp.dsrEnabled = true
+		return nil
+	})
+}
+
+// WithTopologyNodeZone sets the topology node zone
+func WithTopologyNodeZone(nodeZone string) Option {
+	return makeOption(func(p *proxy) error {
+		p.nodeZone = nodeZone
+		return nil
+	})
+}
+
+func WithIPFamily(ipFamily int) Option {
+	return func(p Proxy) error {
+		p.setIpFamily(ipFamily)
+		return nil
+	}
+}
+
+var excludeCIDRsMatch = 1
+
+func WithExcludedCIDRs(cidrs []string) Option {
+	return makeKubeProxyOption(func(kp *KubeProxy) error {
+		if kp.ipFamily == 0 {
+			return fmt.Errorf("ip family is not set")
+		}
+
+		kp.excludedCIDRs = ip.NewCIDRTrie()
+
+		for _, c := range cidrs {
+			cidr, err := ip.CIDRFromString(c)
+			if err != nil {
+				return fmt.Errorf("bad CIDR %s: %w", c, err)
+			}
+
+			if int(cidr.Version()) != kp.ipFamily {
+				continue
+			}
+
+			kp.excludedCIDRs.Update(cidr, &excludeCIDRsMatch)
+		}
+
 		return nil
 	})
 }

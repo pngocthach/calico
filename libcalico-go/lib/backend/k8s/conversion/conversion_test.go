@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
@@ -32,6 +33,7 @@ import (
 	kapiv1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -45,7 +47,6 @@ func podToWorkloadEndpoint(c Converter, pod *kapiv1.Pod) (*model.KVPair, error) 
 }
 
 var _ = Describe("Test parsing strings", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
@@ -171,86 +172,88 @@ var _ = Describe("Test selector conversion", func() {
 })
 
 var _ = Describe("Test Pod conversion", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
 	It("should parse a Pod with an IP to a WorkloadEndpoint", func() {
-		pod := kapiv1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "podA",
-				Namespace: "default",
-				Annotations: map[string]string{
-					"arbitrary": "annotation",
+		makePod := func() kapiv1.Pod {
+			return kapiv1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podA",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"arbitrary": "annotation",
+					},
+					Labels: map[string]string{
+						"labelA": "valueA",
+						"labelB": "valueB",
+					},
+					ResourceVersion: "1234",
 				},
-				Labels: map[string]string{
-					"labelA": "valueA",
-					"labelB": "valueB",
-				},
-				ResourceVersion: "1234",
-			},
-			Spec: kapiv1.PodSpec{
-				NodeName: "nodeA",
-				Containers: []kapiv1.Container{
-					{
-						Ports: []kapiv1.ContainerPort{
-							{
-								ContainerPort: 5678,
+				Spec: kapiv1.PodSpec{
+					NodeName: "nodeA",
+					Containers: []kapiv1.Container{
+						{
+							Ports: []kapiv1.ContainerPort{
+								{
+									ContainerPort: 5678,
+								},
+								{
+									Name:          "no-proto",
+									ContainerPort: 1234,
+								},
 							},
-							{
-								Name:          "no-proto",
-								ContainerPort: 1234,
+						},
+						{
+							Ports: []kapiv1.ContainerPort{
+								{
+									Name:          "tcp-proto",
+									Protocol:      kapiv1.ProtocolTCP,
+									ContainerPort: 1024,
+								},
+								{
+									Name:          "tcp-proto-with-host-port",
+									Protocol:      kapiv1.ProtocolTCP,
+									ContainerPort: 8080,
+									HostPort:      5678,
+								},
+								{
+									Name:          "tcp-proto-with-host-port-and-ip",
+									Protocol:      kapiv1.ProtocolTCP,
+									ContainerPort: 8081,
+									HostPort:      6789,
+									HostIP:        "1.2.3.4",
+								},
+								{
+									Protocol:      kapiv1.ProtocolTCP,
+									ContainerPort: 500,
+									HostPort:      5000,
+								},
+								{
+									Name:          "udp-proto",
+									Protocol:      kapiv1.ProtocolUDP,
+									ContainerPort: 432,
+								},
+								{
+									Name:          "sctp-proto",
+									Protocol:      kapiv1.ProtocolSCTP,
+									ContainerPort: 891,
+								},
+								{
+									Name:          "unkn-proto",
+									Protocol:      kapiv1.Protocol("unknown"),
+									ContainerPort: 567,
+								},
 							},
 						},
 					},
-					{
-						Ports: []kapiv1.ContainerPort{
-							{
-								Name:          "tcp-proto",
-								Protocol:      kapiv1.ProtocolTCP,
-								ContainerPort: 1024,
-							},
-							{
-								Name:          "tcp-proto-with-host-port",
-								Protocol:      kapiv1.ProtocolTCP,
-								ContainerPort: 8080,
-								HostPort:      5678,
-							},
-							{
-								Name:          "tcp-proto-with-host-port-and-ip",
-								Protocol:      kapiv1.ProtocolTCP,
-								ContainerPort: 8081,
-								HostPort:      6789,
-								HostIP:        "1.2.3.4",
-							},
-							{
-								Protocol:      kapiv1.ProtocolTCP,
-								ContainerPort: 500,
-								HostPort:      5000,
-							},
-							{
-								Name:          "udp-proto",
-								Protocol:      kapiv1.ProtocolUDP,
-								ContainerPort: 432,
-							},
-							{
-								Name:          "sctp-proto",
-								Protocol:      kapiv1.ProtocolSCTP,
-								ContainerPort: 891,
-							},
-							{
-								Name:          "unkn-proto",
-								Protocol:      kapiv1.Protocol("unknown"),
-								ContainerPort: 567,
-							},
-						},
-					},
 				},
-			},
-			Status: kapiv1.PodStatus{
-				PodIP: "192.168.0.1",
-			},
+				Status: kapiv1.PodStatus{
+					PodIP: "192.168.0.1",
+				},
+			}
 		}
+		pod := makePod()
 
 		wep, err := podToWorkloadEndpoint(c, &pod)
 		Expect(err).NotTo(HaveOccurred())
@@ -307,6 +310,8 @@ var _ = Describe("Test Pod conversion", func() {
 
 		// Assert ResourceVersion is present.
 		Expect(wep.Revision).To(Equal("1234"))
+
+		Expect(pod).To(Equal(makePod()), "Original pod should not be modified")
 	})
 
 	It("should parse a Pod with dual stack IPs to a WorkloadEndpoint", func() {
@@ -520,7 +525,6 @@ var _ = Describe("Test Pod conversion", func() {
 
 		// Assert that the endpoint contains the appropriate DNAT
 		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Spec.IPNATs).To(ConsistOf(libapiv3.IPNAT{InternalIP: "192.168.0.1", ExternalIP: "1.1.1.1"}))
-
 	})
 
 	It("should find the right address family target for dual stack floating IPs", func() {
@@ -556,10 +560,9 @@ var _ = Describe("Test Pod conversion", func() {
 			libapiv3.IPNAT{InternalIP: "192.168.0.1", ExternalIP: "1.1.1.1"},
 			libapiv3.IPNAT{InternalIP: "fd5f:8067::1", ExternalIP: "fd80:100:100::10"},
 		))
-
 	})
 
-	It("should look the source spoofing disabling annotation", func() {
+	It("should look at the source spoofing disabling annotation", func() {
 		pod := kapiv1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "podA",
@@ -580,6 +583,73 @@ var _ = Describe("Test Pod conversion", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(c.HasIPAddress(&pod)).To(BeTrue())
 		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Spec.AllowSpoofedSourcePrefixes).To(ConsistOf([]string{"1.1.1.0/24", "8.8.8.8/32"}))
+	})
+
+	It("should error on empty string in the source spoofing disabling annotation", func() {
+		pod := kapiv1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "podA",
+				Namespace: "default",
+				Annotations: map[string]string{
+					"cni.projectcalico.org/podIP":                 "192.168.0.1",
+					"cni.projectcalico.org/allowedSourcePrefixes": "[\"\"]",
+				},
+				ResourceVersion: "1234",
+			},
+			Spec: kapiv1.PodSpec{
+				NodeName:   "nodeA",
+				Containers: []kapiv1.Container{},
+			},
+		}
+
+		wep, err := podToWorkloadEndpoint(c, &pod)
+		Expect(err).To(HaveOccurred())
+		Expect(wep).To(BeNil())
+	})
+
+	It("should error on invalid CIDR in the source spoofing disabling annotation", func() {
+		pod := kapiv1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "podA",
+				Namespace: "default",
+				Annotations: map[string]string{
+					"cni.projectcalico.org/podIP":                 "192.168.0.1",
+					"cni.projectcalico.org/allowedSourcePrefixes": "[\"gumbo\"]",
+				},
+				ResourceVersion: "1234",
+			},
+			Spec: kapiv1.PodSpec{
+				NodeName:   "nodeA",
+				Containers: []kapiv1.Container{},
+			},
+		}
+
+		wep, err := podToWorkloadEndpoint(c, &pod)
+		Expect(err).To(HaveOccurred())
+		Expect(wep).To(BeNil())
+	})
+
+	It("should normalize CIDRs in the source spoofing disabling annotation", func() {
+		pod := kapiv1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "podA",
+				Namespace: "default",
+				Annotations: map[string]string{
+					"cni.projectcalico.org/podIP":                 "192.168.0.1",
+					"cni.projectcalico.org/allowedSourcePrefixes": "[\"1.1.1.1/16\"]",
+				},
+				ResourceVersion: "1234",
+			},
+			Spec: kapiv1.PodSpec{
+				NodeName:   "nodeA",
+				Containers: []kapiv1.Container{},
+			},
+		}
+
+		wep, err := podToWorkloadEndpoint(c, &pod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.HasIPAddress(&pod)).To(BeTrue())
+		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Spec.AllowSpoofedSourcePrefixes).To(ConsistOf([]string{"1.1.0.0/16"}))
 	})
 
 	It("should return an error for a bad pod IP", func() {
@@ -728,7 +798,7 @@ var _ = Describe("Test Pod conversion", func() {
 		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Spec.IPNetworks).To(BeEmpty())
 	})
 
-	It("should treat running pod with no podIP annoation with a deletion timestamp as running", func() {
+	It("should treat running pod with no podIP annotation with a deletion timestamp as running", func() {
 		now := metav1.Now()
 		pod := kapiv1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -757,7 +827,7 @@ var _ = Describe("Test Pod conversion", func() {
 		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Spec.IPNetworks).To(ConsistOf("192.168.0.1/32"))
 	})
 
-	It("should treat finished pod with no podIP annoation with a deletion timestamp as finished", func() {
+	It("should treat finished pod with no podIP annotation with a deletion timestamp as finished", func() {
 		now := metav1.Now()
 		pod := kapiv1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1074,20 +1144,104 @@ var _ = Describe("Test Pod conversion", func() {
 		// Make sure the GenerateName information is correct.
 		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).GenerateName).To(Equal(gname))
 	})
+
+	It("should pass network-status annotations from pod to workloadendpoint", func() {
+		makePod := func() kapiv1.Pod {
+			return kapiv1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						"k8s.v1.cni.cncf.io/network-status": `
+					[{
+						"name": "k8s-pod-network",
+						"ips": [
+							"172.16.166.191"
+						],
+						"default": true,
+						"dns": {}
+					}]`,
+					},
+				},
+				Spec: kapiv1.PodSpec{
+					NodeName: "nodeA",
+				},
+				Status: kapiv1.PodStatus{},
+			}
+		}
+		pod := makePod()
+		wep, err := podToWorkloadEndpoint(c, &pod)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(wep.Value.(*libapiv3.WorkloadEndpoint).Annotations).Should(HaveKeyWithValue("k8s.v1.cni.cncf.io/network-status", `
+					[{
+						"name": "k8s-pod-network",
+						"ips": [
+							"172.16.166.191"
+						],
+						"default": true,
+						"dns": {}
+					}]`))
+
+		Expect(pod).To(Equal(makePod()), "Original pod should not be modified")
+	})
+})
+
+var _ = Describe("Test UID conversion", func() {
+	It("should parse a UID to a Calico ID", func() {
+		By("Converting a UID")
+		original := types.UID("30316465-6365-4463-ad63-3564622d3638")
+		converted, err := ConvertUID(original)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(converted)).To(Equal("0c8c26a6-c6a6-44c6-adc6-ac2646b46c1c"))
+
+		By("Parsing it as a valid UID")
+		parsed, err := uuid.Parse(string(converted))
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Checking the version bits are correct")
+		Expect(parsed[6] >> 4).To(Equal(byte(0x4))) // Version 4
+
+		By("Converting it back")
+		convertedBack, err := ConvertUID(converted)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(convertedBack).To(Equal(original))
+	})
+
+	It("should error on an invalid UID", func() {
+		_, err := ConvertUID("not-a-uid")
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should always maintain the v4 version metadata bits, and convert back", func() {
+		for i := 0; i < 100000; i++ {
+			original := types.UID(uuid.New().String())
+			converted, err := ConvertUID(original)
+			Expect(err).NotTo(HaveOccurred())
+
+			parsed, err := uuid.Parse(string(converted))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed[6] >> 4).To(Equal(byte(0x4))) // Version 4
+
+			convertedBack, err := ConvertUID(converted)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(convertedBack).To(Equal(original))
+		}
+	})
 })
 
 var _ = Describe("Test NetworkPolicy conversion", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
 	It("should parse a basic k8s NetworkPolicy to a NetworkPolicy", func() {
-		port80 := intstr.FromInt(80)
+		port80 := intstr.FromInt32(80)
 		portFoo := intstr.FromString("foo")
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1161,6 +1315,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1204,11 +1359,12 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	})
 
 	It("should parse a k8s NetworkPolicy with blank ports", func() {
-		port80 := intstr.FromInt(80)
+		port80 := intstr.FromInt32(80)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1254,13 +1410,14 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	})
 
 	It("should parse a k8s egress NetworkPolicy with blank ports", func() {
-		port53 := intstr.FromInt(53)
-		port80 := intstr.FromInt(80)
+		port53 := intstr.FromInt32(53)
+		port80 := intstr.FromInt32(80)
 		protoUDP := kapiv1.ProtocolUDP
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1318,7 +1475,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	})
 
 	It("should drop rules with invalid ports in a k8s NetworkPolicy", func() {
-		port80 := intstr.FromInt(80)
+		port80 := intstr.FromInt32(80)
 		portFoo := intstr.FromString("foo")
 		portBad1 := intstr.FromString("-50:-1")
 		portBad2 := intstr.FromString("-22:-3")
@@ -1326,6 +1483,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1430,6 +1588,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1578,6 +1737,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1612,6 +1772,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "testPolicy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -1656,6 +1817,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1720,12 +1882,13 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	})
 
 	It("should parse a k8s NetworkPolicy with a DoesNotExist expression ", func() {
-		port80 := intstr.FromInt(80)
+		port80 := intstr.FromInt32(80)
 		portFoo := intstr.FromString("foo")
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1796,13 +1959,14 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	It("should parse a NetworkPolicy with multiple peers and ports", func() {
 		tcp := kapiv1.ProtocolTCP
 		udp := kapiv1.ProtocolUDP
-		eighty := intstr.FromInt(80)
-		ninety := intstr.FromInt(90)
+		eighty := intstr.FromInt32(80)
+		ninety := intstr.FromInt32(90)
 
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1889,6 +2053,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -1921,6 +2086,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -1971,6 +2137,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2017,6 +2184,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2064,6 +2232,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2120,6 +2289,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2157,11 +2327,12 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 
 	It("should parse a NetworkPolicy with Ports only", func() {
 		protocol := kapiv1.ProtocolTCP
-		port := intstr.FromInt(80)
+		port := intstr.FromInt32(80)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2204,12 +2375,13 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 
 	It("should parse a NetworkPolicy with Port Range only", func() {
 		protocol := kapiv1.ProtocolTCP
-		port := intstr.FromInt(32000)
+		port := intstr.FromInt32(32000)
 		endPort := int32(32768)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2252,11 +2424,12 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 
 	It("should parse a NetworkPolicy with Ports only (egress)", func() {
 		protocol := kapiv1.ProtocolTCP
-		port := intstr.FromInt(80)
+		port := intstr.FromInt32(80)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2299,12 +2472,13 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 
 	It("should parse a NetworkPolicy with Port Range only (egress)", func() {
 		protocol := kapiv1.ProtocolTCP
-		port := intstr.FromInt(32000)
+		port := intstr.FromInt32(32000)
 		endPort := int32(32768)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2351,6 +2525,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2398,6 +2573,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2444,13 +2620,14 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 	It("should parse a NetworkPolicy with an Egress rule with IPBlock and Ports", func() {
 		tcp := kapiv1.ProtocolTCP
 		udp := kapiv1.ProtocolUDP
-		eighty := intstr.FromInt(80)
-		ninety := intstr.FromInt(90)
+		eighty := intstr.FromInt32(80)
+		ninety := intstr.FromInt32(90)
 
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2531,7 +2708,6 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 		// As this is an IPBlock rule, podSel and nsSel should be empty (not nil!)
 		Expect(podSel).To(BeEmpty())
 		Expect(nsSel).To(BeEmpty())
-
 	})
 
 	It("should have empty and Nil NetworkPolicyPeerfields when an IPBlock is invalid", func() {
@@ -2551,7 +2727,6 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 		// As this is an IPBlock rule, podSel and nsSel should be empty (not nil!)
 		Expect(podSel).To(BeEmpty())
 		Expect(nsSel).To(BeEmpty())
-
 	})
 
 	It("should parse a NetworkPolicyPeer with an CIDR and Except field", func() {
@@ -2574,7 +2749,6 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 		// As this is an IPBlock rule, podSel and nsSel should be empty (not nil!)
 		Expect(podSel).To(BeEmpty())
 		Expect(nsSel).To(BeEmpty())
-
 	})
 
 	It("should parse a NetworkPolicy with both an Egress and an Ingress rule", func() {
@@ -2582,6 +2756,7 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2641,22 +2816,21 @@ var _ = Describe("Test NetworkPolicy conversion", func() {
 		Expect(pol.Value.(*apiv3.NetworkPolicy).Spec.Types[0]).To(Equal(apiv3.PolicyTypeIngress))
 		Expect(pol.Value.(*apiv3.NetworkPolicy).Spec.Types[1]).To(Equal(apiv3.PolicyTypeEgress))
 	})
-
 })
 
 // This suite of tests is useful for ensuring we continue to support kubernetes apiserver
 // versions <= 1.7.x, and can be removed when that is no longer required.
 var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
 	It("should parse a basic NetworkPolicy to a Policy", func() {
-		port80 := intstr.FromInt(80)
+		port80 := intstr.FromInt32(80)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2722,6 +2896,7 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2755,6 +2930,7 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2820,13 +2996,14 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 	It("should parse a NetworkPolicy with multiple peers and ports", func() {
 		tcp := kapiv1.ProtocolTCP
 		udp := kapiv1.ProtocolUDP
-		eighty := intstr.FromInt(80)
-		ninety := intstr.FromInt(90)
+		eighty := intstr.FromInt32(80)
+		ninety := intstr.FromInt32(90)
 
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2912,6 +3089,7 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -2943,6 +3121,7 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{
@@ -2979,11 +3158,12 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 
 	It("should parse a NetworkPolicy with Ports only", func() {
 		protocol := kapiv1.ProtocolTCP
-		port := intstr.FromInt(80)
+		port := intstr.FromInt32(80)
 		np := networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test.policy",
 				Namespace: "default",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: networkingv1.NetworkPolicySpec{
 				PodSelector: metav1.LabelSelector{},
@@ -3025,7 +3205,6 @@ var _ = Describe("Test NetworkPolicy conversion (k8s <= 1.7, no policyTypes)", f
 })
 
 var _ = Describe("Test Namespace conversion", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
@@ -3038,6 +3217,7 @@ var _ = Describe("Test Namespace conversion", func() {
 					"roger": "rabbit",
 				},
 				Annotations: map[string]string{},
+				UID:         types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: kapiv1.NamespaceSpec{},
 		}
@@ -3070,6 +3250,7 @@ var _ = Describe("Test Namespace conversion", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        "default",
 				Annotations: map[string]string{},
+				UID:         types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: kapiv1.NamespaceSpec{},
 		}
@@ -3100,6 +3281,7 @@ var _ = Describe("Test Namespace conversion", func() {
 				Annotations: map[string]string{
 					"net.beta.kubernetes.io/network-policy": "{\"ingress\": {\"isolation\": \"DefaultDeny\"}}",
 				},
+				UID: types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: kapiv1.NamespaceSpec{},
 		}
@@ -3116,7 +3298,6 @@ var _ = Describe("Test Namespace conversion", func() {
 		// Ensure both inbound and outbound rules are set to allow.
 		Expect(Ingress[0]).To(Equal(apiv3.Rule{Action: apiv3.Allow}))
 		Expect(Egress[0]).To(Equal(apiv3.Rule{Action: apiv3.Allow}))
-
 	})
 
 	It("should not fail for malformed annotation", func() {
@@ -3126,6 +3307,7 @@ var _ = Describe("Test Namespace conversion", func() {
 				Annotations: map[string]string{
 					"net.beta.kubernetes.io/network-policy": "invalidJSON",
 				},
+				UID: types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: kapiv1.NamespaceSpec{},
 		}
@@ -3136,6 +3318,23 @@ var _ = Describe("Test Namespace conversion", func() {
 		})
 	})
 
+	It("should generate a deterministic UID for a Namespace Profile", func() {
+		ns := kapiv1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "default",
+				UID:  types.UID("30316465-6365-4463-ad63-3564622d3638"),
+			},
+			Spec: kapiv1.NamespaceSpec{},
+		}
+
+		p, err := c.NamespaceToProfile(&ns)
+		Expect(err).NotTo(HaveOccurred())
+		p2, err := c.NamespaceToProfile(&ns)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(p.UID).To(Equal(p2.UID))
+		Expect(p.UID).NotTo(Equal(ns.UID))
+	})
+
 	It("should handle a valid but not DefaultDeny annotation", func() {
 		ns := kapiv1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
@@ -3143,6 +3342,7 @@ var _ = Describe("Test Namespace conversion", func() {
 				Annotations: map[string]string{
 					"net.beta.kubernetes.io/network-policy": "{}",
 				},
+				UID: types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 			Spec: kapiv1.NamespaceSpec{},
 		}
@@ -3169,7 +3369,6 @@ var _ = Describe("Test Namespace conversion", func() {
 })
 
 var _ = Describe("Test ServiceAccount conversion", func() {
-
 	// Use a single instance of the Converter for these tests.
 	c := NewConverter()
 
@@ -3182,6 +3381,7 @@ var _ = Describe("Test ServiceAccount conversion", func() {
 					"roger": "rabbit",
 				},
 				Annotations: map[string]string{},
+				UID:         types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 		}
 
@@ -3204,12 +3404,29 @@ var _ = Describe("Test ServiceAccount conversion", func() {
 		Expect(labels["pcsa.roger"]).To(Equal("rabbit"))
 	})
 
+	It("should generate a deterministic UID for a ServiceAccount Profile", func() {
+		sa := kapiv1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sa-test",
+				Namespace: "test",
+				UID:       types.UID("30316465-6365-4463-ad63-3564622d3638"),
+			},
+		}
+		p, err := c.ServiceAccountToProfile(&sa)
+		Expect(err).NotTo(HaveOccurred())
+		p2, err := c.ServiceAccountToProfile(&sa)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(p.UID).To(Equal(p2.UID))
+		Expect(p.UID).NotTo(Equal(sa.UID))
+	})
+
 	It("should parse a ServiceAccount in Namespace to a Profile", func() {
 		sa := kapiv1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        "sa-test",
 				Namespace:   "test",
 				Annotations: map[string]string{},
+				UID:         types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 		}
 
@@ -3224,6 +3441,7 @@ var _ = Describe("Test ServiceAccount conversion", func() {
 		sa := kapiv1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "sa-test",
+				UID:  types.UID("30316465-6365-4463-ad63-3564622d3638"),
 			},
 		}
 

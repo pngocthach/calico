@@ -67,23 +67,31 @@ func (d *linuxDataplane) DoNetworking(
 
 	d.logger.Infof("Setting the host side veth name to %s", hostVethName)
 
+	hostNlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create host netlink handle: %v", err)
+	}
+
+	defer hostNlHandle.Close()
+
 	// Clean up if hostVeth exists.
-	if oldHostVeth, err := netlink.LinkByName(hostVethName); err == nil {
-		if err = netlink.LinkDel(oldHostVeth); err != nil {
+	if oldHostVeth, err := hostNlHandle.LinkByName(hostVethName); err == nil {
+		if err = hostNlHandle.LinkDel(oldHostVeth); err != nil {
 			return "", "", fmt.Errorf("failed to delete old hostVeth %v: %v", hostVethName, err)
 		}
 		d.logger.Infof("Cleaning old hostVeth: %v", hostVethName)
 	}
 
 	err = ns.WithNetNSPath(args.Netns, func(hostNS ns.NetNS) error {
+		la := netlink.NewLinkAttrs()
+		la.Name = contVethName
+		la.MTU = d.mtu
+		la.NumTxQueues = d.queues
+		la.NumRxQueues = d.queues
 		veth := &netlink.Veth{
-			LinkAttrs: netlink.LinkAttrs{
-				Name:        contVethName,
-				MTU:         d.mtu,
-				NumTxQueues: d.queues,
-				NumRxQueues: d.queues,
-			},
-			PeerName: hostVethName,
+			LinkAttrs:     la,
+			PeerName:      hostVethName,
+			PeerNamespace: netlink.NsFd(int(hostNS.Fd())),
 		}
 
 		if err := netlink.LinkAdd(veth); err != nil {
@@ -91,7 +99,7 @@ func (d *linuxDataplane) DoNetworking(
 			return err
 		}
 
-		hostVeth, err := netlink.LinkByName(hostVethName)
+		hostVeth, err := hostNlHandle.LinkByName(hostVethName)
 		if err != nil {
 			err = fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
 			return err
@@ -102,7 +110,7 @@ func (d *linuxDataplane) DoNetworking(
 		} else {
 			// Set the MAC address on the host side interface so the kernel does not
 			// have to generate a persistent address which fails some times.
-			if err = netlink.LinkSetHardwareAddr(hostVeth, mac); err != nil {
+			if err = hostNlHandle.LinkSetHardwareAddr(hostVeth, mac); err != nil {
 				d.logger.Warnf("failed to Set MAC of %q: %v. Using kernel generated MAC.", hostVethName, err)
 			}
 		}
@@ -128,14 +136,23 @@ func (d *linuxDataplane) DoNetworking(
 			if err != nil {
 				return err
 			}
-			err = disableDAD(hostVethName)
+		}
+
+		err = hostNS.Do(func(_ ns.NetNS) error {
+			err := d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
 			if err != nil {
-				return err
+				return fmt.Errorf("error configuring sysctls for interface: %s, error: %w", hostVethName, err)
 			}
+
+			return nil
+		})
+
+		if err != nil {
+			return err
 		}
 
 		// Explicitly set the veth to UP state; the veth won't get a link local address unless it's set to UP state.
-		if err = netlink.LinkSetUp(hostVeth); err != nil {
+		if err = hostNlHandle.LinkSetUp(hostVeth); err != nil {
 			return fmt.Errorf("failed to set %q up: %w", hostVethName, err)
 		}
 
@@ -150,8 +167,28 @@ func (d *linuxDataplane) DoNetworking(
 			return fmt.Errorf("failed to set %q up: %w", contVethName, err)
 		}
 
-		// Fetch the MAC from the container Veth. This is needed by Calico.
-		contVethMAC = contVeth.Attrs().HardwareAddr.String()
+		// Check if there is an annotation requesting a specific fixed MAC address for the container Veth, otherwise
+		// use kernel-assigned MAC.
+		if requestedContVethMac, found := annotations["cni.projectcalico.org/hwAddr"]; found {
+			tmpContVethMAC, err := net.ParseMAC(requestedContVethMac)
+			if err != nil {
+				return fmt.Errorf("failed to parse MAC address %v provided via cni.projectcalico.org/hwAddr: %v",
+					requestedContVethMac, err)
+			}
+
+			err = netlink.LinkSetHardwareAddr(contVeth, tmpContVethMAC)
+			if err != nil {
+				return fmt.Errorf("failed to set container veth MAC to %v as requested via cni.projectcalico.org/hwAddr: %v",
+					requestedContVethMac, err)
+			}
+
+			contVethMAC = tmpContVethMAC.String()
+			d.logger.Infof("successfully configured container veth MAC to %v as requested via cni.projectcalico.org/hwAddr",
+				contVethMAC)
+		} else {
+			contVethMAC = contVeth.Attrs().HardwareAddr.String()
+		}
+
 		d.logger.WithField("MAC", contVethMAC).Debug("Found MAC for container veth")
 
 		// At this point, the virtual ethernet pair has been created, and both ends have the right names.
@@ -202,7 +239,7 @@ func (d *linuxDataplane) DoNetworking(
 				return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
 			}
 
-			// Retry several times as the LL can take a several micro/miliseconds to initialize and we may be too fast
+			// Retry several times as the LL can take a several micro/milliseconds to initialize and we may be too fast
 			// after these sysctls
 			var err error
 			var addresses []netlink.Addr
@@ -210,7 +247,7 @@ func (d *linuxDataplane) DoNetworking(
 				// No need to add a dummy next hop route as the host veth device will already have an IPv6
 				// link local address that can be used as a next hop.
 				// Just fetch the address of the host end of the veth and use it as the next hop.
-				addresses, err = netlink.AddrList(hostVeth, netlink.FAMILY_V6)
+				addresses, err = hostNlHandle.AddrList(hostVeth, netlink.FAMILY_V6)
 				if err != nil {
 					d.logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
 				}
@@ -258,12 +295,6 @@ func (d *linuxDataplane) DoNetworking(
 			return fmt.Errorf("error configuring sysctls for the container netns, error: %s", err)
 		}
 
-		// Now that the everything has been successfully set up in the container, move the "host" end of the
-		// veth into the host namespace.
-		if err = netlink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
-			return fmt.Errorf("failed to move veth to host netns: %v", err)
-		}
-
 		return nil
 	})
 
@@ -272,24 +303,13 @@ func (d *linuxDataplane) DoNetworking(
 		return "", "", err
 	}
 
-	err = d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
-	if err != nil {
-		return "", "", fmt.Errorf("error configuring sysctls for interface: %s, error: %s", hostVethName, err)
-	}
-
-	// Moving a veth between namespaces always leaves it in the "DOWN" state. Set it back to "UP" now that we're
-	// back in the host namespace.
-	hostVeth, err := netlink.LinkByName(hostVethName)
+	hostVeth, err := hostNlHandle.LinkByName(hostVethName)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
 	}
 
-	if err = netlink.LinkSetUp(hostVeth); err != nil {
-		return "", "", fmt.Errorf("failed to set %q up: %v", hostVethName, err)
-	}
-
-	// Now that the host side of the veth is moved, state set to UP, and configured with sysctls, we can add the routes to it in the host namespace.
-	err = SetupRoutes(hostVeth, result)
+	// Add the routes to host veth in the host namespace.
+	err = SetupRoutes(hostNlHandle, hostVeth, result)
 	if err != nil {
 		return "", "", fmt.Errorf("error adding host side routes for interface: %s, error: %s", hostVeth.Attrs().Name, err)
 	}
@@ -307,7 +327,7 @@ func disableDAD(contVethName string) error {
 }
 
 // SetupRoutes sets up the routes for the host side of the veth pair.
-func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
+func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cniv1.Result) error {
 
 	// Go through all the IPs and add routes for each IP in the result.
 	for _, ipAddr := range result.IPs {
@@ -316,7 +336,7 @@ func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
 			Scope:     netlink.SCOPE_LINK,
 			Dst:       &ipAddr.Address,
 		}
-		err := netlink.RouteAdd(&route)
+		err := hostNlHandle.RouteAdd(&route)
 
 		if err != nil {
 			switch err {
@@ -324,7 +344,7 @@ func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
 			// Route already exists, but not necessarily pointing to the same interface.
 			case syscall.EEXIST:
 				// List all the routes for the interface.
-				routes, err := netlink.RouteList(hostVeth, netlink.FAMILY_ALL)
+				routes, err := hostNlHandle.RouteList(hostVeth, netlink.FAMILY_ALL)
 				if err != nil {
 					return fmt.Errorf("error listing routes")
 				}
@@ -344,7 +364,7 @@ func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
 				}
 
 				// Search all routes and report the conflict, search the name of the iface
-				routes, err = netlink.RouteList(nil, netlink.FAMILY_ALL)
+				routes, err = hostNlHandle.RouteList(nil, netlink.FAMILY_ALL)
 				if err != nil {
 					return fmt.Errorf("error listing routes")
 				}
@@ -354,7 +374,7 @@ func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
 				for _, r := range routes {
 					if r.Dst != nil && r.Dst.IP.Equal(route.Dst.IP) {
 						linkName := "unknown"
-						if link, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
+						if link, err := hostNlHandle.LinkByIndex(r.LinkIndex); err == nil {
 							linkName = link.Attrs().Name
 						}
 
@@ -414,6 +434,12 @@ func (d *linuxDataplane) configureSysctls(hostVethName string, hasIPv4, hasIPv6 
 	}
 
 	if hasIPv6 {
+		// By default, the kernel does duplicate address detection for the IPv6 address. DAD delays use of the
+		// IP for up to a second and we don't need it because it's a point-to-point link.
+		if err := writeProcSys(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", hostVethName), "0"); err != nil {
+			return fmt.Errorf("failed to set net.ipv6.conf.%s.accept_dad=0: %s", hostVethName, err)
+		}
+
 		// Make sure ipv6 is enabled on the hostVeth interface in the host network namespace.
 		// Interfaces won't get a link local address without this sysctl set to 0.
 		if err = writeProcSys(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", hostVethName), "0"); err != nil {
@@ -492,42 +518,63 @@ func writeProcSys(path, value string) error {
 
 func (d *linuxDataplane) CleanUpNamespace(args *skel.CmdArgs) error {
 	// Only try to delete the device if a namespace was passed in.
-	if args.Netns != "" {
-		d.logger.WithFields(logrus.Fields{
-			"netns": args.Netns,
-			"iface": args.IfName,
-		}).Debug("Checking namespace & device exist.")
-		devErr := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-			_, err := netlink.LinkByName(args.IfName)
-			return err
-		})
+	logCtx := d.logger.WithFields(logrus.Fields{
+		"netns": args.Netns,
+		"iface": args.IfName,
+	})
+	if args.Netns == "" {
+		logCtx.Info("CleanUpNamespace called with no netns name, ignoring.")
+		return nil
+	}
 
-		if devErr == nil {
-			d.logger.Infof("Calico CNI deleting device in netns %s", args.Netns)
-			// Deleting the veth has been seen to hang on some kernel version. Timeout the command if it takes too long.
-			ch := make(chan error, 1)
+	logCtx.Info("Deleting workload's device in netns.")
 
-			go func() {
-				err := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-					return ip.DelLinkByName(args.IfName)
-				})
+	// We've seen veth deletion hang on some very old kernels so we do it from a background goroutine.
+	startTime := time.Now()
+	done := make(chan struct{})
 
-				ch <- err
-			}()
+	var nsErr, linkErr error
 
-			select {
-			case err := <-ch:
-				if err != nil {
-					return err
-				} else {
-					d.logger.Infof("Calico CNI deleted device in netns %s", args.Netns)
-				}
-			case <-time.After(5 * time.Second):
-				return fmt.Errorf("Calico CNI timed out deleting device in netns %s", args.Netns)
+	go func() {
+		defer close(done)
+		nsErr = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+			logCtx.Info("Entered netns, deleting veth.")
+			ifName := args.IfName
+			var iface netlink.Link
+			iface, linkErr = netlink.LinkByName(ifName)
+			if linkErr == nil {
+				linkErr = netlink.LinkDel(iface)
 			}
-		} else {
-			d.logger.WithField("ifName", args.IfName).Info("veth does not exist, no need to clean up.")
+
+			// Always return nil so that we can tell the difference between an error from WithNetNSPath itself
+			// and an error deleting the link.
+			return nil
+		})
+	}()
+
+	select {
+	case <-done:
+		if nsErr != nil {
+			if _, ok := nsErr.(ns.NSPathNotExistErr); ok {
+				logCtx.Info("Workload's netns already gone.  Nothing to do.")
+				return nil
+			}
+			logCtx.WithError(nsErr).Error("Failed to enter workloads netns.")
+			return fmt.Errorf("failed to enter netns: %w", nsErr)
 		}
+
+		if linkErr != nil {
+			if _, ok := linkErr.(netlink.LinkNotFoundError); ok {
+				logCtx.Info("Workload's veth was already gone.  Nothing to do.")
+				return nil
+			}
+			logCtx.WithError(linkErr).Error("Failed to clean up workload's veth.")
+			return fmt.Errorf("failed to clean up workload's veth inside netns: %w", linkErr)
+		}
+
+		logCtx.WithField("after", time.Since(startTime)).Infof("Deleted device in netns.")
+	case <-time.After(20 * time.Second):
+		return fmt.Errorf("timed out deleting device in netns %s", args.Netns)
 	}
 
 	return nil

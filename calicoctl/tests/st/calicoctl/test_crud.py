@@ -186,7 +186,7 @@ class TestCalicoctlCommands(TestBase):
         rc.assert_error()
         rc.assert_output_contains("Failed to get resources: resource type 'somekind' is not supported")
 
-    def test_empty_name_is_ilegal(self):
+    def test_empty_name_is_illegal(self):
         """
         Test that we error if empty name is provided
         """
@@ -1088,6 +1088,45 @@ class TestCalicoctlCommands(TestBase):
         rc.assert_output_contains("bp1")
         rc.assert_output_contains("global")
 
+    def test_bgp_ttl_security(self):
+        rc = calicoctl("create", data={
+            'apiVersion': API_VERSION,
+            'kind': 'BGPPeer',
+            'metadata': {
+                'name': 'gtsm-peers'
+            },
+            'spec': {
+                'node': 'somenode',
+                'ttlSecurity': 1,
+            }
+        })
+        rc.assert_no_error()
+
+        rc = calicoctl("get bgpp")
+        rc.assert_no_error()
+        rc.assert_output_contains("gtsm-peers")
+        rc.assert_output_not_contains("global")
+
+    def test_bgp_reachable_by(self):
+        rc = calicoctl("create", data={
+            'apiVersion': API_VERSION,
+            'kind': 'BGPPeer',
+            'metadata': {
+                'name': 'route-reflector'
+            },
+            'spec': {
+                'node': 'somenode',
+                'peerIP': '10.20.20.20',
+                'reachableBy': '10.10.10.10',
+            }
+        })
+        rc.assert_no_error()
+
+        rc = calicoctl("get bgpp")
+        rc.assert_no_error()
+        rc.assert_output_contains("route-reflector")
+        rc.assert_output_not_contains("global")
+
     def test_label_command(self):
         """
         Test calicoctl label command.
@@ -1139,7 +1178,7 @@ class TestCalicoctlCommands(TestBase):
         rc = calicoctl("apply",data=node_name1_rev1)
         rc.assert_no_error()
         rc = calicoctl("label nodes node1 cluster --remove")
-        rc.assert_error("can not remove label")
+        rc.assert_error("cannot remove label")
 
     def test_patch(self):
         """
@@ -1159,11 +1198,11 @@ class TestCalicoctlCommands(TestBase):
         self.assertEqual("192.168.0.1",node1_rev1['spec']['bgp']['routeReflectorClusterID'])
 
         # test patching an ippool
-        rc = calicoctl("create", data=ippool_name1_rev1_v4)
+        rc = calicoctl("create", data=ippool_name1_rev4_v4)
         rc.assert_no_error()
 
         rc = calicoctl(
-                "patch ippool %s -p '{\"spec\":{\"natOutgoing\": true}}'" % name(ippool_name1_rev1_v4))
+                "patch ippool %s -p '{\"spec\":{\"natOutgoing\": true}}'" % name(ippool_name1_rev4_v4))
         rc.assert_no_error()
 
         rc = calicoctl(
@@ -1171,6 +1210,9 @@ class TestCalicoctlCommands(TestBase):
         rc.assert_no_error()
         ippool1_rev1 = rc.decoded
         self.assertEqual(True,ippool1_rev1['spec']['natOutgoing'])
+        # Ensure that labels and annotations were merged properly
+        self.assertEqual('label-1',ippool1_rev1['metadata']['labels']['test-label'])
+        self.assertEqual('annotation-1',ippool1_rev1['metadata']['annotations']['test-annotation'])
 
         # test patching invalid networkpolicy
         rc = calicoctl('create', data=networkpolicy_name2_rev1)

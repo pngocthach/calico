@@ -24,64 +24,108 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/ip"
 )
 
-// struct calico_nat_v4_key {
-//    uint32_t prefixLen;
-//    uint32_t addr; // NBO
-//    uint16_t port; // HBO
-//    uint8_t protocol;
-//    uint32_t saddr;
-//    uint8_t pad;
-// };
+func init() {
+	maps.SetSize(FrontendMapParameters.VersionedName(), FrontendMapParameters.MaxEntries)
+	maps.SetSize(BackendMapParameters.VersionedName(), BackendMapParameters.MaxEntries)
+	maps.SetSize(AffinityMapParameters.VersionedName(), AffinityMapParameters.MaxEntries)
+	maps.SetSize(SendRecvMsgMapParameters.VersionedName(), SendRecvMsgMapParameters.MaxEntries)
+	maps.SetSize(CTNATsMapParameters.VersionedName(), CTNATsMapParameters.MaxEntries)
+
+	maps.SetSize(FrontendMapV6Parameters.VersionedName(), FrontendMapV6Parameters.MaxEntries)
+	maps.SetSize(BackendMapV6Parameters.VersionedName(), BackendMapV6Parameters.MaxEntries)
+	maps.SetSize(AffinityMapV6Parameters.VersionedName(), AffinityMapV6Parameters.MaxEntries)
+	maps.SetSize(SendRecvMsgMapV6Parameters.VersionedName(), SendRecvMsgMapV6Parameters.MaxEntries)
+	maps.SetSize(CTNATsMapV6Parameters.VersionedName(), CTNATsMapV6Parameters.MaxEntries)
+}
+
+func SetMapSizes(fsize, bsize, asize int) {
+	maps.SetSize(FrontendMapParameters.VersionedName(), fsize)
+	maps.SetSize(BackendMapParameters.VersionedName(), bsize)
+	maps.SetSize(AffinityMapParameters.VersionedName(), asize)
+
+	maps.SetSize(FrontendMapV6Parameters.VersionedName(), fsize)
+	maps.SetSize(BackendMapV6Parameters.VersionedName(), bsize)
+	maps.SetSize(AffinityMapV6Parameters.VersionedName(), asize)
+}
+
+//	struct calico_nat_v4_key {
+//	   uint32_t prefixLen;
+//	   uint32_t addr; // NBO
+//	   uint16_t port; // HBO
+//	   uint8_t protocol;
+//	   uint32_t saddr;
+//	   uint8_t pad;
+//	};
 const frontendKeySize = 16
 
-// struct calico_nat {
-//	uint32_t addr;
-//	uint16_t port;
-//	uint8_t  protocol;
-//	uint8_t  pad;
-// };
+//	struct calico_nat {
+//		uint32_t addr;
+//		uint16_t port;
+//		uint8_t  protocol;
+//		uint8_t  pad;
+//	};
 const frontendAffKeySize = 8
 
-// struct calico_nat_v4_value {
-//    uint32_t id;
-//    uint32_t count;
-//    uint32_t local;
-//    uint32_t affinity_timeo;
-//    uint32_t flags;
-// };
+//	struct calico_nat_v4_value {
+//	   uint32_t id;
+//	   uint32_t count;
+//	   uint32_t local;
+//	   uint32_t affinity_timeo;
+//	   uint32_t flags;
+//	};
 const frontendValueSize = 20
 
-// struct calico_nat_secondary_v4_key {
-//   uint32_t id;
-//   uint32_t ordinal;
-// };
+//	struct calico_nat_secondary_v4_key {
+//	  uint32_t id;
+//	  uint32_t ordinal;
+//	};
 const backendKeySize = 8
 
-// struct calico_nat_dest {
-//    uint32_t addr;
-//    uint16_t port;
-//    uint8_t pad[2];
-// };
+//	struct calico_nat_dest {
+//	   uint32_t addr;
+//	   uint16_t port;
+//	   uint8_t pad[2];
+//	};
 const backendValueSize = 8
 
 const BlackHoleCount uint32 = 0xffffffff
 
-//(sizeof(addr) + sizeof(port) + sizeof(proto)) in bits
+// (sizeof(addr) + sizeof(port) + sizeof(proto)) in bits
 const ZeroCIDRPrefixLen = 56
 
 var ZeroCIDR = ip.MustParseCIDROrIP("0.0.0.0/0").(ip.V4CIDR)
 
 type FrontendKey [frontendKeySize]byte
 
+type FrontendKeyInterface interface {
+	Proto() uint8
+	Addr() net.IP
+	Port() uint16
+	SrcPrefixLen() uint32
+	SrcCIDR() ip.CIDR
+	AffinityKeyCopy() FrontEndAffinityKeyInterface
+	String() string
+	AsBytes() []byte
+}
+
+type FrontendKeyComparable interface {
+	comparable
+	FrontendKeyInterface
+}
+
 func NewNATKey(addr net.IP, port uint16, protocol uint8) FrontendKey {
 	return NewNATKeySrc(addr, port, protocol, ZeroCIDR)
 }
 
-func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.V4CIDR) FrontendKey {
+func NewNATKeyIntf(addr net.IP, port uint16, protocol uint8) FrontendKeyInterface {
+	return NewNATKey(addr, port, protocol)
+}
+
+func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.CIDR) FrontendKey {
 	var k FrontendKey
 	prefixlen := ZeroCIDRPrefixLen
 	addr = addr.To4()
@@ -94,6 +138,10 @@ func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.V4CIDR) Fron
 	k[10] = protocol
 	copy(k[11:15], cidr.Addr().AsNetIP().To4())
 	return k
+}
+
+func NewNATKeySrcIntf(addr net.IP, port uint16, protocol uint8, cidr ip.CIDR) FrontendKeyInterface {
+	return NewNATKeySrc(addr, port, protocol, cidr)
 }
 
 func (k FrontendKey) Proto() uint8 {
@@ -135,18 +183,32 @@ func (k FrontendKey) Affinitykey() []byte {
 	return k[4:12]
 }
 
+func (k FrontendKey) AffinityKeyCopy() FrontEndAffinityKeyInterface {
+	var affkey FrontEndAffinityKey
+	copy(affkey[:], k.Affinitykey())
+	return affkey
+}
+
 func (k FrontendKey) String() string {
 	return fmt.Sprintf("NATKey{Proto:%v Addr:%v Port:%v SrcAddr:%v}", k.Proto(), k.Addr(), k.Port(), k.SrcCIDR())
+}
+
+func FrontendKeyFromBytes(b []byte) FrontendKeyInterface {
+	var k FrontendKey
+	copy(k[:], b)
+	return k
 }
 
 const (
 	NATFlgExternalLocal = 0x1
 	NATFlgInternalLocal = 0x2
+	NATFlgExclude       = 0x4
 )
 
 var flgTostr = map[int]string{
 	NATFlgExternalLocal: "external-local",
 	NATFlgInternalLocal: "internal-local",
+	NATFlgExclude:       "nat-exclude",
 }
 
 type FrontendValue [frontendValueSize]byte
@@ -195,12 +257,16 @@ func (v FrontendValue) FlagsAsString() string {
 		flg := uint32(1 << i)
 		if flgs&flg != 0 {
 			fstr += flgTostr[int(flg)]
+			fstr += ", "
 		}
 		flgs &= ^flg
 		if flgs == 0 {
 			break
 		}
-		fstr += ", "
+	}
+
+	if fstr != "" {
+		return fstr[:len(fstr)-2]
 	}
 
 	return fstr
@@ -213,6 +279,12 @@ func (v FrontendValue) String() string {
 
 func (v FrontendValue) AsBytes() []byte {
 	return v[:]
+}
+
+func FrontendValueFromBytes(b []byte) FrontendValue {
+	var v FrontendValue
+	copy(v[:], b)
+	return v
 }
 
 type BackendKey [backendKeySize]byte
@@ -240,7 +312,20 @@ func (k BackendKey) AsBytes() []byte {
 	return k[:]
 }
 
+func BackendKeyFromBytes(b []byte) BackendKey {
+	var k BackendKey
+	copy(k[:], b)
+	return k
+}
+
 type BackendValue [backendValueSize]byte
+
+type BackendValueInterface interface {
+	Addr() net.IP
+	Port() uint16
+	String() string
+	AsBytes() []byte
+}
 
 func NewNATBackendValue(addr net.IP, port uint16) BackendValue {
 	var k BackendValue
@@ -251,6 +336,10 @@ func NewNATBackendValue(addr net.IP, port uint16) BackendValue {
 	copy(k[:4], addr)
 	binary.LittleEndian.PutUint16(k[4:6], port)
 	return k
+}
+
+func NewNATBackendValueIntf(addr net.IP, port uint16) BackendValueInterface {
+	return NewNATBackendValue(addr, port)
 }
 
 func (k BackendValue) Addr() net.IP {
@@ -269,8 +358,13 @@ func (k BackendValue) AsBytes() []byte {
 	return k[:]
 }
 
-var FrontendMapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_nat_fe",
+func BackendValueFromBytes(b []byte) BackendValueInterface {
+	var v BackendValue
+	copy(v[:], b)
+	return v
+}
+
+var FrontendMapParameters = maps.MapParameters{
 	Type:       "lpm_trie",
 	KeySize:    frontendKeySize,
 	ValueSize:  frontendValueSize,
@@ -280,12 +374,11 @@ var FrontendMapParameters = bpf.MapParameters{
 	Version:    3,
 }
 
-func FrontendMap(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(FrontendMapParameters)
+func FrontendMap() maps.MapWithExistsCheck {
+	return maps.NewPinnedMap(FrontendMapParameters)
 }
 
-var BackendMapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_nat_be",
+var BackendMapParameters = maps.MapParameters{
 	Type:       "hash",
 	KeySize:    backendKeySize,
 	ValueSize:  backendValueSize,
@@ -294,8 +387,8 @@ var BackendMapParameters = bpf.MapParameters{
 	Flags:      unix.BPF_F_NO_PREALLOC,
 }
 
-func BackendMap(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(BackendMapParameters)
+func BackendMap() maps.MapWithExistsCheck {
+	return maps.NewPinnedMap(BackendMapParameters)
 }
 
 // NATMapMem represents FrontendMap loaded into memory
@@ -318,14 +411,19 @@ func (m MapMem) Equal(cmp MapMem) bool {
 }
 
 // LoadFrontendMap loads the NAT map into a go map or returns an error
-func LoadFrontendMap(m bpf.Map) (MapMem, error) {
+func LoadFrontendMap(m maps.Map) (MapMem, error) {
 	ret := make(MapMem)
 
 	if err := m.Open(); err != nil {
 		return nil, err
 	}
 
-	err := m.Iter(MapMemIter(ret))
+	iterFn := MapMemIter(ret)
+
+	err := m.Iter(func(k, v []byte) maps.IteratorAction {
+		iterFn(k, v)
+		return maps.IterNone
+	})
 	if err != nil {
 		ret = nil
 	}
@@ -333,12 +431,12 @@ func LoadFrontendMap(m bpf.Map) (MapMem, error) {
 	return ret, err
 }
 
-// MapMemIter returns bpf.MapIter that loads the provided NATMapMem
-func MapMemIter(m MapMem) bpf.IterCallback {
+// MapMemIter returns maps.MapIter that loads the provided NATMapMem
+func MapMemIter(m MapMem) func(k, v []byte) {
 	ks := len(FrontendKey{})
 	vs := len(FrontendValue{})
 
-	return func(k, v []byte) bpf.IteratorAction {
+	return func(k, v []byte) {
 		var key FrontendKey
 		copy(key[:ks], k[:ks])
 
@@ -346,7 +444,6 @@ func MapMemIter(m MapMem) bpf.IterCallback {
 		copy(val[:vs], v[:vs])
 
 		m[key] = val
-		return bpf.IterNone
 	}
 }
 
@@ -370,14 +467,19 @@ func (m BackendMapMem) Equal(cmp BackendMapMem) bool {
 }
 
 // LoadBackendMap loads the NATBackend map into a go map or returns an error
-func LoadBackendMap(m bpf.Map) (BackendMapMem, error) {
+func LoadBackendMap(m maps.Map) (BackendMapMem, error) {
 	ret := make(BackendMapMem)
 
 	if err := m.Open(); err != nil {
 		return nil, err
 	}
 
-	err := m.Iter(BackendMapMemIter(ret))
+	iterFn := BackendMapMemIter(ret)
+
+	err := m.Iter(func(k, v []byte) maps.IteratorAction {
+		iterFn(k, v)
+		return maps.IterNone
+	})
 	if err != nil {
 		ret = nil
 	}
@@ -385,12 +487,12 @@ func LoadBackendMap(m bpf.Map) (BackendMapMem, error) {
 	return ret, err
 }
 
-// BackendMapMemIter returns bpf.MapIter that loads the provided NATBackendMapMem
-func BackendMapMemIter(m BackendMapMem) bpf.IterCallback {
+// BackendMapMemIter returns maps.MapIter that loads the provided NATBackendMapMem
+func BackendMapMemIter(m BackendMapMem) func(k, v []byte) {
 	ks := len(BackendKey{})
 	vs := len(BackendValue{})
 
-	return func(k, v []byte) bpf.IteratorAction {
+	return func(k, v []byte) {
 		var key BackendKey
 		copy(key[:ks], k[:ks])
 
@@ -398,7 +500,6 @@ func BackendMapMemIter(m BackendMapMem) bpf.IterCallback {
 		copy(val[:vs], v[:vs])
 
 		m[key] = val
-		return bpf.IterNone
 	}
 }
 
@@ -414,7 +515,21 @@ const affinityKeySize = frontendAffKeySize + 8
 // the client's IP
 type AffinityKey [affinityKeySize]byte
 
+type AffinityKeyInterface interface {
+	ClientIP() net.IP
+	FrontendAffinityKey() FrontEndAffinityKeyInterface
+	String() string
+	AsBytes() []byte
+}
+
 type FrontEndAffinityKey [frontendAffKeySize]byte
+
+type FrontEndAffinityKeyInterface interface {
+	Proto() uint8
+	Addr() net.IP
+	Port() uint16
+	AsBytes() []byte
+}
 
 func (k FrontEndAffinityKey) AsBytes() []byte {
 	return k[:]
@@ -456,7 +571,7 @@ func (k AffinityKey) ClientIP() net.IP {
 }
 
 // FrontendKey returns the FrontendKey part of the key
-func (k AffinityKey) FrontendAffinityKey() FrontEndAffinityKey {
+func (k AffinityKey) FrontendAffinityKey() FrontEndAffinityKeyInterface {
 	var f FrontEndAffinityKey
 	copy(f[:], k[:frontendAffKeySize])
 
@@ -472,6 +587,16 @@ func (k AffinityKey) AsBytes() []byte {
 	return k[:]
 }
 
+func AffinityKeyFromBytes(b []byte) AffinityKey {
+	var v AffinityKey
+	copy(v[:], b)
+	return v
+}
+
+func AffinityKeyIntfFromBytes(b []byte) AffinityKeyInterface {
+	return AffinityKeyFromBytes(b)
+}
+
 // struct calico_nat_v4_affinity_val {
 //    struct calico_nat_dest;
 //    uint64_t ts;
@@ -482,6 +607,11 @@ const affinityValueSize = backendValueSize + 8
 // AffinityValue represents a backend picked by the affinity and the timestamp
 // of its creating
 type AffinityValue [affinityValueSize]byte
+
+type AffinityValueInterface interface {
+	Timestamp() time.Duration
+	Backend() BackendValueInterface
+}
 
 // NewAffinityValue creates a value from a timestamp and a backend
 func NewAffinityValue(ts uint64, backend BackendValue) AffinityValue {
@@ -503,7 +633,7 @@ func (v AffinityValue) Timestamp() time.Duration {
 }
 
 // Backend returns the backend the affinity ties the frontend + client to.
-func (v AffinityValue) Backend() BackendValue {
+func (v AffinityValue) Backend() BackendValueInterface {
 	var b BackendValue
 
 	copy(b[:], v[:backendValueSize])
@@ -520,9 +650,18 @@ func (v AffinityValue) AsBytes() []byte {
 	return v[:]
 }
 
+func AffinityValueFromBytes(b []byte) AffinityValue {
+	var v AffinityValue
+	copy(v[:], b)
+	return v
+}
+
+func AffinityValueIntfFromBytes(b []byte) AffinityValueInterface {
+	return AffinityValueFromBytes(b)
+}
+
 // AffinityMapParameters describe the AffinityMap
-var AffinityMapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_nat_aff",
+var AffinityMapParameters = maps.MapParameters{
 	Type:       "lru_hash",
 	KeySize:    affinityKeySize,
 	ValueSize:  affinityValueSize,
@@ -531,22 +670,27 @@ var AffinityMapParameters = bpf.MapParameters{
 }
 
 // AffinityMap returns an instance of an affinity map
-func AffinityMap(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(AffinityMapParameters)
+func AffinityMap() maps.Map {
+	return maps.NewPinnedMap(AffinityMapParameters)
 }
 
 // AffinityMapMem represents affinity map in memory
 type AffinityMapMem map[AffinityKey]AffinityValue
 
 // LoadAffinityMap loads affinity map into memory
-func LoadAffinityMap(m bpf.Map) (AffinityMapMem, error) {
+func LoadAffinityMap(m maps.Map) (AffinityMapMem, error) {
 	ret := make(AffinityMapMem)
 
 	if err := m.Open(); err != nil {
 		return nil, err
 	}
 
-	err := m.Iter(AffinityMapMemIter(ret))
+	iterFn := AffinityMapMemIter(ret)
+
+	err := m.Iter(func(k, v []byte) maps.IteratorAction {
+		iterFn(k, v)
+		return maps.IterNone
+	})
 	if err != nil {
 		ret = nil
 	}
@@ -554,12 +698,12 @@ func LoadAffinityMap(m bpf.Map) (AffinityMapMem, error) {
 	return ret, err
 }
 
-// AffinityMapMemIter returns bpf.MapIter that loads the provided AffinityMapMem
-func AffinityMapMemIter(m AffinityMapMem) bpf.IterCallback {
+// AffinityMapMemIter returns maps.MapIter that loads the provided AffinityMapMem
+func AffinityMapMemIter(m AffinityMapMem) func(k, v []byte) {
 	ks := len(AffinityKey{})
 	vs := len(AffinityValue{})
 
-	return func(k, v []byte) bpf.IteratorAction {
+	return func(k, v []byte) {
 		var key AffinityKey
 		copy(key[:ks], k[:ks])
 
@@ -567,7 +711,6 @@ func AffinityMapMemIter(m AffinityMapMem) bpf.IterCallback {
 		copy(val[:vs], v[:vs])
 
 		m[key] = val
-		return bpf.IterNone
 	}
 }
 
@@ -599,7 +742,7 @@ func (k SendRecvMsgKey) IP() net.IP {
 	return k[8:12]
 }
 
-// Port returns port converted to 16-bit host endianess
+// Port returns port converted to 16-bit host endianness
 func (k SendRecvMsgKey) Port() uint16 {
 	port := binary.BigEndian.Uint32(k[12:16])
 	return uint16(port >> 16)
@@ -619,7 +762,7 @@ func (v SendRecvMsgValue) IP() net.IP {
 	return v[0:4]
 }
 
-// Port returns port converted to 16-bit host endianess
+// Port returns port converted to 16-bit host endianness
 func (v SendRecvMsgValue) Port() uint16 {
 	port := binary.BigEndian.Uint32(v[4:8])
 	return uint16(port >> 16)
@@ -630,8 +773,7 @@ func (v SendRecvMsgValue) String() string {
 }
 
 // SendRecvMsgMapParameters define SendRecvMsgMap
-var SendRecvMsgMapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_srmsg",
+var SendRecvMsgMapParameters = maps.MapParameters{
 	Type:       "lru_hash",
 	KeySize:    sendRecvMsgKeySize,
 	ValueSize:  sendRecvMsgValueSize,
@@ -639,8 +781,7 @@ var SendRecvMsgMapParameters = bpf.MapParameters{
 	Name:       "cali_v4_srmsg",
 }
 
-var CTNATsMapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_ct_nats",
+var CTNATsMapParameters = maps.MapParameters{
 	Type:       "lru_hash",
 	KeySize:    ctNATsMsgKeySize,
 	ValueSize:  sendRecvMsgValueSize,
@@ -650,22 +791,27 @@ var CTNATsMapParameters = bpf.MapParameters{
 
 // SendRecvMsgMap tracks reverse translations for sendmsg/recvmsg of
 // unconnected UDP
-func SendRecvMsgMap(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(SendRecvMsgMapParameters)
+func SendRecvMsgMap() maps.Map {
+	return maps.NewPinnedMap(SendRecvMsgMapParameters)
 }
 
-func AllNATsMsgMap(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(CTNATsMapParameters)
+func AllNATsMsgMap() maps.Map {
+	return maps.NewPinnedMap(CTNATsMapParameters)
 }
 
 // SendRecvMsgMapMem represents affinity map in memory
 type SendRecvMsgMapMem map[SendRecvMsgKey]SendRecvMsgValue
 
 // LoadSendRecvMsgMap loads affinity map into memory
-func LoadSendRecvMsgMap(m bpf.Map) (SendRecvMsgMapMem, error) {
+func LoadSendRecvMsgMap(m maps.Map) (SendRecvMsgMapMem, error) {
 	ret := make(SendRecvMsgMapMem)
 
-	err := m.Iter(SendRecvMsgMapMemIter(ret))
+	iterFn := SendRecvMsgMapMemIter(ret)
+
+	err := m.Iter(func(k, v []byte) maps.IteratorAction {
+		iterFn(k, v)
+		return maps.IterNone
+	})
 	if err != nil {
 		ret = nil
 	}
@@ -673,12 +819,12 @@ func LoadSendRecvMsgMap(m bpf.Map) (SendRecvMsgMapMem, error) {
 	return ret, err
 }
 
-// SendRecvMsgMapMemIter returns bpf.MapIter that loads the provided SendRecvMsgMapMem
-func SendRecvMsgMapMemIter(m SendRecvMsgMapMem) bpf.IterCallback {
+// SendRecvMsgMapMemIter returns maps.MapIter that loads the provided SendRecvMsgMapMem
+func SendRecvMsgMapMemIter(m SendRecvMsgMapMem) func(k, v []byte) {
 	ks := len(SendRecvMsgKey{})
 	vs := len(SendRecvMsgValue{})
 
-	return func(k, v []byte) bpf.IteratorAction {
+	return func(k, v []byte) {
 		var key SendRecvMsgKey
 		copy(key[:ks], k[:ks])
 
@@ -686,6 +832,5 @@ func SendRecvMsgMapMemIter(m SendRecvMsgMapMem) bpf.IterCallback {
 		copy(val[:vs], v[:vs])
 
 		m[key] = val
-		return bpf.IterNone
 	}
 }

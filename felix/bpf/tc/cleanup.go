@@ -26,6 +26,7 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 
 	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
 )
 
 // CleanUpProgramsAndPins makes a best effort to remove all our TC BPF programs.
@@ -47,15 +48,16 @@ func CleanUpProgramsAndPins() {
 			"Failed to parse bpftool output.  Assuming BPF not supported/nothing to clean up.")
 		return
 	}
-	calicoMapIDs := set.New()
+	calicoMapIDs := set.New[int]()
 	for _, m := range maps {
-		if strings.HasPrefix(m.Name, "cali_") || strings.HasPrefix(m.Name, "calico_") {
+		if strings.HasPrefix(m.Name, "cali_") || strings.HasPrefix(m.Name, "calico_") ||
+			strings.HasPrefix(m.Name, "xdp_cali_") {
 			log.WithField("name", m.Name).Debug("Found calico map")
 			calicoMapIDs.Add(m.ID)
 		}
 	}
 
-	calicoProgIDs := set.New()
+	calicoProgIDs := set.New[int]()
 	if calicoMapIDs.Len() > 0 {
 		// Have some calico maps, search for calico programs.
 		bpftool := exec.Command("bpftool", "prog", "list", "--json")
@@ -92,7 +94,7 @@ func CleanUpProgramsAndPins() {
 
 	// Find all the interfaces with a clsact qdisc and examine the attached filters to see if any belong to
 	// us.
-	calicoIfaces := set.New()
+	calicoIfaces := set.New[string]()
 	for _, iface := range ifacesWithClsact() {
 		for _, dir := range []string{"ingress", "egress"} {
 			tc := exec.Command("tc", "filter", "show", dir, "dev", iface)
@@ -109,8 +111,7 @@ func CleanUpProgramsAndPins() {
 		}
 	}
 
-	calicoIfaces.Iter(func(item interface{}) error {
-		iface := item.(string)
+	calicoIfaces.Iter(func(iface string) error {
 		cmd := exec.Command("tc", "qdisc", "del", "dev", iface, "clsact")
 		err = cmd.Run()
 		if err != nil {
@@ -120,7 +121,7 @@ func CleanUpProgramsAndPins() {
 		return nil
 	})
 
-	bpf.CleanUpCalicoPins("/sys/fs/bpf/tc")
+	bpf.CleanUpCalicoPins(bpfdefs.DefaultBPFfsPath)
 }
 
 var tcFiltRegex = regexp.MustCompile(`filter .*? bpf .*? id (\d+)`)

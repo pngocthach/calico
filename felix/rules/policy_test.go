@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -275,7 +275,7 @@ var _ = Describe("Protobuf rule to iptables rule conversion", func() {
 	)
 
 	DescribeTable(
-		"Deny rules should be correctly rendered",
+		"Deny (DROP) rules should be correctly rendered",
 		func(ipVer int, in proto.Rule, expMatch string) {
 			renderer := NewRenderer(rrConfigNormal)
 			denyRule := in
@@ -285,6 +285,23 @@ var _ = Describe("Protobuf rule to iptables rule conversion", func() {
 			Expect(len(rules)).To(Equal(1))
 			Expect(rules[0].Match.Render()).To(Equal(expMatch))
 			Expect(rules[0].Action).To(Equal(iptables.DropAction{}))
+		},
+		ruleTestData...,
+	)
+
+	DescribeTable(
+		"Deny (REJECT) rules should be correctly rendered",
+		func(ipVer int, in proto.Rule, expMatch string) {
+			rrConfigReject := rrConfigNormal
+			rrConfigReject.IptablesFilterDenyAction = "REJECT"
+			renderer := NewRenderer(rrConfigReject)
+			denyRule := in
+			denyRule.Action = "deny"
+			rules := renderer.ProtoRuleToIptablesRules(&denyRule, uint8(ipVer))
+			// For deny, should be one match rule that just does the REJECT.
+			Expect(len(rules)).To(Equal(1))
+			Expect(rules[0].Match.Render()).To(Equal(expMatch))
+			Expect(rules[0].Action).To(Equal(iptables.RejectAction{}))
 		},
 		ruleTestData...,
 	)
@@ -789,7 +806,7 @@ var _ = Describe("Protobuf rule to iptables rule conversion", func() {
 			"-A test -m set --match-set cali40ipset-2 dst,dst --jump MARK --set-mark 0x400/0x400",
 			allBlocksPassAndEqThisBlockPassRule,
 
-			// Positive sroiuce CIDRs.
+			// Positive source CIDRs.
 			"-A test --source 10.1.0.0/16 --jump MARK --set-mark 0x400/0x400",
 			"-A test --source 11.0.0.0/8 --jump MARK --set-mark 0x400/0x400",
 			allBlocksPassAndEqThisBlockPassRule,
@@ -1086,10 +1103,6 @@ var _ = Describe("rule metadata tests", func() {
 							"Policy long-policy-name-that-gets-hashed ingress",
 						},
 					},
-					{
-						Match:  iptables.Match().MarkSingleBitSet(0x80),
-						Action: iptables.ReturnAction{},
-					},
 				},
 			},
 			&iptables.Chain{
@@ -1125,10 +1138,6 @@ var _ = Describe("rule metadata tests", func() {
 						Comment: []string{
 							"Profile long-policy-name-that-gets-hashed ingress",
 						},
-					},
-					{
-						Match:  iptables.Match().MarkSingleBitSet(0x80),
-						Action: iptables.ReturnAction{},
 					},
 				},
 			},

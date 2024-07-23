@@ -1,4 +1,4 @@
-#!/bin/bash -ex
+#!/bin/bash -e
 
 REPO_NAME=${REPO_NAME:-master}
 test -n "$SECRET_KEY"
@@ -17,9 +17,9 @@ else
     # -ti to docker-run, and $SECRET_KEY must not require a pass phrase.
     interactive=
 fi
-docker run --rm ${interactive} -v ${rootdir}:/code -v ${keydir}:/keydir -w /code/hack/release/packaging/output calico-build/bionic /bin/sh -c "gpg --import --batch < /keydir/key && debsign -k'*@' *_*_source.changes"
+docker run --rm ${interactive} -v ${rootdir}:/code -v ${keydir}:/keydir -w /code/hack/release/packaging/output calico-build/focal /bin/sh -c "gpg --import --batch < /keydir/key && debsign -k'*@' --re-sign *_*_source.changes"
 
-for series in trusty xenial bionic focal; do
+for series in focal jammy; do
     # Get the packages and versions that already exist in the PPA, so we can avoid
     # uploading the same package and version as already exist.  (As they would be rejected
     # anyway by Launchpad.)
@@ -38,6 +38,6 @@ for series in trusty xenial bionic focal; do
                 break
             fi
         done
-        ${already_exists} || docker run --rm -v ${rootdir}:/code -w /code calico-build/${series} dput -u ppa:project-calico/${REPO_NAME} ${changes_file}
+        ${already_exists} || docker run --rm -v ${rootdir}:/code -w /code/hack/release/packaging/output calico-build/${series} dput -u ppa:project-calico/${REPO_NAME} ${changes_file} | ts "[upload $series]"
     done
 done

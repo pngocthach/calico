@@ -18,6 +18,8 @@ package calc_test
 // the model package.
 
 import (
+	log "github.com/sirupsen/logrus"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -295,6 +297,32 @@ var policy1_order20 = Policy{
 		{SrcSelector: bEpBSelector},
 	},
 	Types: []string{"ingress", "egress"},
+}
+
+var policy1_order20_always = Policy{
+	Order:    &order20,
+	Selector: "a == 'a'",
+	InboundRules: []Rule{
+		{SrcSelector: allSelector},
+	},
+	OutboundRules: []Rule{
+		{SrcSelector: bEpBSelector},
+	},
+	Types:            []string{"ingress", "egress"},
+	PerformanceHints: []v3.PolicyPerformanceHint{v3.PerfHintAssumeNeededOnEveryNode},
+}
+
+var policy1_order20_ondemand = Policy{
+	Order:    &order20,
+	Selector: "a == 'a'",
+	InboundRules: []Rule{
+		{SrcSelector: allSelector},
+	},
+	OutboundRules: []Rule{
+		{SrcSelector: bEpBSelector},
+	},
+	Types:            []string{"ingress", "egress"},
+	PerformanceHints: []v3.PolicyPerformanceHint{v3.PerfHintAssumeNeededOnEveryNode},
 }
 
 var protoTCP = numorstring.ProtocolFromStringV1("tcp")
@@ -623,6 +651,7 @@ var localHostIP = mustParseIP("192.168.0.1")
 var remoteHostIP = mustParseIP("192.168.0.2")
 var remoteHostIPv6 = mustParseIP("dead:beef:0001::2")
 var remoteHost2IP = mustParseIP("192.168.0.3")
+var remoteHost2IPv6 = mustParseIP("dead:beef:0001::3")
 
 var localHostIPWithPrefix = "192.168.0.1/24"
 var remoteHostIPWithPrefix = "192.168.0.2/24"
@@ -726,7 +755,7 @@ var remoteIPAMSlash32BlockKey = BlockKey{
 }
 
 var remotev6IPAMBlockKey = BlockKey{
-	CIDR: mustParseNet("feed:beef:0001::/96"),
+	CIDR: mustParseNet("feed:beef:0:0:1::/96"),
 }
 
 var localIPAMBlockKey = BlockKey{
@@ -749,7 +778,7 @@ var remoteIPAMBlockSlash32 = AllocationBlock{
 	Unallocated: []int{0},
 }
 var remotev6IPAMBlock = AllocationBlock{
-	CIDR:        mustParseNet("feed:beef:0001::/96"),
+	CIDR:        mustParseNet("feed:beef:0:0:1::/96"),
 	Affinity:    &remoteHostAffinity,
 	Allocations: make([]*int, 8),
 	Unallocated: []int{0, 1, 2, 3, 4, 5, 6, 7},
@@ -832,6 +861,7 @@ var localIPAMBlockWithBorrows = AllocationBlock{
 var p = int32(80)
 var tcp = v1.ProtocolTCP
 var endpointSliceKey1 = model.ResourceKey{Name: "eps", Namespace: "default", Kind: "KubernetesEndpointSlice"}
+var endpointSliceKey2 = model.ResourceKey{Name: "eps-2", Namespace: "default", Kind: "KubernetesEndpointSlice"}
 var endpointSlice1 = discovery.EndpointSlice{
 	ObjectMeta: metav1.ObjectMeta{Name: "eps", Namespace: "default", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
 	Endpoints: []discovery.Endpoint{
@@ -841,7 +871,41 @@ var endpointSlice1 = discovery.EndpointSlice{
 		{Port: &p, Protocol: &tcp},
 	},
 }
+var endpointSlice1NewIPs = discovery.EndpointSlice{
+	ObjectMeta: metav1.ObjectMeta{Name: "eps", Namespace: "default", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+	Endpoints: []discovery.Endpoint{
+		{Addresses: []string{"10.0.0.1"}},
+		{Addresses: []string{"10.0.0.2"}},
+		{Addresses: []string{"10.0.0.3"}},
+	},
+	Ports: []discovery.EndpointPort{
+		{Port: &p, Protocol: &tcp},
+	},
+}
+var endpointSlice1NewIPs2 = discovery.EndpointSlice{
+	ObjectMeta: metav1.ObjectMeta{Name: "eps", Namespace: "default", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+	Endpoints: []discovery.Endpoint{
+		{Addresses: []string{"10.0.0.2"}},
+		{Addresses: []string{"10.0.0.3"}},
+		{Addresses: []string{"10.0.0.4"}},
+	},
+	Ports: []discovery.EndpointPort{
+		{Port: &p, Protocol: &tcp},
+	},
+}
+var endpointSlice2NewIPs2 = discovery.EndpointSlice{
+	ObjectMeta: metav1.ObjectMeta{Name: "eps-2", Namespace: "default", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+	Endpoints: []discovery.Endpoint{
+		{Addresses: []string{"10.0.0.2"}},
+		{Addresses: []string{"10.0.0.3"}},
+		{Addresses: []string{"10.0.0.4"}},
+	},
+	Ports: []discovery.EndpointPort{
+		{Port: &p, Protocol: &tcp},
+	},
+}
 var servicePolicyKey = model.PolicyKey{Name: "svc-policy"}
+var servicePolicyKey2 = model.PolicyKey{Name: "svc-policy2"}
 var servicePolicy = model.Policy{
 	Namespace: "default",
 	OutboundRules: []model.Rule{
@@ -855,14 +919,51 @@ var servicePolicy = model.Policy{
 	Selector: "all()",
 }
 
+var servicePolicyNoPorts = model.Policy{
+	Namespace: "default",
+	InboundRules: []model.Rule{
+		{
+			Action:              "Allow",
+			SrcService:          "svc",
+			SrcServiceNamespace: "default",
+			Protocol:            &protoTCP,
+			SrcPorts: []numorstring.Port{
+				{
+					MinPort: 80,
+					MaxPort: 80,
+				},
+			},
+		},
+	},
+	Types:    []string{"ingress"},
+	Selector: "all()",
+}
+
 func intPtr(i int) *int {
 	return &i
 }
 
 var localHostVXLANTunnelIP = "10.0.0.0"
 var remoteHostVXLANTunnelIP = "10.0.1.0"
-var remoteHostVXLANV6TunnelIP = "feed:beef:0001::0"
+var remoteHostVXLANV6TunnelIP = "feed:beef:0:0:1::0"
 var remoteHostVXLANTunnelIP2 = "10.0.1.1"
 var remoteHost2VXLANTunnelIP = "10.0.2.0"
 var remoteHostVXLANTunnelMAC = "66:74:c5:72:3f:01"
 var remoteHostVXLANV6TunnelMAC = "10:f3:27:5c:47:66"
+
+var t = true
+
+var wgPrivateKey1 = mustGeneratePrivateKey()
+var wgPublicKey1 = wgPrivateKey1.PublicKey()
+var wgPrivateKey2 = mustGeneratePrivateKey()
+var wgPublicKey2 = wgPrivateKey2.PublicKey()
+
+func mustGeneratePrivateKey() wgtypes.Key {
+	if k, err := wgtypes.GeneratePrivateKey(); err != nil {
+		log.WithError(err).Fatal("Error generating wireguard private key")
+	} else {
+		return k
+	}
+	// This will never run, but it's included to appease golanci-lint
+	return wgtypes.Key{}
+}

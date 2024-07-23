@@ -20,7 +20,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"golang.org/x/sys/unix"
+
 	"github.com/projectcalico/calico/felix/timeshim/mocktime"
 
 	. "github.com/onsi/ginkgo"
@@ -28,6 +29,8 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	v2 "github.com/projectcalico/calico/felix/bpf/conntrack/v2"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/mock"
 )
 
@@ -44,16 +47,16 @@ var (
 	timeouts = conntrack.DefaultTimeouts()
 
 	genericJustCreated    = makeValue(now-1, now-1, conntrack.Leg{}, conntrack.Leg{})
-	genericAlmostTimedOut = makeValue(now-(20*time.Minute), now-(599*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
-	genericTimedOut       = makeValue(now-(20*time.Minute), now-(601*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
+	genericAlmostTimedOut = makeValue(now-(20*time.Minute), now-(599*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
+	genericTimedOut       = makeValue(now-(20*time.Minute), now-(601*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
 
 	udpJustCreated    = makeValue(now-1, now-1, conntrack.Leg{}, conntrack.Leg{})
-	udpAlmostTimedOut = makeValue(now-(2*time.Minute), now-(59*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
-	udpTimedOut       = makeValue(now-(2*time.Minute), now-(61*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
+	udpAlmostTimedOut = makeValue(now-(2*time.Minute), now-(59*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
+	udpTimedOut       = makeValue(now-(2*time.Minute), now-(61*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
 
 	icmpJustCreated    = makeValue(now-1, now-1, conntrack.Leg{}, conntrack.Leg{})
-	icmpAlmostTimedOut = makeValue(now-(2*time.Minute), now-(4*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
-	icmpTimedOut       = makeValue(now-(2*time.Minute), now-(6*time.Second), conntrack.Leg{Whitelisted: true}, conntrack.Leg{})
+	icmpAlmostTimedOut = makeValue(now-(2*time.Minute), now-(4*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
+	icmpTimedOut       = makeValue(now-(2*time.Minute), now-(6*time.Second), conntrack.Leg{Approved: true}, conntrack.Leg{})
 
 	tcpJustCreated        = makeValue(now-1, now-1, conntrack.Leg{SynSeen: true}, conntrack.Leg{})
 	tcpHandshakeTimeout   = makeValue(now-22*time.Second, now-21*time.Second, conntrack.Leg{SynSeen: true}, conntrack.Leg{})
@@ -67,12 +70,7 @@ var (
 )
 
 func makeValue(created time.Duration, lastSeen time.Duration, legA conntrack.Leg, legB conntrack.Leg) conntrack.Value {
-	var e conntrack.Value
-	binary.LittleEndian.PutUint64(e[:8], uint64(created))
-	binary.LittleEndian.PutUint64(e[8:16], uint64(lastSeen))
-	binary.LittleEndian.PutUint32(e[28:32], legA.Flags())
-	binary.LittleEndian.PutUint32(e[40:44], legB.Flags())
-	return e
+	return conntrack.NewValueNormal(created, lastSeen, 0, legA, legB)
 }
 
 var _ = Describe("BPF Conntrack LivenessCalculator", func() {
@@ -86,7 +84,7 @@ var _ = Describe("BPF Conntrack LivenessCalculator", func() {
 		Expect(mockTime.KTimeNanos()).To(BeNumerically("==", now))
 		ctMap = mock.NewMockMap(conntrack.MapParams)
 		lc = conntrack.NewLivenessScanner(timeouts, false, conntrack.WithTimeShim(mockTime))
-		scanner = conntrack.NewScanner(ctMap, lc)
+		scanner = conntrack.NewScanner(ctMap, conntrack.KeyFromBytes, conntrack.ValueFromBytes, lc)
 	})
 
 	DescribeTable(
@@ -117,7 +115,7 @@ var _ = Describe("BPF Conntrack LivenessCalculator", func() {
 			scanner.Scan()
 			_, err = ctMap.Get(key.AsBytes())
 			if expExpired {
-				Expect(bpf.IsNotExists(err)).To(BeTrue(), "Scan() should have cleaned up entry")
+				Expect(maps.IsNotExists(err)).To(BeTrue(), "Scan() should have cleaned up entry")
 			} else {
 				Expect(err).NotTo(HaveOccurred(), "Scan() deleted entry unexpectedly")
 			}
@@ -128,7 +126,7 @@ var _ = Describe("BPF Conntrack LivenessCalculator", func() {
 			mockTime.IncrementTime(2 * time.Hour)
 			scanner.Scan()
 			_, err = ctMap.Get(key.AsBytes())
-			Expect(bpf.IsNotExists(err)).To(BeTrue(), "Scan() should have cleaned up entry")
+			Expect(maps.IsNotExists(err)).To(BeTrue(), "Scan() should have cleaned up entry")
 		},
 		Entry("TCP just created", tcpKey, tcpJustCreated, false),
 		Entry("TCP handshake timeout", tcpKey, tcpHandshakeTimeout, true),
@@ -178,6 +176,9 @@ var _ = Describe("BPF Conntrack StaleNATScanner", func() {
 	backendIP := net.IPv4(2, 2, 2, 2)
 	backendPort := uint16(2222)
 
+	backendIP2 := net.IPv4(2, 2, 2, 3)
+	backendPort2 := uint16(223)
+
 	snatPort := uint16(456)
 
 	withSNATPort := func(snatport uint16, v conntrack.Value) conntrack.Value {
@@ -186,12 +187,17 @@ var _ = Describe("BPF Conntrack StaleNATScanner", func() {
 	}
 
 	DescribeTable("forward entries",
-		func(k conntrack.Key, v conntrack.Value, verdict conntrack.ScanVerdict) {
+		func(k conntrack.Key, v conntrack.Value, verdict conntrack.ScanVerdict, getFn ...conntrack.EntryGet) {
 			staleNATScanner := conntrack.NewStaleNATScanner(dummyNATChecker{
 				check: func(fIP net.IP, fPort uint16, bIP net.IP, bPort uint16, proto uint8) bool {
 					Expect(proto).To(Equal(uint8(123)))
 					Expect(fIP.Equal(svcIP)).To(BeTrue())
 					Expect(fPort).To(Equal(svcPort))
+
+					if bIP.Equal(backendIP2) && bPort == backendPort2 {
+						return true
+					}
+
 					Expect(bIP.Equal(backendIP)).To(BeTrue())
 					Expect(bPort).To(Equal(backendPort))
 					return false
@@ -199,7 +205,12 @@ var _ = Describe("BPF Conntrack StaleNATScanner", func() {
 			},
 			)
 
-			Expect(verdict).To(Equal(staleNATScanner.Check(k, v, nil)))
+			var get conntrack.EntryGet
+			if len(getFn) == 1 {
+				get = getFn[0]
+			}
+
+			Expect(verdict).To(Equal(staleNATScanner.Check(k, v, get)))
 		},
 		Entry("keyA - revA",
 			conntrack.NewKey(123, clientIP, clientPort, svcIP, svcPort),
@@ -221,25 +232,22 @@ var _ = Describe("BPF Conntrack StaleNATScanner", func() {
 			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, clientIP, clientPort)),
 			conntrack.ScanVerdictDelete,
 		),
-		Entry("mismatch key port",
-			conntrack.NewKey(123, svcIP, svcPort, clientIP, 54545),
-			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, clientIP, clientPort)),
+		Entry("mismatch IP",
+			conntrack.NewKey(123, svcIP, svcPort, net.IPv4(6, 6, 6, 6), clientPort),
+			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP2, backendPort2, clientIP, clientPort)),
 			conntrack.ScanVerdictOK,
+			func(conntrack.KeyInterface) (conntrack.ValueInterface, error) {
+				return conntrack.NewValueNATReverse(0, 0, 0, conntrack.Leg{}, conntrack.Leg{},
+					net.IPv4(0, 0, 0, 0), svcIP, svcPort), nil
+			},
 		),
-		Entry("mismatch key IP",
-			conntrack.NewKey(123, svcIP, svcPort, net.IPv4(2, 1, 2, 1), clientPort),
-			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, clientIP, clientPort)),
-			conntrack.ScanVerdictOK,
-		),
-		Entry("mismatch rev port",
-			conntrack.NewKey(123, svcIP, svcPort, clientIP, clientPort),
-			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, clientIP, 12321)),
-			conntrack.ScanVerdictOK,
-		),
-		Entry("mismatch rev IP",
+		Entry("mismatch rev IP missing rev",
 			conntrack.NewKey(123, svcIP, svcPort, clientIP, clientPort),
 			conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, net.IPv4(3, 2, 2, 3), clientPort)),
-			conntrack.ScanVerdictOK,
+			conntrack.ScanVerdictDelete,
+			func(conntrack.KeyInterface) (conntrack.ValueInterface, error) {
+				return nil, unix.ENOENT
+			},
 		),
 		Entry("snatport keyA - revA",
 			conntrack.NewKey(123, clientIP, clientPort, svcIP, svcPort),
@@ -264,6 +272,43 @@ var _ = Describe("BPF Conntrack StaleNATScanner", func() {
 			withSNATPort(snatPort,
 				conntrack.NewValueNATForward(0, 0, 0, conntrack.NewKey(123, backendIP, backendPort, clientIP, snatPort))),
 			conntrack.ScanVerdictDelete,
+		),
+	)
+})
+
+var _ = Describe("BPF Conntrack upgrade entries", func() {
+	k2 := v2.NewKey(1, net.ParseIP("10.0.0.1"), 0, net.ParseIP("10.0.0.2"), 0)
+	k3 := conntrack.NewKey(1, net.ParseIP("10.0.0.1"), 0, net.ParseIP("10.0.0.2"), 0)
+
+	v2Normal := v2.NewValueNormal(now-1, now-1, 0, v2.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, v2.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201})
+	v3Normal := conntrack.NewValueNormal(now-1, now-1, 0, conntrack.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, conntrack.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201})
+
+	v2NatReverse := v2.NewValueNATReverse(now-1, now-1, 0, v2.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, v2.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201}, net.IPv4(1, 2, 3, 4), net.IPv4(5, 6, 7, 8), 1234)
+	v3NatReverse := conntrack.NewValueNATReverse(now-1, now-1, 0, conntrack.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, conntrack.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201}, net.IPv4(1, 2, 3, 4), net.IPv4(5, 6, 7, 8), 1234)
+
+	v2NatRevSnat := v2.NewValueNATReverseSNAT(now-1, now-1, 0, v2.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, v2.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201}, net.IPv4(1, 2, 3, 4), net.IPv4(5, 6, 7, 8), net.IPv4(9, 10, 11, 12), 1234)
+	v3NatRevSnat := conntrack.NewValueNATReverseSNAT(now-1, now-1, 0, conntrack.Leg{Seqno: 1000, SynSeen: true, Ifindex: 200}, conntrack.Leg{Seqno: 1001, RstSeen: true, Ifindex: 201}, net.IPv4(1, 2, 3, 4), net.IPv4(5, 6, 7, 8), net.IPv4(9, 10, 11, 12), 1234)
+
+	v2NatFwd := v2.NewValueNATForward(now-1, now-1, 0, v2.NewKey(3, net.ParseIP("20.0.0.1"), 0, net.ParseIP("20.0.0.2"), 0))
+	v3NatFwd := conntrack.NewValueNATForward(now-1, now-1, 0, conntrack.NewKey(3, net.ParseIP("20.0.0.1"), 0, net.ParseIP("20.0.0.2"), 0))
+	DescribeTable("upgrade entries",
+		func(k2 v2.Key, v2 v2.Value, k3 conntrack.Key, v3 conntrack.Value) {
+			upgradedKey := k2.Upgrade()
+			upgradedValue := v2.Upgrade()
+			Expect(upgradedKey.AsBytes()).To(Equal(k3.AsBytes()))
+			Expect(upgradedValue.AsBytes()).To(Equal(v3.AsBytes()))
+		},
+		Entry("conntrack normal entry",
+			k2, v2Normal, k3, v3Normal,
+		),
+		Entry("conntrack nat rev entry",
+			k2, v2NatReverse, k3, v3NatReverse,
+		),
+		Entry("conntrack nat rev entry",
+			k2, v2NatRevSnat, k3, v3NatRevSnat,
+		),
+		Entry("conntrack nat rev entry",
+			k2, v2NatFwd, k3, v3NatFwd,
 		),
 	)
 })

@@ -88,7 +88,7 @@ var _ = Describe("CalicoCni", func() {
 
 			Expect(len(result.IPs)).Should(Equal(1))
 			ip := result.IPs[0].Address.IP.String()
-			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 			Expect(result.IPs[0].Address.Mask.String()).Should(Equal("ffffffff"))
 
 			// datastore things:
@@ -133,7 +133,7 @@ var _ = Describe("CalicoCni", func() {
 			}))
 
 			// Routes and interface on host - there's is nothing to assert on the routes since felix adds those.
-			hostVethName := "cali" + containerID[:utils.Min(11, len(containerID))] //"cali" + containerID
+			hostVethName := "cali" + containerID[:min(11, len(containerID))] // "cali" + containerID
 
 			hostVeth, err := netlink.LinkByName(hostVethName)
 			Expect(err).ToNot(HaveOccurred())
@@ -362,7 +362,7 @@ var _ = Describe("CalicoCni", func() {
 			  },
 			  "dataplane_options": {
 			  	"type": "grpc",
-			  	"socket": "unix:///tmp/xxxx-non-existent-dont-create-this-please.sock"
+			  	"socket": "unix:///tmp/xxxx-nonexistent-dont-create-this-please.sock"
 			  }
 			}`, cniVersion, os.Getenv("ETCD_IP"), os.Getenv("DATASTORE_TYPE"))
 
@@ -800,7 +800,7 @@ var _ = Describe("CalicoCni", func() {
 
 		Context("with networking rigged to fail", func() {
 			BeforeEach(func() {
-				// To prevent the networking atempt from succeeding, rename the old veth.
+				// To prevent the networking attempt from succeeding, rename the old veth.
 				// This leaves a route and an eth0 in place that the plugin will struggle with.
 				By("Breaking networking for the created interface")
 				hostVeth := endpointSpec.InterfaceName
@@ -847,13 +847,17 @@ var _ = Describe("CalicoCni", func() {
 				containerID, result, _, _, _, contNs, err := testutils.CreateContainerWithId(netconf, "", testutils.TEST_DEFAULT_NS, "", "meep1337")
 				Expect(err).ShouldNot(HaveOccurred())
 
+				hostNlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
+				Expect(err).ShouldNot(HaveOccurred())
+				defer hostNlHandle.Close()
+
 				// CNI plugin generates host side vEth name from containerID if used for "cni" orchestrator.
-				hostVethName := "cali" + containerID[:utils.Min(11, len(containerID))] //"cali" + containerID
+				hostVethName := "cali" + containerID[:min(11, len(containerID))] // "cali" + containerID
 				hostVeth, err := netlink.LinkByName(hostVethName)
 				Expect(err).ToNot(HaveOccurred())
 
 				By("setting up the same route CNI plugin installed in the initial run for the hostVeth")
-				err = linux.SetupRoutes(hostVeth, result)
+				err = linux.SetupRoutes(hostNlHandle, hostVeth, result)
 				Expect(err).NotTo(HaveOccurred())
 
 				_, err = testutils.DeleteContainerWithId(netconf, contNs.Path(), "", testutils.TEST_DEFAULT_NS, containerID)

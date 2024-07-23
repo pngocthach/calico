@@ -75,7 +75,7 @@ func dump() {
 		fmt.Printf("  %s: %d\n", proto, entry.Port)
 	}
 
-	fmt.Printf("Interfaces with blacklist:\n")
+	fmt.Printf("Interfaces with blocklist:\n")
 	ifaces, err := bpfLib.GetXDPIfaces()
 	if err != nil {
 		log.Fatalf("%v", err)
@@ -96,7 +96,6 @@ func dump() {
 }
 
 // main is the entry point to the binary.
-//
 func main() {
 	// Parse command-line args.
 	version := "Version:            " + buildinfo.GitVersion + "\n" +

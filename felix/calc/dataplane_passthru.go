@@ -20,6 +20,9 @@ import (
 
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
+	libv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	cresources "github.com/projectcalico/calico/libcalico-go/lib/resources"
+
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -31,15 +34,19 @@ import (
 // duplicates along the way.  It maps OnUpdate() calls to dedicated method calls for consistency
 // with the rest of the dataplane API.
 type DataplanePassthru struct {
-	callbacks passthruCallbacks
+	ipv6Support bool
+	callbacks   passthruCallbacks
 
-	hostIPs map[string]*net.IP
+	hostIPs   map[string]*net.IP
+	hostIPv6s map[string]*net.IP
 }
 
-func NewDataplanePassthru(callbacks passthruCallbacks) *DataplanePassthru {
+func NewDataplanePassthru(callbacks passthruCallbacks, ipv6Support bool) *DataplanePassthru {
 	return &DataplanePassthru{
-		callbacks: callbacks,
-		hostIPs:   map[string]*net.IP{},
+		ipv6Support: ipv6Support,
+		callbacks:   callbacks,
+		hostIPs:     map[string]*net.IP{},
+		hostIPv6s:   map[string]*net.IP{},
 	}
 }
 
@@ -102,6 +109,83 @@ func (h *DataplanePassthru) OnUpdate(update api.Update) (filterOut bool) {
 			} else {
 				h.callbacks.OnServiceUpdate(kubernetesServiceToProto(update.Value.(*kapiv1.Service)))
 			}
+		} else if key.Kind == libv3.KindNode {
+			// Handle node resource to pass-through HostMetadataV6Update/HostMetadataV6Remove messages
+			// with IPv6 node address updates. IPv4 updates are handled above my model.HostIPKey updates.
+			log.WithField("update", update).Debug("Passing-through a Node IPv6 address update")
+			log.WithField("update", update).Debug("Passing-through a Node update")
+			hostname := key.Name
+			if update.Value == nil {
+				log.WithField("update", update).Debug("Passing-through Node IPv6 address remove")
+				delete(h.hostIPv6s, hostname)
+				h.callbacks.OnHostIPv6Remove(hostname)
+				log.WithField("update", update).Debug("Passing-through Node remove")
+				h.callbacks.OnHostMetadataRemove(hostname)
+			} else {
+				node, _ := update.Value.(*libv3.Node)
+				log.WithField("update", update).Debug("Passing-through Node update")
+				bgpIp4net := &net.IPNet{} // required for print in event sequencer
+				bgpIp6net := &net.IPNet{} // required for print in event sequencer
+				asnumber := ""
+				if node.Spec.BGP != nil {
+					ip4, ip4net, _ := net.ParseCIDR(node.Spec.BGP.IPv4Address)
+					ip6, ip6net, _ := net.ParseCIDR(node.Spec.BGP.IPv6Address)
+					if ip4net != nil {
+						ip4net.IP = ip4.IP
+						bgpIp4net = ip4net
+					}
+					if ip6net != nil {
+						ip6net.IP = ip6.IP
+						bgpIp6net = ip6net
+					}
+					if node.Spec.BGP.ASNumber != nil {
+						asnumber = node.Spec.BGP.ASNumber.String()
+					}
+				}
+				h.callbacks.OnHostMetadataUpdate(hostname, bgpIp4net, bgpIp6net, asnumber, node.Labels)
+				if node.Spec.BGP != nil {
+					if node.Spec.BGP.IPv6Address != "" {
+						ip, _, _ := net.ParseCIDR(node.Spec.BGP.IPv6Address)
+						oldIP := h.hostIPv6s[hostname]
+						if oldIP != nil && ip.IP.Equal(oldIP.IP) {
+							log.WithField("update", update).Debug("Ignoring duplicate Node IPv6 address update")
+							return
+						}
+						log.WithField("update", update).Debug("Passing-through Node IPv6 address update")
+						h.hostIPv6s[hostname] = ip
+						h.callbacks.OnHostIPv6Update(hostname, ip)
+					} else if h.hostIPv6s[hostname] != nil {
+						log.WithField("update", update).Debug("Passing-through Node IPv6 address remove")
+						delete(h.hostIPv6s, hostname)
+						h.callbacks.OnHostIPv6Remove(hostname)
+					}
+				}
+
+				if h.ipv6Support && node.Spec.BGP == nil {
+					// BGP is turned off, try to get one from the node resource. This is a
+					// similar fallback as for IPv4, see how HostIPKey is generated in
+					// libcalico-go/lib/backend/syncersv1/updateprocessors/felixnodeprocessor.go
+					var ip *net.IP
+					ip, _ = cresources.FindNodeAddress(node, libv3.InternalIP, 6)
+					if ip == nil {
+						ip, _ = cresources.FindNodeAddress(node, libv3.ExternalIP, 6)
+					}
+					if ip != nil {
+						oldIP := h.hostIPv6s[hostname]
+						if oldIP != nil && ip.IP.Equal(oldIP.IP) {
+							log.WithField("update", update).Debug("Ignoring duplicate Node IPv6 address update")
+							return
+						}
+						log.WithField("update", update).Debug("Passing-through Node IPv6 address update")
+						h.hostIPv6s[hostname] = ip
+						h.callbacks.OnHostIPv6Update(hostname, ip)
+					} else if h.hostIPv6s[hostname] != nil {
+						log.WithField("update", update).Debug("Passing-through Node IPv6 address remove")
+						delete(h.hostIPv6s, hostname)
+						h.callbacks.OnHostIPv6Remove(hostname)
+					}
+				}
+			}
 		} else {
 			log.WithField("key", key).Debugf("Ignoring v3 resource of kind %s", key.Kind)
 		}
@@ -110,7 +194,7 @@ func (h *DataplanePassthru) OnUpdate(update api.Update) (filterOut bool) {
 }
 
 func kubernetesServiceToProto(s *kapiv1.Service) *proto.ServiceUpdate {
-	return &proto.ServiceUpdate{
+	up := &proto.ServiceUpdate{
 		Name:           s.Name,
 		Namespace:      s.Namespace,
 		Type:           string(s.Spec.Type),
@@ -118,4 +202,29 @@ func kubernetesServiceToProto(s *kapiv1.Service) *proto.ServiceUpdate {
 		LoadbalancerIp: s.Spec.LoadBalancerIP,
 		ExternalIps:    s.Spec.ExternalIPs,
 	}
+
+	ports := make([]*proto.ServicePort, 0, len(s.Spec.Ports))
+
+	protoGet := func(kp kapiv1.Protocol) string {
+		switch kp {
+		case kapiv1.ProtocolUDP:
+			return "UDP"
+		case kapiv1.ProtocolSCTP:
+			return "SCTP"
+		}
+
+		return "TCP"
+	}
+
+	for _, p := range s.Spec.Ports {
+		ports = append(ports, &proto.ServicePort{
+			Protocol: protoGet(p.Protocol),
+			Port:     p.Port,
+			NodePort: p.NodePort,
+		})
+	}
+
+	up.Ports = ports
+
+	return up
 }

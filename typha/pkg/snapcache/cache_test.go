@@ -15,18 +15,17 @@
 package snapcache_test
 
 import (
+	"context"
+	"fmt"
 	"strconv"
+	"sync"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 
 	"github.com/projectcalico/calico/typha/pkg/snapcache"
-
-	"context"
-	"fmt"
-	"sync"
-	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -57,6 +56,7 @@ func (r *healthRecorder) RegisterReporter(name string, reports *health.HealthRep
 func (r *healthRecorder) Report(name string, report *health.HealthReport) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
+	log.WithField("name", name).WithField("report", report).Info("Health report")
 	if name != r.expectedName {
 		return
 	}
@@ -83,11 +83,13 @@ func (r *healthRecorder) LastReport() (rep health.HealthReport) {
 
 func crumbToSnapshotUpdates(crumb *snapcache.Breadcrumb) []api.Update {
 	var snapshotUpdates []api.Update
-	for entry := range crumb.KVs.Iterator(nil) {
-		upd, err := entry.Value.(syncproto.SerializedUpdate).ToUpdate()
+	crumb.KVs.Ascend(func(entry syncproto.SerializedUpdate) bool {
+		upd, err := entry.ToUpdate()
 		Expect(err).NotTo(HaveOccurred())
 		snapshotUpdates = append(snapshotUpdates, upd)
-	}
+		return true // Keep iterating.
+	})
+
 	return snapshotUpdates
 }
 
@@ -106,7 +108,7 @@ var _ = Describe("Snapshot cache FV tests", func() {
 			MaxBatchSize:     10,
 			WakeUpInterval:   10 * time.Second,
 			HealthAggregator: mockHealth,
-			HealthName:       "my-cache",
+			Name:             "my-cache",
 		}
 		cache = snapcache.New(cacheConfig)
 		cxt, cancel = context.WithCancel(context.Background())
@@ -145,13 +147,9 @@ var _ = Describe("Snapshot cache FV tests", func() {
 			// Wait for the update to flow through...
 			Eventually(func() bool {
 				crumb = cache.CurrentBreadcrumb()
-				crumbSize := crumb.KVs.Size()
-				// Check snapshot is read-only.
-				Expect(func() {
-					crumb.KVs.Insert([]byte("abcd"), "unused")
-				}).To(Panic())
+				crumbSize := crumb.KVs.Len()
 				log.WithField("crumb", crumb).WithField("size", crumbSize).Info("Current crumb now...")
-				Consistently(func() uint { return crumb.KVs.Size() }).Should(Equal(crumbSize))
+				Consistently(crumb.KVs.Len).Should(Equal(crumbSize))
 				return crumbSize > 0
 			}).Should(BeTrue())
 			log.WithField("crumb", crumb).Info("Got initial crumb")
@@ -228,13 +226,9 @@ var _ = Describe("Snapshot cache FV tests", func() {
 			// Wait for the update to flow through...
 			Eventually(func() bool {
 				crumb = cache.CurrentBreadcrumb()
-				crumbSize := crumb.KVs.Size()
-				// Check snapshot is read-only.
-				Expect(func() {
-					crumb.KVs.Insert([]byte("abcd"), "unused")
-				}).To(Panic())
+				crumbSize := crumb.KVs.Len()
 				log.WithField("crumb", crumb).WithField("size", crumbSize).Info("Current crumb now...")
-				Consistently(func() uint { return crumb.KVs.Size() }).Should(Equal(crumbSize))
+				Consistently(crumb.KVs.Len).Should(Equal(crumbSize))
 				return crumbSize > 0
 			}).Should(BeTrue())
 			log.WithField("crumb", crumb).Info("Got initial crumb")
@@ -357,7 +351,7 @@ var _ = Describe("Snapshot cache FV tests", func() {
 
 	generateUpdates := func(num int) []api.Update {
 		var updates []api.Update
-		var seenKeys = set.New()
+		var seenKeys = set.New[string]()
 		for i := 0; i < num; i++ {
 			configIdx := i % 100
 			value := fmt.Sprintf("config%v", i%55)
@@ -584,14 +578,16 @@ func (f *follower) Loop(cxt context.Context) {
 	crumb := f.cache.CurrentBreadcrumb()
 	logCxt.WithField("crumb", crumb.SequenceNumber).Info("Got first crumb")
 	done := false
-	for item := range crumb.KVs.Iterator(cxt.Done()) {
-		upd := item.Value.(syncproto.SerializedUpdate)
-		f.storeKV(upd)
+
+	crumb.KVs.Ascend(func(update syncproto.SerializedUpdate) bool {
+		f.storeKV(update)
 		if crumb.SyncStatus == api.InSync {
 			f.inSyncAt = f.maxRev
 			done = true
 		}
-	}
+		return true // Keep iterating.
+	})
+
 	var minSleepCrumbSeqNo uint64
 	for !done && cxt.Err() == nil {
 		var err error
@@ -604,7 +600,7 @@ func (f *follower) Loop(cxt context.Context) {
 			break
 		}
 		crumb = newCrumb
-		//logCxt.WithField("crumb", crumb.SequenceNumber).Info("Got next crumb")
+		// logCxt.WithField("crumb", crumb.SequenceNumber).Info("Got next crumb")
 		for _, upd := range crumb.Deltas {
 			f.storeKV(upd)
 		}

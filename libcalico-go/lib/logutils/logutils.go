@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,18 +56,19 @@ func FilterLevels(maxLevel log.Level) []log.Level {
 
 // Formatter is our custom log formatter designed to balance ease of machine processing
 // with human readability.  Logs include:
-//    - A sortable millisecond timestamp, for scanning and correlating logs
-//    - The log level, near the beginning of the line, to aid in visual scanning
-//    - The PID of the process to make it easier to spot log discontinuities (If
-//      you are looking at two disjoint chunks of log, were they written by the
-//      same process?  Was there a restart in-between?)
-//    - The file name and line number, as essential context
-//    - The message!
-//    - Log fields appended in sorted order
+//   - A sortable millisecond timestamp, for scanning and correlating logs
+//   - The log level, near the beginning of the line, to aid in visual scanning
+//   - The PID of the process to make it easier to spot log discontinuities (If
+//     you are looking at two disjoint chunks of log, were they written by the
+//     same process?  Was there a restart in-between?)
+//   - The file name and line number, as essential context
+//   - The message!
+//   - Log fields appended in sorted order
 //
 // Example:
-//    2017-01-05 09:17:48.238 [INFO][85386] endpoint_mgr.go 434: Skipping configuration of
-//    interface because it is oper down. ifaceName="cali1234"
+//
+//	2017-01-05 09:17:48.238 [INFO][85386] endpoint_mgr.go 434: Skipping configuration of
+//	interface because it is oper down. ifaceName="cali1234"
 type Formatter struct {
 	// If specified, prepends the component to the file name. This is useful for when
 	// multiple components are logging to the same file (e.g., calico/node) for distinguishing
@@ -97,8 +99,8 @@ func (f *Formatter) Format(entry *log.Entry) ([]byte, error) {
 // already included in the syslog metadata such as timestamp and PID.  The log level _is_ included
 // because syslog doesn't seem to output it by default and it's very useful.
 //
-//    INFO endpoint_mgr.go 434: Skipping configuration of interface because it is oper down.
-//    ifaceName="cali1234"
+//	INFO endpoint_mgr.go 434: Skipping configuration of interface because it is oper down.
+//	ifaceName="cali1234"
 func FormatForSyslog(entry *log.Entry) string {
 	levelStr := strings.ToUpper(entry.Level.String())
 	fileName := entry.Data[fieldFileName]
@@ -520,4 +522,42 @@ func SafeParseLogLevel(logLevel string) log.Level {
 		}
 	}
 	return defaultedLevel
+}
+
+// TestingTWriter adapts a *testing.T as a Writer so it can be used as a target
+// for logrus.  typically, it should be used via the ConfigureLoggingForTestingT
+// helper.
+type TestingTWriter struct {
+	T *testing.T
+}
+
+func (l TestingTWriter) Write(p []byte) (n int, err error) {
+	l.T.Helper()
+	l.T.Log(strings.TrimRight(string(p), "\r\n"))
+	return len(p), nil
+}
+
+// RedirectLogrusToTestingT redirects logrus output to the given testing.T.  It
+// returns a func() that can be called to restore the original log output.
+func RedirectLogrusToTestingT(t *testing.T) (cancel func()) {
+	oldOut := log.StandardLogger().Out
+	cancel = func() {
+		log.SetOutput(oldOut)
+	}
+	log.SetOutput(TestingTWriter{T: t})
+	return
+}
+
+var confForTestingOnce sync.Once
+
+// ConfigureLoggingForTestingT configures logrus to write to the logger of the
+// given testing.T.  It should be called at the start of each "go test" that
+// wants to capture log output.  It registers a cleanup with the testing.T to
+// remove the log redirection at the end of the test.
+func ConfigureLoggingForTestingT(t *testing.T) {
+	confForTestingOnce.Do(func() {
+		log.SetFormatter(&Formatter{Component: "test"})
+		log.AddHook(ContextHook{})
+	})
+	t.Cleanup(RedirectLogrusToTestingT(t))
 }

@@ -67,7 +67,7 @@ func CalculateEndpointPolicies(
 		if strings.EqualFold(policyType, "OutBoundNAT") {
 			found = true
 			if !natOutgoing {
-				logger.Info("NAT-outgoing disabled for this IP pool, ignoring OutBoundNAT policy from NetConf.")
+				logger.Info("NATOutgoing disabled for this IP pool, ignoring OutBoundNAT policy from NetConf.")
 				continue
 			}
 
@@ -132,22 +132,22 @@ func CalculateEndpointPolicies(
 //
 // For example, we convert from raw JSON like:
 //
-// {
-//   "Type":  "OutBoundNAT",
-//   "ExceptionList":  [
-//     "10.96.0.0/12",
-//     "192.168.0.0/16"
-//   ]
-// }
+//	{
+//	  "Type":  "OutBoundNAT",
+//	  "ExceptionList":  [
+//	    "10.96.0.0/12",
+//	    "192.168.0.0/16"
+//	  ]
+//	}
 //
 // to:
 //
-// hcn.EndpointPolicy{
-//   Type: hcn.OutBoundNAT,
-//   Settings: json.RawMessage(
-//     []byte(`{"ExceptionList":["10.96.0.0/12","192.168.0.0/16"]}`),
-//   ),
-// }
+//	hcn.EndpointPolicy{
+//	  Type: hcn.OutBoundNAT,
+//	  Settings: json.RawMessage(
+//	    []byte(`{"ExceptionList":["10.96.0.0/12","192.168.0.0/16"]}`),
+//	  ),
+//	}
 func convertToHcnEndpointPolicy(policy map[string]interface{}) (hcn.EndpointPolicy, error) {
 	hcnPolicy := hcn.EndpointPolicy{}
 

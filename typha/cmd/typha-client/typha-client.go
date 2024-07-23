@@ -15,17 +15,14 @@
 package main
 
 import (
+	"context"
 	"os"
+	"runtime"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"math/rand"
-	"runtime"
-
 	"github.com/docopt/docopt-go"
-
-	"context"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/typha/pkg/buildinfo"
@@ -73,9 +70,6 @@ func (s *syncerCallbacks) OnUpdates(updates []api.Update) {
 }
 
 func main() {
-	// Go's RNG is not seeded by default.  Do that now.
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	// Set up logging.
 	logutils.ConfigureEarlyLogging()
 	logutils.ConfigureLogging(&config.Config{
@@ -118,7 +112,8 @@ func main() {
 	}
 
 	hostname, _ := os.Hostname()
-	client := syncclient.New([]discovery.Typha{{Addr: addr}}, buildinfo.GitVersion, hostname, "typha command-line client", callbacks, options)
+	discoverer := discovery.New(discovery.WithAddrOverride(addr))
+	client := syncclient.New(discoverer, buildinfo.GitVersion, hostname, "typha command-line client", callbacks, options)
 	err = client.Start(context.Background())
 	if err != nil {
 		log.WithError(err).Panic("Client failed")

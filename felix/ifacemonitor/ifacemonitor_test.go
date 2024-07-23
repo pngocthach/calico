@@ -39,7 +39,7 @@ import (
 type linkModel struct {
 	index int
 	state string
-	addrs set.Set
+	addrs set.Set[string]
 }
 
 type netlinkTest struct {
@@ -61,7 +61,7 @@ type netlinkTest struct {
 
 type addrState struct {
 	ifaceName string
-	addrs     set.Set
+	addrs     set.Set[string]
 }
 
 type linkUpdate struct {
@@ -70,9 +70,12 @@ type linkUpdate struct {
 	index int
 }
 
+type inSyncupdate struct{}
+
 type mockDataplane struct {
 	linkC chan linkUpdate
 	addrC chan addrState
+	syncC chan inSyncupdate
 }
 
 func (nl *netlinkTest) addLink(name string) {
@@ -90,7 +93,7 @@ func (nl *netlinkTest) addLinkNoSignal(name string) {
 	nl.links[name] = linkModel{
 		index: nl.nextIndex,
 		state: "down",
-		addrs: set.New(),
+		addrs: set.New[string](),
 	}
 	nl.nextIndex++
 	nl.linksMutex.Unlock()
@@ -154,16 +157,16 @@ func (nl *netlinkTest) signalLink(name string, oldIndex int) {
 	nl.linksMutex.Unlock()
 
 	// Build the update.
+	la := netlink.NewLinkAttrs()
+	la.Name = name
+	la.Index = index
+	la.RawFlags = rawFlags
 	update := netlink.LinkUpdate{
 		Header: unix.NlMsghdr{
 			Type: msgType,
 		},
 		Link: &netlink.Dummy{
-			LinkAttrs: netlink.LinkAttrs{
-				Name:     name,
-				Index:    index,
-				RawFlags: rawFlags,
-			},
+			LinkAttrs: la,
 		},
 	}
 
@@ -245,12 +248,12 @@ func (nl *netlinkTest) LinkList() ([]netlink.Link, error) {
 		if link.state == "up" {
 			rawFlags = syscall.IFF_RUNNING
 		}
+		la := netlink.NewLinkAttrs()
+		la.Name = name
+		la.Index = link.index
+		la.RawFlags = rawFlags
 		links = append(links, &netlink.Dummy{
-			LinkAttrs: netlink.LinkAttrs{
-				Name:     name,
-				Index:    link.index,
-				RawFlags: rawFlags,
-			},
+			LinkAttrs: la,
 		})
 	}
 	nl.linksMutex.Unlock()
@@ -264,8 +267,7 @@ func (nl *netlinkTest) ListLocalRoutes(link netlink.Link, family int) ([]netlink
 	model, prs := nl.links[name]
 	var routes []netlink.Route
 	if prs {
-		model.addrs.Iter(func(item interface{}) error {
-			addr := item.(string)
+		model.addrs.Iter(func(addr string) error {
 			net, err := netlink.ParseIPNet(addr)
 			if err != nil {
 				panic("Address parsing failed")
@@ -298,8 +300,7 @@ func (nl *netlinkTest) AddrList(link netlink.Link, family int) ([]netlink.Addr, 
 	model, prs := nl.links[name]
 	addrs := []netlink.Addr{}
 	if prs {
-		model.addrs.Iter(func(item interface{}) error {
-			addr := item.(string)
+		model.addrs.Iter(func(addr string) error {
 			net, err := netlink.ParseIPNet(addr)
 			if err != nil {
 				panic("Address parsing failed")
@@ -347,7 +348,7 @@ func (dp *mockDataplane) notExpectLinkStateCb() {
 	ConsistentlyWithOffset(1, dp.linkC, "50ms", "5ms").ShouldNot(Receive())
 }
 
-func (dp *mockDataplane) addrStateCallback(ifaceName string, addrs set.Set) {
+func (dp *mockDataplane) addrStateCallback(ifaceName string, addrs set.Set[string]) {
 	log.WithFields(log.Fields{
 		"ifaceName": ifaceName,
 		"addrs":     addrs,
@@ -391,12 +392,28 @@ func (dp *mockDataplane) expectAddrStateCb(ifaceName string, addr string, presen
 	}
 }
 
+func (dp *mockDataplane) synchronizationCallBack() {
+	log.Info("In sync callback fired")
+	dp.syncC <- inSyncupdate{}
+	log.Info("mock dataplane reported sync callback")
+}
+
+func (dp *mockDataplane) expectInSyncCB() {
+	var syncIface inSyncupdate
+	EventuallyWithOffset(1, dp.syncC).Should(Receive(&syncIface))
+}
+
+func (dp *mockDataplane) expectNoInSyncCB() {
+	ConsistentlyWithOffset(1, dp.syncC, "100ms").ShouldNot(Receive())
+}
+
 var errFatal = errors.New("fatal error")
 
 var _ = Describe("ifacemonitor", func() {
 	var nl *netlinkTest
 	var resyncC chan time.Time
 	var fatalErrC chan struct{}
+	var expectInSync bool
 	var im *ifacemonitor.InterfaceMonitor
 	var dp *mockDataplane
 
@@ -435,9 +452,12 @@ var _ = Describe("ifacemonitor", func() {
 		dp = &mockDataplane{
 			linkC: make(chan linkUpdate, 1),
 			addrC: make(chan addrState, 2),
+			syncC: make(chan inSyncupdate, 1),
 		}
 		im.StateCallback = dp.linkStateCallback
 		im.AddrCallback = dp.addrStateCallback
+		im.InSyncCallback = dp.synchronizationCallBack
+		expectInSync = true
 	})
 
 	JustBeforeEach(func() {
@@ -455,12 +475,18 @@ var _ = Describe("ifacemonitor", func() {
 			im.MonitorInterfaces()
 		}()
 		Eventually(nl.userSubscribed).Should(Receive())
+		if expectInSync {
+			dp.expectInSyncCB()
+		} else {
+			dp.expectNoInSyncCB()
+		}
 		log.Info("Monitor interfaces subscribed")
 	})
 
 	Context("with an error from LinkList", func() {
 		BeforeEach(func() {
 			nl.LinkListErr = fmt.Errorf("dummy err")
+			expectInSync = false
 		})
 
 		It("should report a fatal error", func() {

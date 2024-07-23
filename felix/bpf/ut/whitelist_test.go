@@ -22,16 +22,15 @@ import (
 
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
 
-	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
 	"github.com/projectcalico/calico/felix/bpf/routes"
 	"github.com/projectcalico/calico/felix/ip"
 )
 
 // Usually a packet passes through 2 programs, HEP->WEP, WEP->HEP or WEP->WEP. These test
-// make sure that both programs whitelist the traffic if their policies allow it.
+// make sure that both programs allow the traffic if their policies allow it.
 
-func TestWhitelistFromWorkloadExitHost(t *testing.T) {
+func TestAllowFromWorkloadExitHost(t *testing.T) {
 	RegisterTestingT(t)
 
 	bpfIfaceName = "WHwl"
@@ -48,7 +47,7 @@ func TestWhitelistFromWorkloadExitHost(t *testing.T) {
 
 	// Insert a reverse route for the source workload.
 	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
-	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload, 1).AsBytes()
+	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
 	err = rtMap.Update(rtKey, rtVal)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -56,6 +55,7 @@ func TestWhitelistFromWorkloadExitHost(t *testing.T) {
 		ipv4.SrcIP, uint16(udp.SrcPort), ipv4.DstIP, uint16(udp.DstPort))
 
 	// Leaving workload
+	skbMark = 0
 	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
@@ -67,14 +67,14 @@ func TestWhitelistFromWorkloadExitHost(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by WEP
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
-		// Not whitelisted by HEP yet
-		Expect(ctr.Data().B2A.Whitelisted).NotTo(BeTrue())
+		// Approved by WEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// Not approved by HEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
 	})
 
 	// Leaving node 1
-	skbMark = tcdefs.MarkSeen // CALI_SKB_MARK_SEEN
+	expectMark(tcdefs.MarkSeen)
 
 	runBpfTest(t, "calico_to_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
@@ -87,13 +87,13 @@ func TestWhitelistFromWorkloadExitHost(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by both WEP and HEP
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
-		Expect(ctr.Data().B2A.Whitelisted).To(BeTrue())
+		// Approved by both WEP and HEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
 	})
 }
 
-func TestWhitelistEnterHostToWorkload(t *testing.T) {
+func TestAllowEnterHostToWorkload(t *testing.T) {
 	RegisterTestingT(t)
 
 	bpfIfaceName = "HWwl"
@@ -103,9 +103,7 @@ func TestWhitelistEnterHostToWorkload(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 	udp := l4.(*layers.UDP)
 
-	mc := &bpf.MapContext{}
-
-	ctMap := conntrack.Map(mc)
+	ctMap := conntrack.Map()
 	err = ctMap.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 	resetCTMap(ctMap) // ensure it is clean
@@ -114,17 +112,19 @@ func TestWhitelistEnterHostToWorkload(t *testing.T) {
 
 	// Insert a reverse route for the source workload.
 	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
-	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload, 1).AsBytes()
+	rtVal := routes.NewValue(routes.FlagsRemoteWorkload | routes.FlagInIPAMPool).AsBytes()
 	err = rtMap.Update(rtKey, rtVal)
-	defer func() {
-		err := rtMap.Delete(rtKey)
-		Expect(err).NotTo(HaveOccurred())
-	}()
 	Expect(err).NotTo(HaveOccurred())
+	rtKey = routes.NewKey(dstV4CIDR).AsBytes()
+	rtVal = routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMap.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	defer resetRTMap(rtMap)
 
 	ctKey := conntrack.NewKey(uint8(ipv4.Protocol),
 		ipv4.SrcIP, uint16(udp.SrcPort), ipv4.DstIP, uint16(udp.DstPort))
 
+	skbMark = 0
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
@@ -136,13 +136,13 @@ func TestWhitelistEnterHostToWorkload(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by HEP
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
-		// NOt whitelisted by WEP yet
-		Expect(ctr.Data().B2A.Whitelisted).NotTo(BeTrue())
+		// Approved by HEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// NOt approved by WEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
 	})
 
-	skbMark = tcdefs.MarkSeen // CALI_SKB_MARK_SEEN
+	expectMark(tcdefs.MarkSeen)
 
 	runBpfTest(t, "calico_to_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
@@ -155,13 +155,13 @@ func TestWhitelistEnterHostToWorkload(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Still whitelisted both by HEP and WEP
-		Expect(ctr.Data().B2A.Whitelisted).To(BeTrue())
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
+		// Still approved both by HEP and WEP
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
 	})
 }
 
-func TestWhitelistWorkloadToWorkload(t *testing.T) {
+func TestAllowWorkloadToWorkload(t *testing.T) {
 	RegisterTestingT(t)
 
 	bpfIfaceName = "WWwl"
@@ -171,9 +171,7 @@ func TestWhitelistWorkloadToWorkload(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 	udp := l4.(*layers.UDP)
 
-	mc := &bpf.MapContext{}
-
-	ctMap := conntrack.Map(mc)
+	ctMap := conntrack.Map()
 	err = ctMap.EnsureExists()
 	Expect(err).NotTo(HaveOccurred())
 	resetCTMap(ctMap) // ensure it is clean
@@ -182,7 +180,7 @@ func TestWhitelistWorkloadToWorkload(t *testing.T) {
 
 	// Insert a reverse route for the source workload.
 	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
-	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload, 1).AsBytes()
+	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
 	err = rtMap.Update(rtKey, rtVal)
 	defer func() {
 		err := rtMap.Delete(rtKey)
@@ -193,6 +191,7 @@ func TestWhitelistWorkloadToWorkload(t *testing.T) {
 	ctKey := conntrack.NewKey(uint8(ipv4.Protocol),
 		ipv4.SrcIP, uint16(udp.SrcPort), ipv4.DstIP, uint16(udp.DstPort))
 
+	skbMark = 0
 	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
@@ -204,13 +203,13 @@ func TestWhitelistWorkloadToWorkload(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by the first WEP (on egress from WEP)
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
-		// Not whitelisted by the second WEP yet
-		Expect(ctr.Data().B2A.Whitelisted).NotTo(BeTrue())
+		// Approved by the first WEP (on egress from WEP)
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// Not approved by the second WEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
 	})
 
-	skbMark = tcdefs.MarkSeen // CALI_SKB_MARK_SEEN
+	expectMark(tcdefs.MarkSeen)
 
 	runBpfTest(t, "calico_to_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
@@ -223,13 +222,13 @@ func TestWhitelistWorkloadToWorkload(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by both WEPs
-		Expect(ctr.Data().A2B.Whitelisted).To(BeTrue())
-		Expect(ctr.Data().B2A.Whitelisted).To(BeTrue())
+		// Approved by both WEPs
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
 	})
 }
 
-func TestWhitelistFromHostExitHost(t *testing.T) {
+func TestAllowFromHostExitHost(t *testing.T) {
 	RegisterTestingT(t)
 
 	bpfIfaceName = "WHhs"
@@ -241,7 +240,7 @@ func TestWhitelistFromHostExitHost(t *testing.T) {
 	ipHdr.SrcIP = node1ip
 	ipHdr.DstIP = node2ip
 
-	_, ipv4, l4, _, pktBytes, err := testPacket(nil, ipHdr, nil, nil)
+	_, ipv4, l4, _, pktBytes, err := testPacketV4(nil, ipHdr, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 	udp := l4.(*layers.UDP)
 
@@ -265,7 +264,7 @@ func TestWhitelistFromHostExitHost(t *testing.T) {
 		ipv4.SrcIP, uint16(udp.SrcPort), ipv4.DstIP, uint16(udp.DstPort))
 
 	// Leaving node 1
-	skbMark = 0
+	skbMark = tcdefs.MarkSeen
 
 	runBpfTest(t, "calico_to_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
@@ -280,12 +279,13 @@ func TestWhitelistFromHostExitHost(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by HEP
-		Expect(ctr.Data().A2B.Whitelisted).To(BeFalse())
-		Expect(ctr.Data().B2A.Whitelisted).To(BeTrue())
+		// Approved by HEP
+		Expect(ctr.Data().A2B.Approved).To(BeFalse())
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
 	})
 
 	// Return
+	skbMark = 0
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		respPkt := udpResponseRaw(pktBytes)
 		res, err := bpfrun(respPkt)
@@ -303,8 +303,86 @@ func TestWhitelistFromHostExitHost(t *testing.T) {
 
 		ctr := ct[ctKey]
 
-		// Whitelisted by HEP
-		Expect(ctr.Data().A2B.Whitelisted).To(BeFalse())
-		Expect(ctr.Data().B2A.Whitelisted).To(BeTrue())
+		// Approved by HEP
+		Expect(ctr.Data().A2B.Approved).To(BeFalse())
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
 	})
+}
+
+func TestAllowEnterHostToWorkloadV6(t *testing.T) {
+	RegisterTestingT(t)
+
+	bpfIfaceName = "HWwl"
+	defer func() { bpfIfaceName = "" }()
+
+	hop := &layers.IPv6HopByHop{}
+	hop.NextHeader = layers.IPProtocolUDP
+
+	/* from gopacket ip6_test.go */
+	tlv := &layers.IPv6HopByHopOption{}
+	tlv.OptionType = 0x01 //PadN
+	tlv.OptionData = []byte{0x00, 0x00, 0x00, 0x00}
+	hop.Options = append(hop.Options, tlv)
+
+	_, _, l4, _, pktBytes, err := testPacketV6(nil, ipv6Default, nil, nil, hop)
+	Expect(err).NotTo(HaveOccurred())
+	udp := l4.(*layers.UDP)
+
+	resetMap(ctMapV6) // ensure it is clean
+
+	hostIP = node1ip
+
+	// Insert a reverse route for the source workload.
+	rtKey := routes.NewKeyV6(srcV6CIDR).AsBytes()
+	rtVal := routes.NewValueV6(routes.FlagsRemoteWorkload | routes.FlagInIPAMPool).AsBytes()
+	err = rtMapV6.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	rtKey = routes.NewKeyV6(dstV6CIDR).AsBytes()
+	rtVal = routes.NewValueV6WithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	err = rtMapV6.Update(rtKey, rtVal)
+	Expect(err).NotTo(HaveOccurred())
+	defer resetRTMap(rtMapV6)
+
+	dumpRTMapV6(rtMapV6)
+
+	ctKey := conntrack.NewKeyV6(17, /* UDP */
+		ipv6Default.SrcIP, uint16(udp.SrcPort), ipv6Default.DstIP, uint16(udp.DstPort))
+
+	skbMark = 0
+	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+
+		ct, err := conntrack.LoadMapMemV6(ctMapV6)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ct).Should(HaveKey(ctKey))
+
+		ctr := ct[ctKey]
+
+		// Approved by HEP
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+		// NOt approved by WEP yet
+		Expect(ctr.Data().B2A.Approved).NotTo(BeTrue())
+	}, withIPv6())
+
+	expectMark(tcdefs.MarkSeen)
+
+	dumpCTMapV6(ctMapV6)
+
+	runBpfTest(t, "calico_to_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(pktBytes)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+
+		ct, err := conntrack.LoadMapMemV6(ctMapV6)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ct).Should(HaveKey(ctKey))
+
+		ctr := ct[ctKey]
+
+		// Still approved both by HEP and WEP
+		Expect(ctr.Data().B2A.Approved).To(BeTrue())
+		Expect(ctr.Data().A2B.Approved).To(BeTrue())
+	}, withIPv6())
 }

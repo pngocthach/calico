@@ -14,22 +14,28 @@
 
 Param(
     [string]$NodeIp="",
-    [string]$InterfaceName="Ethernet"
+    [string]$InterfaceName="vEthernet (Ethernet*"
 )
 
 $baseDir = "$PSScriptRoot\.."
 . $baseDir\config.ps1
-ipmo $baseDir\libs\calico\calico.psm1
+ipmo $baseDir\libs\calico\calico.psm1 -Force
 
 Write-Host "Running kubelet service."
+
+# After restart of node network adapter goes to the wrong state. So, CalicoNode service recreates it.
+# But kubelet can start some pods using broken adapter before CalicoNode complete initialization.
+# So, we need to wait for complete Calico initialization.
+Wait-ForCalicoInit
+
 Write-Host "Using configured nodename: $env:NODENAME DNS: $env:DNS_NAME_SERVERS"
 
-Write-Host "Auto-detecting node IP, looking for interface named 'vEthernet ($InterfaceName...'."
-$na = Get-NetAdapter | ? Name -Like "vEthernet ($InterfaceName*" | ? Status -EQ Up
+Write-Host "Auto-detecting node IP, looking for interface named like '$InterfaceName' ..."
+$na = Get-NetAdapter | ? Name -Like "$InterfaceName" | ? Status -EQ Up
 while ($na -EQ $null) {
-    Write-Host "Waiting for interface named 'vEthernet ($InterfaceName...'."
+    Write-Host "Waiting for interface named like '$InterfaceName' ..."
     Start-Sleep 3
-    $na = Get-NetAdapter | ? Name -Like "vEthernet ($InterfaceName*" | ? Status -EQ Up
+    $na = Get-NetAdapter | ? Name -Like "$InterfaceName" | ? Status -EQ Up
 }
 $NodeIp = (Get-NetIPAddress -InterfaceAlias $na.ifAlias -AddressFamily IPv4).IPAddress
 Write-Host "Detected node IP: $NodeIp."
@@ -42,10 +48,8 @@ $argList = @(`
     "--enable-debugging-handlers",`
     "--cluster-dns=$env:DNS_NAME_SERVERS",`
     "--cluster-domain=cluster.local",`
-    "--kubeconfig=c:\k\config",`
     "--hairpin-mode=promiscuous-bridge",`
     "--cgroups-per-qos=false",`
-    "--logtostderr=true",`
     "--enforce-node-allocatable=""""",`
     "--kubeconfig=""c:\k\config"""`
 )
@@ -54,7 +58,6 @@ $argList = @(`
 if (Get-IsContainerdRunning)
 {
     Write-Host "Detected containerd running, configuring kubelet for containerd"
-    $argList += "--container-runtime=remote"
     $argList += "--container-runtime-endpoint=npipe:////.//pipe//containerd-containerd"
 }
 else

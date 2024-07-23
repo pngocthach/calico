@@ -42,8 +42,8 @@ import (
 )
 
 // ResourceManager provides a useful function for each resource type.  This includes:
-//	-  Commands to assist with generation of table output format of resources
-//	-  Commands to manage resource instances through an un-typed interface.
+//   - Commands to assist with generation of table output format of resources
+//   - Commands to manage resource instances through an un-typed interface.
 type ResourceManager interface {
 	GetTableDefaultHeadings(wide bool) []string
 	GetTableTemplate(columns []string, printNamespace bool) (string, error)
@@ -74,13 +74,13 @@ type ResourceListActionCommand func(context.Context, client.Interface, ResourceO
 
 // ResourceHelper encapsulates details about a specific version of a specific resource:
 //
-// 	-  The type of resource (Kind and Version).  This includes the list types (even
-//	   though they are not strictly resources themselves).
-// 	-  The concrete resource struct for this version
-//	-  Template strings used to format output for each resource type.
-//	-  Functions to handle resource management actions (apply, create, update, delete, list).
-//         These functions are an untyped interface (generic Resource interfaces) that map through
-//         to the Calico clients typed interface.
+//   - The type of resource (Kind and Version).  This includes the list types (even
+//     though they are not strictly resources themselves).
+//   - The concrete resource struct for this version
+//   - Template strings used to format output for each resource type.
+//   - Functions to handle resource management actions (apply, create, update, delete, list).
+//     These functions are an untyped interface (generic Resource interfaces) that map through
+//     to the Calico clients typed interface.
 type resourceHelper struct {
 	resource          runtime.Object
 	listResource      ResourceListObject
@@ -134,7 +134,7 @@ func registerResource(res ResourceObject, resList ResourceListObject, isNamespac
 	helpers[res.GetObjectKind().GroupVersionKind()] = rh
 
 	rh = resourceHelper{
-		listResource:      resList.(ResourceListObject),
+		listResource:      resList,
 		resourceType:      reflect.ValueOf(resList).Elem().Type(),
 		tableHeadings:     tableHeadings,
 		tableHeadingsWide: tableHeadingsWide,
@@ -165,7 +165,7 @@ func (rh resourceHelper) Apply(ctx context.Context, client client.Interface, res
 	}
 
 	// Store the original ResourceVersion for the Update operation later.
-	originalRV := resource.(ResourceObject).GetObjectMeta().GetResourceVersion()
+	originalRV := resource.GetObjectMeta().GetResourceVersion()
 
 	// Remove the resourceVersion, because Create call can't have
 	// resourceVersion set and Update automatically gets and sets
@@ -180,7 +180,7 @@ func (rh resourceHelper) Apply(ctx context.Context, client client.Interface, res
 	switch err.(type) {
 	case cerrors.ErrorResourceAlreadyExists, cerrors.ErrorOperationNotSupported:
 		// Insert the original ResourceVersion back into the object before trying the Update.
-		resource.(ResourceObject).GetObjectMeta().SetResourceVersion(originalRV)
+		resource.GetObjectMeta().SetResourceVersion(originalRV)
 
 		// Try updating if the resource already exists.
 		return rh.Update(ctx, client, resource)
@@ -206,7 +206,7 @@ func (rh resourceHelper) Update(ctx context.Context, client client.Interface, re
 	var err error
 
 	// Check to see if the resourceVersion is specified in the resource object.
-	rv := resource.(ResourceObject).GetObjectMeta().GetResourceVersion()
+	rv := resource.GetObjectMeta().GetResourceVersion()
 
 	// Copy the resource to prevent modifying the input resource metadata.
 	resource = resource.DeepCopyObject().(ResourceObject)
@@ -215,8 +215,8 @@ func (rh resourceHelper) Update(ctx context.Context, client client.Interface, re
 	// Do not attempt to retry if the resource version is specified.
 	if rv != "" {
 		// Clean out the resource version to always get the latest revision.
-		resource.(ResourceObject).GetObjectMeta().SetResourceVersion("")
-		// Validate the metadata is not changed for the the resource.
+		resource.GetObjectMeta().SetResourceVersion("")
+		// Validate the metadata is not changed for the resource.
 		ro, err := rh.get(ctx, client, resource)
 		if err != nil {
 			return ro, err
@@ -296,7 +296,7 @@ func (rh resourceHelper) Patch(ctx context.Context, client client.Interface, res
 		return ro, err
 	}
 
-	resource = mergeMetadataForUpdate(ro, resource)
+	resource = mergeMetadataForPatch(ro, resource)
 
 	// Marshal original obj for comparison
 	original, err := json.Marshal(ro)
@@ -307,7 +307,7 @@ func (rh resourceHelper) Patch(ctx context.Context, client client.Interface, res
 	// perform strategic merge
 	patched, err := strategicpatch.StrategicMergePatch(original, []byte(patch), ro.DeepCopyObject())
 	if err != nil {
-		return resource, fmt.Errorf("permorming strategic merge patch: %v", err)
+		return resource, fmt.Errorf("performing strategic merge patch: %v", err)
 	}
 
 	// convert patched data to resource
@@ -365,11 +365,11 @@ func GetResourcesFromArgs(args map[string]interface{}) ([]ResourceObject, error)
 			return nil, fmt.Errorf("resource type '%s' is not supported", kind)
 		}
 		res = res.DeepCopyObject().(ResourceObject)
-		res.(ResourceObject).GetObjectMeta().SetName(name)
+		res.GetObjectMeta().SetName(name)
 
 		// Set the namespace if the object kind is namespaced.
 		if helpers[res.GetObjectKind().GroupVersionKind()].isNamespaced {
-			res.(ResourceObject).GetObjectMeta().SetNamespace(namespace)
+			res.GetObjectMeta().SetNamespace(namespace)
 		}
 
 		ret = append(ret, res)
@@ -393,21 +393,21 @@ func newResource(tm schema.GroupVersionKind) (runtime.Object, error) {
 	log.Infof("Found resource helper: %s", rh)
 
 	// Create new resource and fill in the type metadata.
-	new := reflect.New(rh.resourceType)
-	elem := new.Elem()
+	n := reflect.New(rh.resourceType)
+	elem := n.Elem()
 	elem.FieldByName("Kind").SetString(tm.Kind)
 	elem.FieldByName("APIVersion").SetString(tm.GroupVersion().String())
 
-	_, ok = new.Interface().(ResourceObject)
+	_, ok = n.Interface().(ResourceObject)
 	if ok {
-		return new.Interface().(ResourceObject), nil
+		return n.Interface().(ResourceObject), nil
 	}
-	return new.Interface().(ResourceListObject), nil
+	return n.Interface().(ResourceListObject), nil
 }
 
 // Create the resource from the specified byte array encapsulating the resource.
-// -  The byte array may be JSON or YAML encoding of either a single resource or list of
-//    resources as defined by the API objects in /api.
+//   - The byte array may be JSON or YAML encoding of either a single resource or list of
+//     resources as defined by the API objects in /api.
 //
 // The returned Resource will either be a single resource document or a List of documents.
 // If the file does not contain any valid Resources this function returns an error.
@@ -479,9 +479,9 @@ func unmarshalSliceOfResources(tml []unstructured.Unstructured, b []byte) ([]run
 }
 
 // CreateResourcesFromFile creates the Resource from the specified file f.
-// 	-  The file format may be JSON or YAML encoding of either a single resource or list of
-// 	   resources as defined by the API objects in /api.
-// 	-  A filename of "-" means "Read from stdin".
+//   - The file format may be JSON or YAML encoding of either a single resource or list of
+//     resources as defined by the API objects in /api.
+//   - A filename of "-" means "Read from stdin".
 //
 // The returned Resource will either be a single Resource or a List containing zero or more
 // Resources.  If the file does not contain any valid Resources this function returns an error.
@@ -598,6 +598,36 @@ func mergeMetadataForUpdate(old, new ResourceObject) ResourceObject {
 	// so that they will not be overwritten.
 	sm.SetAnnotations(cm.GetAnnotations())
 	sm.SetLabels(cm.GetLabels())
+
+	sm.(*v1.ObjectMeta).DeepCopyInto(cm.(*v1.ObjectMeta))
+	return new
+}
+
+// mergeMetadataForPatch merges the Metadata for a stored ResourceObject and a potential
+// patch non-destructively. The resulting labels and annotations will be the union of
+// the two sets.
+func mergeMetadataForPatch(old, new ResourceObject) ResourceObject {
+	sm := old.GetObjectMeta()
+	cm := new.GetObjectMeta()
+
+	// Set the fields that are allowed to be overwritten (Labels and Annotations)
+	// so that they will not be overwritten.
+	annotations := sm.GetAnnotations()
+	for key, val := range cm.GetAnnotations() {
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[key] = val
+	}
+	labels := sm.GetLabels()
+	for key, val := range cm.GetLabels() {
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels[key] = val
+	}
+	sm.SetAnnotations(annotations)
+	sm.SetLabels(labels)
 
 	sm.(*v1.ObjectMeta).DeepCopyInto(cm.(*v1.ObjectMeta))
 	return new

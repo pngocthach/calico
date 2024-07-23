@@ -312,7 +312,7 @@ func schema_libcalico_go_lib_apis_v1_CalicoAPIConfigSpec(ref common.ReferenceCal
 					},
 					"EtcdConfig": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Inline the ectd config fields",
+							Description: "Inline the etcd config fields",
 							Default:     map[string]interface{}{},
 							Ref:         ref("github.com/projectcalico/calico/libcalico-go/lib/apis/v1.EtcdConfig"),
 						},
@@ -829,7 +829,7 @@ func schema_libcalico_go_lib_apis_v1_IPPool(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "IPPool contains the details of a Calico IP pool resource. A pool resource is used by Calico in two ways:\n\t- to provide a set of IP addresses from which Calico IPAM assigns addresses\n\t  for workloads.\n\t- to provide configuration specific to IP address range, such as configuration\n\t  for the BGP daemon (e.g. when to use a GRE tunnel to encapsulate packets\n\t  between compute hosts).",
+				Description: "IPPool contains the details of a Calico IP pool resource. A pool resource is used by Calico in two ways:\n  - to provide a set of IP addresses from which Calico IPAM assigns addresses\n    for workloads.\n  - to provide configuration specific to IP address range, such as configuration\n    for the BGP daemon (e.g. when to use a GRE tunnel to encapsulate packets\n    between compute hosts).",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"TypeMetadata": {
@@ -1238,7 +1238,7 @@ func schema_libcalico_go_lib_apis_v1_Policy(ref common.ReferenceCallback) common
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "Policy contains information about a security Policy resource.  This contains a set of security rules to apply.  Security policies allow a selector-based security model which can override the security profiles directly referenced by an endpoint.\n\nEach policy must do one of the following:\n\n \t- Match the packet and apply an \"allow\" action; this immediately accepts the packet, skipping\n       all further policies and profiles. This is not recommended in general, because it prevents\n       further policy from being executed.\n\t- Match the packet and apply a \"deny\" action; this drops the packet immediately, skipping all\n       further policy and profiles.\n\t- Fail to match the packet; in which case the packet proceeds to the next policy. If there\n\t  are no more policies then the packet is dropped.\n\nCalico implements the security policy for each endpoint individually and only the policies that have matching selectors are implemented. This ensures that the number of rules that actually need to be inserted into the kernel is proportional to the number of local endpoints rather than the total amount of policy.",
+				Description: "Policy contains information about a security Policy resource.  This contains a set of security rules to apply.  Security policies allow a selector-based security model which can override the security profiles directly referenced by an endpoint.\n\nEach policy must do one of the following:\n\n  - Match the packet and apply an \"allow\" action; this immediately accepts the packet, skipping\n    all further policies and profiles. This is not recommended in general, because it prevents\n    further policy from being executed.\n  - Match the packet and apply a \"deny\" action; this drops the packet immediately, skipping all\n    further policy and profiles.\n  - Fail to match the packet; in which case the packet proceeds to the next policy. If there\n    are no more policies then the packet is dropped.\n\nCalico implements the security policy for each endpoint individually and only the policies that have matching selectors are implemented. This ensures that the number of rules that actually need to be inserted into the kernel is proportional to the number of local endpoints rather than the total amount of policy.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"TypeMetadata": {
@@ -1398,7 +1398,7 @@ func schema_libcalico_go_lib_apis_v1_PolicySpec(ref common.ReferenceCallback) co
 					},
 					"selector": {
 						SchemaProps: spec.SchemaProps{
-							Description: "The selector is an expression used to pick pick out the endpoints that the policy should be applied to.\n\nSelector expressions follow this syntax:\n\n\tlabel == \"string_literal\"  ->  comparison, e.g. my_label == \"foo bar\"\n\tlabel != \"string_literal\"   ->  not equal; also matches if label is not present\n\tlabel in { \"a\", \"b\", \"c\", ... }  ->  true if the value of label X is one of \"a\", \"b\", \"c\"\n\tlabel not in { \"a\", \"b\", \"c\", ... }  ->  true if the value of label X is not one of \"a\", \"b\", \"c\"\n\thas(label_name)  -> True if that label is present\n\t! expr -> negation of expr\n\texpr && expr  -> Short-circuit and\n\texpr || expr  -> Short-circuit or\n\t( expr ) -> parens for grouping\n\tall() or the empty selector -> matches all endpoints.\n\nLabel names are allowed to contain alphanumerics, -, _ and /. String literals are more permissive but they do not support escape characters.\n\nExamples (with made-up labels):\n\n\ttype == \"webserver\" && deployment == \"prod\"\n\ttype in {\"frontend\", \"backend\"}\n\tdeployment != \"dev\"\n\t! has(label_name)",
+							Description: "The selector is an expression used to pick out the endpoints that the policy should be applied to.\n\nSelector expressions follow this syntax:\n\n\tlabel == \"string_literal\"  ->  comparison, e.g. my_label == \"foo bar\"\n\tlabel != \"string_literal\"   ->  not equal; also matches if label is not present\n\tlabel in { \"a\", \"b\", \"c\", ... }  ->  true if the value of label X is one of \"a\", \"b\", \"c\"\n\tlabel not in { \"a\", \"b\", \"c\", ... }  ->  true if the value of label X is not one of \"a\", \"b\", \"c\"\n\thas(label_name)  -> True if that label is present\n\t! expr -> negation of expr\n\texpr && expr  -> Short-circuit and\n\texpr || expr  -> Short-circuit or\n\t( expr ) -> parens for grouping\n\tall() or the empty selector -> matches all endpoints.\n\nLabel names are allowed to contain alphanumerics, -, _ and /. String literals are more permissive but they do not support escape characters.\n\nExamples (with made-up labels):\n\n\ttype == \"webserver\" && deployment == \"prod\"\n\ttype in {\"frontend\", \"backend\"}\n\tdeployment != \"dev\"\n\t! has(label_name)",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -1926,7 +1926,7 @@ func schema_libcalico_go_lib_apis_v1_WorkloadEndpointSpec(ref common.ReferenceCa
 					},
 					"allow_spoofed_source_prefixes": {
 						SchemaProps: spec.SchemaProps{
-							Description: "AllowSpoofedSourcePrefixes is a list of CIDRs this workload endoint is allowed to send traffic from, i.e. this allows the workload endpoint to spoof its IP address using addresses in these prefixes",
+							Description: "AllowSpoofedSourcePrefixes is a list of CIDRs this workload endpoint is allowed to send traffic from, i.e. this allows the workload endpoint to spoof its IP address using addresses in these prefixes",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -2879,7 +2879,14 @@ func schema_libcalico_go_lib_apis_v3_NodeStatus(ref common.ReferenceCallback) co
 				Properties: map[string]spec.Schema{
 					"wireguardPublicKey": {
 						SchemaProps: spec.SchemaProps{
-							Description: "WireguardPublicKey is the Wireguard public-key for this node. wireguardPublicKey validates if the string is a valid base64 encoded key.",
+							Description: "WireguardPublicKey is the IPv4 Wireguard public-key for this node. wireguardPublicKey validates if the string is a valid base64 encoded key.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"wireguardPublicKeyV6": {
+						SchemaProps: spec.SchemaProps{
+							Description: "WireguardPublicKeyV6 is the IPv6 Wireguard public-key for this node. wireguardPublicKey validates if the string is a valid base64 encoded key.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -2914,7 +2921,14 @@ func schema_libcalico_go_lib_apis_v3_NodeWireguardSpec(ref common.ReferenceCallb
 				Properties: map[string]spec.Schema{
 					"interfaceIPv4Address": {
 						SchemaProps: spec.SchemaProps{
-							Description: "InterfaceIPv4Address is the IPv4 address for the Wireguard interface.",
+							Description: "InterfaceIPv4Address is the IP address for the IPv4 Wireguard interface.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"interfaceIPv6Address": {
+						SchemaProps: spec.SchemaProps{
+							Description: "InterfaceIPv6Address is the IP address for the IPv6 Wireguard interface.",
 							Type:        []string{"string"},
 							Format:      "",
 						},

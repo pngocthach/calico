@@ -160,6 +160,21 @@ func (c client) CalicoNodeStatus() CalicoNodeStatusInterface {
 	return calicoNodeStatus{client: c}
 }
 
+// IPAMConfig returns an interface for managing the IPAMConfig resource.
+func (c client) IPAMConfig() IPAMConfigInterface {
+	return IPAMConfigs{client: c}
+}
+
+// BlockAffinity returns an interface for viewing the IPAM block affinity resources.
+func (c client) BlockAffinities() BlockAffinityInterface {
+	return blockAffinities{client: c}
+}
+
+// BGPFilter returns an interface for managing the BGPFilter resource.
+func (c client) BGPFilter() BGPFilterInterface {
+	return BGPFilter{client: c}
+}
+
 type poolAccessor struct {
 	client *client
 }

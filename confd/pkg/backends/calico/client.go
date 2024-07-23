@@ -1,10 +1,10 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -80,6 +80,21 @@ type backendClientAccessor interface {
 	Backend() api.Client
 }
 
+func NewRouteIndex() *RouteIndex {
+	return &RouteIndex{
+		programmedRoutes:       make(map[string]bool),
+		programmedRejectRoutes: make(map[string]bool),
+	}
+}
+
+// RouteIndex is a helper type for tracking which routes have been programmed
+// for a given route type (ExternalIP, LoadBalancer, ClusterIP) based on what we've
+// read from the BGPConfiguration API. Used to ensure we don't send duplicate routes.
+type RouteIndex struct {
+	programmedRoutes       map[string]bool
+	programmedRejectRoutes map[string]bool
+}
+
 func NewCalicoClient(confdConfig *config.Config) (*client, error) {
 	// Load the client clientCfg.  This loads from the environment if a filename
 	// has not been specified.
@@ -121,18 +136,25 @@ func NewCalicoClient(confdConfig *config.Config) (*client, error) {
 	// Create the client.  Initialize the cache revision to 1 so that the watcher
 	// code can handle the first iteration by always rendering.
 	c := &client{
-		client:            bc,
-		cache:             make(map[string]string),
-		peeringCache:      make(map[string]string),
-		cacheRevision:     1,
-		revisionsByPrefix: make(map[string]uint64),
-		nodeMeshEnabled:   nodeMeshEnabled,
-		nodeLabelManager:  newNodeLabelManager(),
-		bgpPeers:          make(map[string]*apiv3.BGPPeer),
-		sourceReady:       make(map[string]bool),
-		nodeListenPorts:   make(map[string]uint16),
-		globalBGPConfig:   cfg,
-		nodeIPs:           make(map[string]struct{}),
+		client:                  bc,
+		cache:                   make(map[string]string),
+		peeringCache:            make(map[string]string),
+		cacheRevision:           1,
+		revisionsByPrefix:       make(map[string]uint64),
+		nodeMeshEnabled:         nodeMeshEnabled,
+		nodeLabelManager:        newNodeLabelManager(),
+		bgpPeers:                make(map[string]*apiv3.BGPPeer),
+		sourceReady:             make(map[string]bool),
+		nodeListenPorts:         make(map[string]uint16),
+		globalBGPConfig:         cfg,
+		nodeIPs:                 make(map[string]struct{}),
+		programmedRouteRefCount: make(map[string]int),
+
+		// Track which routes we have sent, and which we have not. We need maps for
+		// each of the three types of routes we track.
+		ExternalIPRouteIndex:     NewRouteIndex(),
+		ClusterIPRouteIndex:      NewRouteIndex(),
+		LoadBalancerIPRouteIndex: NewRouteIndex(),
 
 		// This channel, for the syncer calling OnUpdates and OnStatusUpdated, has 0
 		// capacity so that the caller blocks in the same way as it did before when its
@@ -217,7 +239,7 @@ func NewCalicoClient(confdConfig *config.Config) (*client, error) {
 		c.syncer.Start()
 	}
 
-	if len(clusterCIDRs) != 0 || len(externalCIDRs) != 0 {
+	if len(clusterCIDRs) != 0 || len(externalCIDRs) != 0 || len(lbCIDRs) != 0 {
 		// Create and start route generator, if configured to do so. This can either be through
 		// environment variable, or the data store via BGPConfiguration.
 		// We only turn it on if configured to do so, to avoid needing to watch services / endpoints.
@@ -279,6 +301,16 @@ type client struct {
 
 	// The route generator
 	rg *routeGenerator
+
+	// Keep reference counts of programmed routes. We have multiple route
+	// sources to track - k8s Services, and BGPConfiguration - and they can
+	// provide duplicate routes.
+	programmedRouteRefCount map[string]int
+
+	// Indexes for tracking programmed routes of each type.
+	ExternalIPRouteIndex     *RouteIndex
+	ClusterIPRouteIndex      *RouteIndex
+	LoadBalancerIPRouteIndex *RouteIndex
 
 	// Readiness signals for individual data sources.
 	sourceReady map[string]bool
@@ -429,6 +461,9 @@ type bgpPeer struct {
 	RestartTime     string               `json:"restart_time"`
 	CalicoNode      bool                 `json:"calico_node"`
 	NumAllowLocalAS int32                `json:"num_allow_local_as"`
+	TTLSecurity     uint8                `json:"ttl_security"`
+	ReachableBy     string               `json:"reachable_by"`
+	Filters         []string             `json:"filters"`
 }
 
 type bgpPrefix struct {
@@ -519,14 +554,14 @@ func (c *client) updatePeersV1() {
 			var peers []*bgpPeer
 			if v3res.Spec.PeerSelector != "" {
 				for _, peerNodeName := range c.nodeLabelManager.nodesMatching(v3res.Spec.PeerSelector) {
-					peers = append(peers, c.nodeAsBGPPeers(peerNodeName)...)
+					peers = append(peers, c.nodeAsBGPPeers(peerNodeName, true, true, v3res)...)
 				}
 			} else {
 				// Separate port from Ip if it uses <ip>:<port> format
 				host, port := parseIPPort(v3res.Spec.PeerIP)
 				ip := cnet.ParseIP(host)
 				if ip == nil {
-					log.Warning("PeerIP is not assigned or is malformed")
+					log.Error("PeerIP is not assigned or is malformed")
 					continue
 				}
 
@@ -553,6 +588,26 @@ func (c *client) updatePeersV1() {
 					numLocalAS = *v3res.Spec.NumAllowedLocalASNumbers
 				}
 
+				var ttlSecurityHopCount uint8
+				if v3res.Spec.TTLSecurity != nil {
+					ttlSecurityHopCount = *v3res.Spec.TTLSecurity
+				}
+
+				var reachableBy string
+				if v3res.Spec.ReachableBy != "" {
+					reachableByAddr := cnet.ParseIP(v3res.Spec.ReachableBy)
+					if reachableByAddr == nil {
+						log.Error("ReachableBy address is malformed")
+						continue
+					}
+
+					if reachableByAddr.Version() != ip.Version() {
+						log.Error("ReachableBy address family does not match PeerIP")
+						continue
+					}
+					reachableBy = v3res.Spec.ReachableBy
+				}
+
 				peers = append(peers, &bgpPeer{
 					PeerIP:          *ip,
 					ASNum:           v3res.Spec.ASNumber,
@@ -560,7 +615,10 @@ func (c *client) updatePeersV1() {
 					Port:            port,
 					KeepNextHop:     v3res.Spec.KeepOriginalNextHop,
 					CalicoNode:      isCalicoNode,
+					TTLSecurity:     ttlSecurityHopCount,
+					Filters:         v3res.Spec.Filters,
 					NumAllowLocalAS: numLocalAS,
+					ReachableBy:     reachableBy,
 				})
 			}
 			log.Debugf("Peers %#v", peers)
@@ -594,11 +652,22 @@ func (c *client) updatePeersV1() {
 		// This time, the "local" nodes are actually those matching the remote fields
 		// in BGPPeer, i.e. PeerIP, ASNumber and PeerSelector...
 		var localNodeNames []string
+		var includeV4, includeV6 bool
 		if v3res.Spec.PeerSelector != "" {
 			localNodeNames = c.nodeLabelManager.nodesMatching(v3res.Spec.PeerSelector)
+			// Peering on label selector, so we should reverse the peering over IPv4 and IPv6.
+			includeV4 = true
+			includeV6 = true
 		} else {
 			ip, port := parseIPPort(v3res.Spec.PeerIP)
 			localNodeNames = c.nodesWithIPPortAndAS(ip, v3res.Spec.ASNumber, port)
+			// Peering on IP only selector, so we should reverse the peering only over the
+			// same IP version.
+			if strings.Contains(ip, ":") {
+				includeV6 = true
+			} else {
+				includeV4 = true
+			}
 		}
 		log.Debugf("Local nodes %#v", localNodeNames)
 
@@ -625,7 +694,7 @@ func (c *client) updatePeersV1() {
 
 		var peers []*bgpPeer
 		for _, peerNodeName := range peerNodeNames {
-			peers = append(peers, c.nodeAsBGPPeers(peerNodeName)...)
+			peers = append(peers, c.nodeAsBGPPeers(peerNodeName, includeV4, includeV6, v3res)...)
 		}
 		if len(peers) == 0 {
 			continue
@@ -727,12 +796,16 @@ func (c *client) globalAS() string {
 	return c.cache[asKey]
 }
 
-func (c *client) nodeAsBGPPeers(nodeName string) (peers []*bgpPeer) {
+func (c *client) nodeAsBGPPeers(nodeName string, v4 bool, v6 bool, v3Peer *apiv3.BGPPeer) (peers []*bgpPeer) {
 	ipv4Str, ipv6Str, asNum, rrClusterID := c.nodeToBGPFields(nodeName)
-	for version, ipStr := range map[string]string{
-		"IPv4": ipv4Str,
-		"IPv6": ipv6Str,
-	} {
+	versions := map[string]string{}
+	if v4 {
+		versions["IPv4"] = ipv4Str
+	}
+	if v6 {
+		versions["IPv6"] = ipv6Str
+	}
+	for version, ipStr := range versions {
 		peer := &bgpPeer{}
 		if ipStr == "" {
 			log.Debugf("No %v for node %v", version, nodeName)
@@ -744,6 +817,16 @@ func (c *client) nodeAsBGPPeers(nodeName string) (peers []*bgpPeer) {
 			continue
 		}
 		peer.PeerIP = *ip
+
+		if v3Peer.Spec.TTLSecurity != nil {
+			peer.TTLSecurity = *v3Peer.Spec.TTLSecurity
+		}
+
+		if v3Peer.Spec.ReachableBy != "" {
+			peer.ReachableBy = v3Peer.Spec.ReachableBy
+		}
+
+		peer.Filters = v3Peer.Spec.Filters
 
 		// If peer node has listenPort set in BGPConfiguration, use that.
 		if port, ok := c.nodeListenPorts[nodeName]; ok {
@@ -776,16 +859,15 @@ func (c *client) nodeAsBGPPeers(nodeName string) (peers []*bgpPeer) {
 // OnUpdates is called from the BGP syncer to indicate that new updates are available from the
 // Calico datastore.
 // This client does the following:
-// -  stores the updates in its local cache
-// -  increments the revision number associated with each of the affected watch prefixes
-// -  wakes up the watchers so that they can check if any of the prefixes they are
-//    watching have been updated.
+//   - stores the updates in its local cache
+//   - increments the revision number associated with each of the affected watch prefixes
+//   - wakes up the watchers so that they can check if any of the prefixes they are
+//     watching have been updated.
 func (c *client) OnUpdates(updates []api.Update) {
 	c.syncerC <- updates
 }
 
 func (c *client) onUpdates(updates []api.Update, needUpdatePeersV1 bool) {
-
 	// Update our cache from the updates.
 	c.cacheLock.Lock()
 	defer c.cacheLock.Unlock()
@@ -864,7 +946,7 @@ func (c *client) onUpdates(updates []api.Update, needUpdatePeersV1 bool) {
 						delete(c.nodeIPs, oldNodeIPv4)
 					}
 					if oldNodeIPv6 != "" && oldNodeIPv6 == nodeIPv6 {
-						// IPv6 adress is updated, remove the old IPv6 address.
+						// IPv6 address is updated, remove the old IPv6 address.
 						delete(c.nodeIPs, oldNodeIPv6)
 					}
 					if nodeIPv4 != "" {
@@ -923,6 +1005,11 @@ func (c *client) onUpdates(updates []api.Update, needUpdatePeersV1 bool) {
 			// Note need to recompute equivalent v1 peerings.
 			needUpdatePeersV1 = true
 			needUpdatePeersReasons = append(needUpdatePeersReasons, "BGP peer updated or deleted")
+		}
+
+		if v3key.Kind == apiv3.KindBGPFilter {
+			needUpdatePeersV1 = true
+			needUpdatePeersReasons = append(needUpdatePeersReasons, "BGPFilter updated or deleted")
 		}
 	}
 
@@ -1012,7 +1099,6 @@ func (c *client) onUpdates(updates []api.Update, needUpdatePeersV1 bool) {
 }
 
 func (c *client) updateBGPConfigCache(resName string, v3res *apiv3.BGPConfiguration, svcAdvertisement *bool, updatePeersV1 *bool, updateReasons *[]string) {
-
 	if resName == globalConfigName {
 		c.getPrefixAdvertisementsKVPair(v3res, model.GlobalBGPConfigKey{})
 		c.getListenPortKVPair(v3res, model.GlobalBGPConfigKey{}, updatePeersV1, updateReasons)
@@ -1025,6 +1111,7 @@ func (c *client) updateBGPConfigCache(resName string, v3res *apiv3.BGPConfigurat
 		c.getLogSeverityKVPair(v3res, model.GlobalBGPConfigKey{})
 		c.getNodeMeshRestartTimeKVPair(v3res, model.GlobalBGPConfigKey{})
 		c.getNodeMeshPasswordKVPair(v3res, model.GlobalBGPConfigKey{})
+		c.getIgnoredInterfacesKVPair(v3res, model.GlobalBGPConfigKey{})
 
 		// Cache the updated BGP configuration
 		c.globalBGPConfig = v3res
@@ -1078,7 +1165,7 @@ func (c *client) getPrefixAdvertisementsKVPair(v3res *apiv3.BGPConfiguration, ke
 		for _, prefixAdvertisement := range v3res.Spec.PrefixAdvertisements {
 			cidr := prefixAdvertisement.CIDR
 
-			communitiesSet := set.New()
+			communitiesSet := set.New[string]()
 			for _, c := range prefixAdvertisement.Communities {
 				isCommunity := isValidCommunity(c)
 				// if c is a community value, use it directly, else get the community value from defined definedCommunities.
@@ -1234,7 +1321,7 @@ func (c *client) getNodeToNodeMeshKVPair(v3res *apiv3.BGPConfiguration, key inte
 
 	if v3res != nil && v3res.Spec.NodeToNodeMeshEnabled != nil {
 		enabled := *v3res.Spec.NodeToNodeMeshEnabled
-		var val = nodeToNodeMeshEnabled
+		val := nodeToNodeMeshEnabled
 		if !enabled {
 			val = nodeToNodeMeshDisabled
 		}
@@ -1283,7 +1370,8 @@ func (c *client) getNodeMeshPasswordKVPair(v3res *apiv3.BGPConfiguration, key in
 		)
 		if err != nil {
 			log.WithError(err).Warningf("Can't read password referenced by BGP Configuration %v in secret %s:%s", v3res.Name, v3res.Spec.NodeMeshPassword.SecretKeyRef.Name, v3res.Spec.NodeMeshPassword.SecretKeyRef.Key)
-			// Skip updating the password if it is unreadable
+			// Secret or key not available, treat as a delete.
+			c.updateCache(api.UpdateTypeKVDeleted, getKVPair(meshPasswordKey))
 			return
 		}
 		c.updateCache(api.UpdateTypeKVUpdated, getKVPair(meshPasswordKey, password))
@@ -1292,22 +1380,27 @@ func (c *client) getNodeMeshPasswordKVPair(v3res *apiv3.BGPConfiguration, key in
 	}
 }
 
+func (c *client) getIgnoredInterfacesKVPair(v3res *apiv3.BGPConfiguration, key interface{}) {
+	ignoredIfacesKey := getBGPConfigKey("ignored_interfaces", key)
+	if v3res != nil && v3res.Spec.IgnoredInterfaces != nil {
+		c.updateCache(api.UpdateTypeKVUpdated, getKVPair(ignoredIfacesKey, strings.Join(v3res.Spec.IgnoredInterfaces, ",")))
+	} else {
+		c.updateCache(api.UpdateTypeKVDeleted, getKVPair(ignoredIfacesKey))
+	}
+}
+
 func getNodeName(nodeName string) string {
 	return strings.TrimPrefix(nodeName, perNodeConfigNamePrefix)
 }
 
-func getCommunitiesArray(communitiesSet set.Set) []string {
-	var communityValue []string
-	communitiesSet.Iter(func(item interface{}) error {
-		communityValue = append(communityValue, item.(string))
-		return nil
-	})
+func getCommunitiesArray(communitiesSet set.Set[string]) []string {
+	communityValue := communitiesSet.Slice()
 	sort.Strings(communityValue)
 	return communityValue
 }
 
 func (c *client) onExternalIPsUpdate(externalIPs []string) {
-	if err := c.updateGlobalRoutes(c.externalIPs, externalIPs); err == nil {
+	if err := c.updateGlobalRoutes(externalIPs, c.ExternalIPRouteIndex); err == nil {
 		c.externalIPs = externalIPs
 		c.externalIPNets = parseIPNets(c.externalIPs)
 		log.Infof("Updated with new external IP CIDRs: %s", externalIPs)
@@ -1317,7 +1410,7 @@ func (c *client) onExternalIPsUpdate(externalIPs []string) {
 }
 
 func (c *client) onClusterIPsUpdate(clusterCIDRs []string) {
-	if err := c.updateGlobalRoutes(c.clusterCIDRs, clusterCIDRs); err == nil {
+	if err := c.updateGlobalRoutes(clusterCIDRs, c.ClusterIPRouteIndex); err == nil {
 		c.clusterCIDRs = clusterCIDRs
 		log.Infof("Updated with new cluster IP CIDRs: %s", clusterCIDRs)
 	} else {
@@ -1326,7 +1419,21 @@ func (c *client) onClusterIPsUpdate(clusterCIDRs []string) {
 }
 
 func (c *client) onLoadBalancerIPsUpdate(lbIPs []string) {
-	if err := c.updateGlobalRoutes(c.loadBalancerIPs, lbIPs); err == nil {
+	// We advertise the given LB IP ranges from every node in order to satisfy services with external traffic policy of "cluster".
+	// However, we don't want to advertise single IPs in this way because it breaks any "local" type services the user creates,
+	// which should instead be advertised from only a subset of nodes.
+	// So, we handle advertisement of any single-addresses found in the config on a per-service basis from within the routeGenerator.
+	var globalLbIPs []string
+	for _, lbIP := range lbIPs {
+		if strings.Contains(lbIP, ":") {
+			if !strings.HasSuffix(lbIP, "/128") {
+				globalLbIPs = append(globalLbIPs, lbIP)
+			}
+		} else if !strings.HasSuffix(lbIP, "/32") {
+			globalLbIPs = append(globalLbIPs, lbIP)
+		}
+	}
+	if err := c.updateGlobalRoutes(globalLbIPs, c.LoadBalancerIPRouteIndex); err == nil {
 		c.loadBalancerIPs = lbIPs
 		c.loadBalancerIPNets = parseIPNets(c.loadBalancerIPs)
 		log.Infof("Updated with new Loadbalancer IP CIDRs: %s", lbIPs)
@@ -1353,10 +1460,19 @@ func (c *client) GetLoadBalancerIPs() []*net.IPNet {
 	return c.loadBalancerIPNets
 }
 
-// "Global" here means the routes for cluster IP and external IP CIDRs that are advertised from
-// every node in the cluster.
-func (c *client) updateGlobalRoutes(current, new []string) error {
-	for _, n := range new {
+// updateGlobalRoutes updates programs and withdraws routes based on the given CIDRs as provided via
+// the BGPConfiguration API, and this node's service advertisement status as configured via
+// the per-node Service advertisement exclusion label.
+//
+// Each call to this function is scoped to a particular route type - ClusterIP,
+// ExternalIP, or LoadBalancerIP - based on the provided RouteIndex.
+//
+// The provided RouteIndex is used to ensure that routes for a particular CIDR are only
+// programmed once, and to ensure that any programmed routes that are no
+// longer valid are withdrawn.
+func (c *client) updateGlobalRoutes(cidrs []string, ri *RouteIndex) error {
+	// Pre-validate the given CIDRs.
+	for _, n := range cidrs {
 		_, _, err := net.ParseCIDR(n)
 		if err != nil {
 			// Shouldn't ever happen, given prior validation.
@@ -1364,29 +1480,66 @@ func (c *client) updateGlobalRoutes(current, new []string) error {
 		}
 	}
 
-	// Find any currently advertised CIDRs that we should withdraw.
-	withdraws := []string{}
-	for _, existing := range current {
-		if !contains(new, existing) {
-			withdraws = append(withdraws, existing)
-		}
-	}
-
 	if !c.ExcludeServiceAdvertisement() {
-		// Withdraw the old CIDRs and add the new.
 		log.Info("Advertise global service ranges from this node")
-		c.addRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, new)
-		c.addRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, new)
-		c.deleteRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, withdraws)
-		c.deleteRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, withdraws)
+		for _, r := range cidrs {
+			// Program each of the given CIDRs as a reject route, assuming it hasn't
+			// already been added.
+			if !ri.programmedRejectRoutes[r] {
+				c.addRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, []string{r})
+				ri.programmedRejectRoutes[r] = true
+			}
+
+			// Program each CIDR as a route, assuming it hasn't already been added.
+			if !ri.programmedRoutes[r] {
+				c.addRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, []string{r})
+				ri.programmedRoutes[r] = true
+			}
+		}
+
+		// For each programmed route, if the CIDR is no longer present, remove it.
+		for r := range ri.programmedRoutes {
+			if !contains(cidrs, r) {
+				c.deleteRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, []string{r})
+				delete(ri.programmedRoutes, r)
+			}
+		}
+
+		// For each programmed reject route, if the CIDR is no longer present, remove it.
+		for r := range ri.programmedRejectRoutes {
+			if !contains(cidrs, r) {
+				c.deleteRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, []string{r})
+				delete(ri.programmedRejectRoutes, r)
+			}
+		}
 	} else {
 		// If this node is excluded from service advertisement, we should not advertise any
 		// routes. However, we should still program reject rules for the CIDR range so we do not
 		// program any learned routes into the data plane.
 		log.Info("Do not advertise global service ranges from this node")
-		c.deleteRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, current)
-		c.deleteRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, current)
-		c.addRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, new)
+
+		// Program each of the given CIDRs as a reject route, assuming it hasn't
+		// already been added.
+		for _, r := range cidrs {
+			if !ri.programmedRejectRoutes[r] {
+				c.addRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, []string{r})
+				ri.programmedRejectRoutes[r] = true
+			}
+		}
+
+		// For each programmed reject route, if the CIDR is no longer present, remove it.
+		for r := range ri.programmedRejectRoutes {
+			if !contains(cidrs, r) {
+				c.deleteRoutesLockHeld(rejectKeyPrefix, rejectKeyPrefixV6, []string{r})
+				delete(ri.programmedRejectRoutes, r)
+			}
+		}
+
+		// Withdraw all routes that had previously been programmed.
+		for r := range ri.programmedRoutes {
+			c.deleteRoutesLockHeld(routeKeyPrefix, routeKeyPrefixV6, []string{r})
+			delete(ri.programmedRoutes, r)
+		}
 	}
 
 	return nil
@@ -1432,8 +1585,7 @@ func (c *client) updateCache(updateType api.UpdateType, kvp *model.KVPair) bool 
 		return false
 	}
 
-	switch updateType {
-	case api.UpdateTypeKVDeleted:
+	if kvp.Value == nil {
 		// The bird templates that confd is used to render assume that some global
 		// defaults are always configured.
 		if globalDefault, ok := globalDefaults[k]; ok {
@@ -1447,16 +1599,36 @@ func (c *client) updateCache(updateType api.UpdateType, kvp *model.KVPair) bool 
 			}
 			delete(c.cache, k)
 		}
-	case api.UpdateTypeKVNew, api.UpdateTypeKVUpdated:
+	} else {
+		// Serialize the value and check if it needs to be updated.
 		value, err := model.SerializeValue(kvp)
 		if err != nil {
 			log.Errorf("Ignoring update: unable to serialize value %v: %v", kvp.Value, err)
 			return false
 		}
 		newValue := string(value)
-		if currentValue, isSet := c.cache[k]; isSet && currentValue == newValue {
+		currentValue, isSet := c.cache[k]
+		if isSet && currentValue == newValue {
 			return false
 		}
+
+		// Ignore pending block affinities - we shouldn't act upon them
+		// unless they are confirmed. Treat pending affinities as a delete.
+		if key, ok := kvp.Key.(model.BlockAffinityKey); ok {
+			aff := kvp.Value.(*model.BlockAffinity)
+			if aff.State == model.StatePending {
+				if isSet {
+					// Strictly speaking, a block affinity will never go from confirmed back to pending,
+					// but to be extra careful we handle that case anyway.
+					delete(c.cache, k)
+					return true
+				}
+				log.WithFields(log.Fields{"cidr": key.CIDR, "host": key.Host}).Debug("Block affinity is pending, skip")
+				return false
+			}
+		}
+
+		// Update the cache.
 		c.cache[k] = newValue
 	}
 
@@ -1607,10 +1779,12 @@ func (c *client) updateLogLevel() {
 	}
 }
 
-var routeKeyPrefix = "/calico/staticroutes/"
-var rejectKeyPrefix = "/calico/rejectcidrs/"
-var routeKeyPrefixV6 = "/calico/staticroutesv6/"
-var rejectKeyPrefixV6 = "/calico/rejectcidrsv6/"
+var (
+	routeKeyPrefix    = "/calico/staticroutes/"
+	rejectKeyPrefix   = "/calico/rejectcidrs/"
+	routeKeyPrefixV6  = "/calico/staticroutesv6/"
+	rejectKeyPrefixV6 = "/calico/rejectcidrsv6/"
+)
 
 func (c *client) addRoutesLockHeld(prefixV4, prefixV6 string, cidrs []string) {
 	for _, cidr := range cidrs {
@@ -1620,7 +1794,10 @@ func (c *client) addRoutesLockHeld(prefixV4, prefixV6 string, cidrs []string) {
 		} else {
 			k = prefixV4 + strings.Replace(cidr, "/", "-", 1)
 		}
+
+		// Update the cache and increment the reference count for this key.
 		c.cache[k] = cidr
+		c.programmedRouteRefCount[k]++
 		c.keyUpdated(k)
 	}
 }
@@ -1633,8 +1810,17 @@ func (c *client) deleteRoutesLockHeld(prefixV4, prefixV6 string, cidrs []string)
 		} else {
 			k = prefixV4 + strings.Replace(cidr, "/", "-", 1)
 		}
-		delete(c.cache, k)
-		c.keyUpdated(k)
+
+		if c.programmedRouteRefCount[k] <= 1 {
+			// This is the last reference for this route. We can remove it.
+			// We only delete from the cache if there are no other users of this route.
+			delete(c.cache, k)
+			delete(c.programmedRouteRefCount, k)
+			c.keyUpdated(k)
+		} else {
+			// Just decrement the ref counter.
+			c.programmedRouteRefCount[k]--
+		}
 	}
 }
 
@@ -1660,8 +1846,7 @@ func (c *client) DeleteStaticRoutes(cidrs []string) {
 }
 
 func (c *client) setPeerConfigFieldsFromV3Resource(peers []*bgpPeer, v3res *apiv3.BGPPeer) {
-
-	// Get the password, if one is configured.
+	// Get the password, if one is configured
 	password := c.getPassword(v3res)
 
 	for _, peer := range peers {

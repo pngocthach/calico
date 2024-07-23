@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,8 +21,7 @@ import (
 	"strings"
 
 	"github.com/projectcalico/calico/felix/bpf/ipsets"
-
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 
 	log "github.com/sirupsen/logrus"
 
@@ -33,7 +32,15 @@ import (
 	"github.com/projectcalico/calico/felix/rules"
 )
 
+// Verifier imposes a limit on how many jumps can be on the same code path.
+const (
+	verifierMaxJumpsLimit      = 8192
+	maxJumpsHeadroom           = 200
+	defaultPerProgramJumpLimit = verifierMaxJumpsLimit - maxJumpsHeadroom
+)
+
 type Builder struct {
+	blocks          []*Block
 	b               *Block
 	tierID          int
 	policyID        int
@@ -41,22 +48,46 @@ type Builder struct {
 	rulePartID      int
 	ipSetIDProvider ipSetIDProvider
 
-	ipSetMapFD bpf.MapFD
-	stateMapFD bpf.MapFD
-	jumpMapFD  bpf.MapFD
+	ipSetMapFD         maps.FD
+	stateMapFD         maps.FD
+	staticJumpMapFD    maps.FD
+	policyJumpMapFD    maps.FD
+	policyMapIndex     int
+	policyMapStride    int
+	policyDebugEnabled bool
+	forIPv6            bool
+	allowJmp           int
+	denyJmp            int
+	useJmps            bool
+	maxJumpsPerProgram int
+	numRulesInProgram  int
+	xdp                bool
 }
 
 type ipSetIDProvider interface {
 	GetNoAlloc(ipSetID string) uint64
 }
 
-func NewBuilder(ipSetIDProvider ipSetIDProvider, ipsetMapFD, stateMapFD, jumpMapFD bpf.MapFD) *Builder {
+// Option is an additional option that can change default behaviour
+type Option func(b *Builder)
+
+func NewBuilder(
+	ipSetIDProvider ipSetIDProvider,
+	ipsetMapFD, stateMapFD, staticProgsMapFD, policyJumpMapFD maps.FD,
+	opts ...Option) *Builder {
 	b := &Builder{
-		ipSetIDProvider: ipSetIDProvider,
-		ipSetMapFD:      ipsetMapFD,
-		stateMapFD:      stateMapFD,
-		jumpMapFD:       jumpMapFD,
+		ipSetIDProvider:    ipSetIDProvider,
+		ipSetMapFD:         ipsetMapFD,
+		stateMapFD:         stateMapFD,
+		staticJumpMapFD:    staticProgsMapFD,
+		policyJumpMapFD:    policyJumpMapFD,
+		maxJumpsPerProgram: defaultPerProgramJumpLimit,
 	}
+
+	for _, option := range opts {
+		option(b)
+	}
+
 	return b
 }
 
@@ -79,30 +110,45 @@ const (
 
 var (
 	// Stack offsets.  These are defined locally.
-	offStateKey    = nextOffset(4, 4)
-	offSrcIPSetKey = nextOffset(ipsets.IPSetEntrySize, 8)
-	offDstIPSetKey = nextOffset(ipsets.IPSetEntrySize, 8)
+	offStateKey = nextOffset(4, 4)
+	// Even for v4 programs, we have the v6 layout
+	// N.B. we can use 64bit stack stores in ipv6 because of the 4 byte alignment
+	// preceded by the 4 bytes of StateKey. That makes the ip within the src key
+	// 8 bytes aligned. And since the ip is followed by 4 bytes of
+	// port+proto+pad, the dst key is also aligned in the same way. <sweat :-)>
+	offSrcIPSetKey = nextOffset(ipsets.IPSetEntryV6Size, 4)
+	offDstIPSetKey = nextOffset(ipsets.IPSetEntryV6Size, 4)
 
 	// Offsets within the cal_tc_state struct.
-	// WARNING: must be kept in sync with the definitions in bpf/include/jump.h.
-	stateOffIPSrc          int16 = stateEventHdrSize + 0
-	stateOffIPDst          int16 = stateEventHdrSize + 4
-	_                            = stateOffIPDst
-	stateOffPreNATIPDst    int16 = stateEventHdrSize + 8
-	_                            = stateOffPreNATIPDst
-	stateOffPostNATIPDst   int16 = stateEventHdrSize + 12
-	stateOffPolResult      int16 = stateEventHdrSize + 20
-	stateOffSrcPort        int16 = stateEventHdrSize + 24
-	stateOffDstPort        int16 = stateEventHdrSize + 26
-	stateOffICMPType             = stateOffDstPort
-	stateOffPreNATDstPort  int16 = stateEventHdrSize + 28
-	_                            = stateOffPreNATDstPort
-	stateOffPostNATDstPort int16 = stateEventHdrSize + 30
-	stateOffIPProto        int16 = stateEventHdrSize + 32
-	stateOffFlags          int16 = stateEventHdrSize + 33
+	// WARNING: must be kept in sync with the definitions in bpf-gpl/types.h.
+	stateOffIPSrc          = FieldOffset{Offset: stateEventHdrSize + 0, Field: "state->ip_src"}
+	stateOffIPDst          = FieldOffset{Offset: stateEventHdrSize + 16, Field: "state->ip_dst"}
+	_                      = stateOffIPDst
+	stateOffPreNATIPDst    = FieldOffset{Offset: stateEventHdrSize + 32, Field: "state->pre_nat_ip_dst"}
+	_                      = stateOffPreNATIPDst
+	stateOffPostNATIPDst   = FieldOffset{Offset: stateEventHdrSize + 48, Field: "state->post_nat_ip_dst"}
+	stateOffPolResult      = FieldOffset{Offset: stateEventHdrSize + 84, Field: "state->pol_rc"}
+	stateOffSrcPort        = FieldOffset{Offset: stateEventHdrSize + 88, Field: "state->sport"}
+	stateOffDstPort        = FieldOffset{Offset: stateEventHdrSize + 90, Field: "state->dport"}
+	_                      = stateOffDstPort
+	stateOffICMPType       = FieldOffset{Offset: stateEventHdrSize + 90, Field: "state->icmp_type"}
+	stateOffPreNATDstPort  = FieldOffset{Offset: stateEventHdrSize + 92, Field: "state->pre_nat_dport"}
+	_                      = stateOffPreNATDstPort
+	stateOffPostNATDstPort = FieldOffset{Offset: stateEventHdrSize + 94, Field: "state->post_nat_dport"}
+	stateOffIPProto        = FieldOffset{Offset: stateEventHdrSize + 96, Field: "state->ip_proto"}
+	stateOffIPSize         = FieldOffset{Offset: stateEventHdrSize + 98, Field: "state->ip_size"}
+	_                      = stateOffIPSize
 
-	// Compile-time check that IPSetEntrySize hasn't changed; if it changes, the code will need to change.
-	_ = [1]struct{}{{}}[20-ipsets.IPSetEntrySize]
+	stateOffRulesHit = FieldOffset{Offset: stateEventHdrSize + 100, Field: "state->rules_hit"}
+	stateOffRuleIDs  = FieldOffset{Offset: stateEventHdrSize + 104, Field: "state->rule_ids"}
+
+	stateOffFlags = FieldOffset{Offset: stateEventHdrSize + 360, Field: "state->flags"}
+
+	skbCb0 = FieldOffset{Offset: 12*4 + 0*4, Field: "skb->cb[0]"}
+	skbCb1 = FieldOffset{Offset: 12*4 + 1*4, Field: "skb->cb[1]"}
+
+	// Compile-time check that IPSetEntryV6Size hasn't changed; if it changes, the code will need to change.
+	_ = [1]struct{}{{}}[32-ipsets.IPSetEntryV6Size]
 
 	// Offsets within struct ip4_set_key.
 	// WARNING: must be kept in sync with the definitions in bpf/ipsets/map.go.
@@ -115,12 +161,13 @@ var (
 	ipsKeyPad    int16 = 19
 
 	// Bits in the state flags field.
-	FlagDestIsHost uint8 = 1 << 2
-	FlagSrcIsHost  uint8 = 1 << 3
+	FlagDestIsHost uint64 = 1 << 2
+	FlagSrcIsHost  uint64 = 1 << 3
 )
 
 type Rule struct {
 	*proto.Rule
+	MatchID RuleMatchID
 }
 
 type Policy struct {
@@ -165,6 +212,8 @@ type Rules struct {
 	ForXDP bool
 }
 
+type RuleMatchID = uint64
+
 type Profile = Policy
 
 type TierEndAction string
@@ -175,11 +224,13 @@ const (
 	TierEndPass  TierEndAction = "pass"
 )
 
-func (p *Builder) Instructions(rules Rules) (Insns, error) {
-	p.b = NewBlock()
+func (p *Builder) Instructions(rules Rules) ([]Insns, error) {
+	p.xdp = rules.ForXDP
+	p.b = NewBlock(p.policyDebugEnabled)
+	p.blocks = append(p.blocks, p.b)
 	p.writeProgramHeader()
 
-	if rules.ForXDP {
+	if p.xdp {
 		// For an XDP program HostNormalTiers continues the untracked policy to enforce;
 		// other fields are unused.
 		goto normalPolicy
@@ -242,8 +293,17 @@ normalPolicy:
 		p.writeProfiles(rules.Profiles, "allow")
 	}
 
-	p.writeProgramFooter(rules.ForXDP)
-	return p.b.Assemble()
+	p.writeProgramFooter()
+
+	var progs []Insns
+	for i, b := range p.blocks {
+		insns, err := b.Assemble()
+		if err != nil {
+			return nil, fmt.Errorf("failed to assemble policy program %d: %w", i, err)
+		}
+		progs = append(progs, insns)
+	}
+	return progs, nil
 }
 
 // writeProgramHeader emits instructions to load the state from the state map, leaving
@@ -261,39 +321,30 @@ func (p *Builder) writeProgramHeader() {
 	p.b.AddImm64(R2, int32(offStateKey))
 	// Load map file descriptor into R1.
 	// clang uses a 64-bit load so copy that for now.
+	p.b.AddComment("Load packet metadata saved by previous program")
 	p.b.LoadMapFD(R1, uint32(p.stateMapFD)) // R1 = 0 (64-bit immediate)
 	p.b.Call(HelperMapLookupElem)           // Call helper
 	// Check return value for NULL.
 	p.b.JumpEqImm64(R0, 0, "exit")
 	// Save state pointer in R9.
+	p.b.AddComment("Save state pointer in register R9")
 	p.b.Mov64(R9, R0)
 	p.b.LabelNextInsn("policy")
 }
 
-const (
-	jumpIdxPolicy = iota
-	jumpIdxAllowed
-	jumpIdxICMP
-	jumpIdxDrop
-
-	_ = jumpIdxPolicy
-	_ = jumpIdxICMP
-	_ = jumpIdxDrop
-)
-
 func (p *Builder) writeJumpIfToOrFromHost(label string) {
 	// Load state flags.
-	p.b.Load8(R1, R9, stateOffFlags)
+	p.b.Load64(R1, R9, stateOffFlags)
 
 	// Mask against host bits.
-	p.b.AndImm32(R1, int32(FlagDestIsHost|FlagSrcIsHost))
+	p.b.AndImm64(R1, int32(FlagDestIsHost|FlagSrcIsHost))
 
 	// If non-zero, jump to specified label.
 	p.b.JumpNEImm64(R1, 0, label)
 }
 
 // writeProgramFooter emits the program exit jump targets.
-func (p *Builder) writeProgramFooter(forXDP bool) {
+func (p *Builder) writeProgramFooter() {
 	// Fall through here if there's no match.  Also used when we hit an error or if policy rejects packet.
 	p.b.LabelNextInsn("deny")
 
@@ -301,23 +352,21 @@ func (p *Builder) writeProgramFooter(forXDP bool) {
 	p.b.MovImm32(R1, int32(state.PolicyDeny))
 	p.b.Store32(R9, R1, stateOffPolResult)
 
-	if forXDP {
-		p.b.LabelNextInsn("exit")
-		p.b.MovImm64(R0, 1 /* XDP_DROP */)
+	// Execute the tail call to drop program
+	p.b.Mov64(R1, R6)                            // First arg is the context.
+	p.b.LoadMapFD(R2, uint32(p.staticJumpMapFD)) // Second arg is the map.
+	if p.useJmps {
+		p.b.AddCommentF("Deny jump to %d", p.denyJmp)
+		p.b.MovImm32(R3, int32(p.denyJmp)) // Third arg is the index (rather than a pointer to the index).
 	} else {
-		// Execute the tail call to drop program
-		p.b.Mov64(R1, R6)                      // First arg is the context.
-		p.b.LoadMapFD(R2, uint32(p.jumpMapFD)) // Second arg is the map.
-		p.b.MovImm32(R3, jumpIdxDrop)          // Third arg is the index (rather than a pointer to the index).
-		p.b.Call(HelperTailCall)
-
-		// Fall through if tail call fails.
-		p.b.LabelNextInsn("exit")
-		p.b.MovImm64(R0, 2 /* TC_ACT_SHOT */)
+		p.b.Load32(R3, R6, skbCb1) // Third arg is the index from skb->cb[1]).
 	}
-	p.b.Exit()
+	p.b.Call(HelperTailCall)
 
-	if forXDP {
+	// Fall through if tail call fails.
+	p.writeExitTarget()
+
+	if p.xdp {
 		p.b.LabelNextInsn("xdp_pass")
 		p.b.MovImm64(R0, 2 /* XDP_PASS */)
 		p.b.Exit()
@@ -329,34 +378,98 @@ func (p *Builder) writeProgramFooter(forXDP bool) {
 		p.b.MovImm32(R1, int32(state.PolicyAllow))
 		p.b.Store32(R9, R1, stateOffPolResult)
 		// Execute the tail call.
-		p.b.Mov64(R1, R6)                      // First arg is the context.
-		p.b.LoadMapFD(R2, uint32(p.jumpMapFD)) // Second arg is the map.
-		p.b.MovImm32(R3, jumpIdxAllowed)       // Third arg is the index (rather than a pointer to the index).
+		p.b.Mov64(R1, R6)                            // First arg is the context.
+		p.b.LoadMapFD(R2, uint32(p.staticJumpMapFD)) // Second arg is the map.
+		if p.useJmps {
+			p.b.AddCommentF("Allow jump to %d", p.allowJmp)
+			p.b.MovImm32(R3, int32(p.allowJmp)) // Third arg is the index (rather than a pointer to the index).
+		} else {
+			p.b.Load32(R3, R6, skbCb0) // Third arg is the index from skb->cb[0]).
+		}
 		p.b.Call(HelperTailCall)
 
 		// Fall through if tail call fails.
 		p.b.MovImm32(R1, state.PolicyTailCallFailed)
 		p.b.Store32(R9, R1, stateOffPolResult)
-		p.b.MovImm64(R0, 2 /* TC_ACT_SHOT */)
+		if p.xdp {
+			p.b.MovImm64(R0, 1 /* XDP_DROP */)
+		} else {
+			p.b.MovImm64(R0, 2 /* TC_ACT_SHOT */)
+		}
 		p.b.Exit()
 	}
 }
 
-func (p *Builder) setUpIPSetKey(ipsetID uint64, keyOffset, ipOffset, portOffset int16) {
+func (p *Builder) writeExitTarget() {
+	p.b.LabelNextInsn("exit")
+	if p.xdp {
+		p.b.MovImm64(R0, 1 /* XDP_DROP */)
+	} else {
+		p.b.MovImm64(R0, 2 /* TC_ACT_SHOT */)
+	}
+	p.b.Exit()
+}
+
+func (p *Builder) writeRecordRuleID(id RuleMatchID, skipLabel string) {
+	// Load the hit count
+	p.b.Load8(R1, R9, stateOffRulesHit)
+
+	// Make sure we do not hit too many rules, if so skip to action without
+	// recording the rule ID
+	p.b.JumpGEImm64(R1, state.MaxRuleIDs, skipLabel)
+
+	// Increment the hit count
+	p.b.Mov64(R2, R1)
+	p.b.AddImm64(R2, 1)
+	// Store the new count
+	p.b.Store8(R9, R2, stateOffRulesHit)
+
+	// Store the rule ID in the rule ids array
+	p.b.ShiftLImm64(R1, 3) // x8
+	p.b.AddImm64(R1, int32(stateOffRuleIDs.Offset))
+	p.b.LoadImm64(R2, int64(id))
+	p.b.Add64(R1, R9)
+	p.b.Store64(R1, R2, FieldOffset{Offset: 0, Field: ""})
+}
+
+func (p *Builder) writeRecordRuleHit(r Rule, skipLabel string) {
+	log.Debugf("Hit rule ID 0x%x", r.MatchID)
+	p.writeRecordRuleID(r.MatchID, skipLabel)
+}
+
+func (p *Builder) setUpIPSetKey(ipsetID uint64, keyOffset int16, ipOffset, portOffset FieldOffset) {
+	v6Adjust := int16(0)
+	prefixLen := int32(128)
+
+	if p.forIPv6 {
+		// IPv6 addresses are 12 bytes longer and so everything beyond the
+		// address is shifted by 12 bytes.
+		v6Adjust = 12
+		prefixLen += 96
+	}
+
 	// TODO track whether we've already done an initialisation and skip the parts that don't change.
 	// Zero the padding.
 	p.b.MovImm64(R1, 0) // R1 = 0
-	p.b.StoreStack8(R1, keyOffset+ipsKeyPad)
-	p.b.MovImm64(R1, 128) // R1 = 128
+	p.b.StoreStack8(R1, keyOffset+ipsKeyPad+v6Adjust)
+	p.b.MovImm64(R1, prefixLen) // R1 = 128
 	p.b.StoreStack32(R1, keyOffset+ipsKeyPrefix)
 
 	// Store the IP address, port and protocol.
-	p.b.Load32(R1, R9, ipOffset)
-	p.b.StoreStack32(R1, keyOffset+ipsKeyAddr)
+	if !p.forIPv6 {
+		p.b.Load32(R1, R9, ipOffset)
+		p.b.StoreStack32(R1, keyOffset+ipsKeyAddr)
+	} else {
+		p.b.Load64(R1, R9, ipOffset)
+		p.b.StoreStack64(R1, keyOffset+ipsKeyAddr)
+		ipOffset.Offset += 8
+		p.b.Load64(R1, R9, ipOffset)
+		p.b.StoreStack64(R1, keyOffset+ipsKeyAddr+8)
+	}
 	p.b.Load16(R1, R9, portOffset)
-	p.b.StoreStack16(R1, keyOffset+ipsKeyPort)
+	p.b.StoreStack16(R1, keyOffset+ipsKeyPort+v6Adjust)
 	p.b.Load8(R1, R9, stateOffIPProto)
-	p.b.StoreStack8(R1, keyOffset+ipsKeyProto)
+	p.b.StoreStack8(R1, keyOffset+ipsKeyProto+v6Adjust)
 
 	// Store the IP set ID.  It is 64-bit but, since it's a packed struct, we have to write it in two
 	// 32-bit chunks.
@@ -378,6 +491,7 @@ func (p *Builder) writeTiers(tiers []Tier, destLeg matchLeg, allowLabel string) 
 		actionLabels["next-tier"] = endOfTierLabel
 
 		log.Debugf("Start of tier %d %q", p.tierID, tier.Name)
+		p.b.AddCommentF("Start of tier %s", tier.Name)
 		for _, pol := range tier.Policies {
 			p.writePolicy(pol, actionLabels, destLeg)
 		}
@@ -387,6 +501,7 @@ func (p *Builder) writeTiers(tiers []Tier, destLeg matchLeg, allowLabel string) 
 		if action == TierEndUndef {
 			action = TierEndDeny
 		}
+		p.b.AddCommentF("End of tier %s", tier.Name)
 		log.Debugf("End of tier %d %q: %s", p.tierID, tier.Name, action)
 		p.writeRule(Rule{
 			Rule: &proto.Rule{},
@@ -411,6 +526,8 @@ func (p *Builder) writeProfiles(profiles []Policy, allowLabel string) {
 func (p *Builder) writePolicyRules(policy Policy, actionLabels map[string]string, destLeg matchLeg) {
 	for ruleIdx, rule := range policy.Rules {
 		log.Debugf("Start of rule %d", ruleIdx)
+		p.b.AddCommentF("Start of rule %s", rule)
+		p.b.AddCommentF("Rule MatchID: %d", rule.MatchID)
 		action := strings.ToLower(rule.Action)
 		if action == "log" {
 			log.Debug("Skipping log rule.  Not supported in BPF mode.")
@@ -418,13 +535,16 @@ func (p *Builder) writePolicyRules(policy Policy, actionLabels map[string]string
 		}
 		p.writeRule(rule, actionLabels[action], destLeg)
 		log.Debugf("End of rule %d", ruleIdx)
+		p.b.AddCommentF("End of rule %s", rule.RuleId)
 	}
 }
 
 func (p *Builder) writePolicy(policy Policy, actionLabels map[string]string, destLeg matchLeg) {
+	p.b.AddCommentF("Start of policy %s", policy.Name)
 	log.Debugf("Start of policy %q %d", policy.Name, p.policyID)
 	p.writePolicyRules(policy, actionLabels, destLeg)
 	log.Debugf("End of policy %q %d", policy.Name, p.policyID)
+	p.b.AddCommentF("End of policy %s", policy.Name)
 	p.policyID++
 }
 
@@ -449,7 +569,7 @@ const (
 	legDestPreNAT matchLeg = "destPreNAT"
 )
 
-func (leg matchLeg) offsetToStateIPAddressField() (offset int16) {
+func (leg matchLeg) offsetToStateIPAddressField() (offset FieldOffset) {
 	if leg == legSource {
 		offset = stateOffIPSrc
 	} else if leg == legDestPreNAT {
@@ -460,7 +580,7 @@ func (leg matchLeg) offsetToStateIPAddressField() (offset int16) {
 	return
 }
 
-func (leg matchLeg) offsetToStatePortField() (portOffset int16) {
+func (leg matchLeg) offsetToStatePortField() (portOffset FieldOffset) {
 	if leg == legSource {
 		portOffset = stateOffSrcPort
 	} else if leg == legDestPreNAT {
@@ -480,12 +600,22 @@ func (leg matchLeg) stackOffsetToIPSetKey() (keyOffset int16) {
 	return
 }
 
+func (p *Builder) ipVersion() uint8 {
+	if p.forIPv6 {
+		return uint8(proto.IPVersion_IPV6)
+	} else {
+		return uint8(proto.IPVersion_IPV4)
+	}
+}
+
 func (p *Builder) writeRule(r Rule, actionLabel string, destLeg matchLeg) {
+	p.maybeSplitProgram()
+
 	if actionLabel == "" {
 		log.Panic("empty action label")
 	}
 
-	rule := rules.FilterRuleToIPVersion(4, r.Rule)
+	rule := rules.FilterRuleToIPVersion(p.ipVersion(), r.Rule)
 	if rule == nil {
 		log.Debugf("Version mismatch, skipping rule")
 		return
@@ -600,6 +730,7 @@ func (p *Builder) writeRule(r Rule, actionLabel string, destLeg matchLeg) {
 	p.writeEndOfRule(r, actionLabel)
 	p.ruleID++
 	p.rulePartID = 0
+	p.numRulesInProgram++
 }
 
 func (p *Builder) writeStartOfRule() {
@@ -609,12 +740,22 @@ func (p *Builder) writeEndOfRule(rule Rule, actionLabel string) {
 	// If all the match criteria are met, we fall through to the end of the rule
 	// so all that's left to do is to jump to the relevant action.
 	// TODO log and log-and-xxx actions
+	if p.policyDebugEnabled {
+		p.writeRecordRuleHit(rule, actionLabel)
+	}
+
 	p.b.Jump(actionLabel)
 
 	p.b.LabelNextInsn(p.endOfRuleLabel())
 }
 
 func (p *Builder) writeProtoMatch(negate bool, protocol *proto.Protocol) {
+	if negate {
+		p.b.AddCommentF("If protocol == %s, skip to next rule", protocolToName(protocol))
+	} else {
+		p.b.AddCommentF("If protocol != %s, skip to next rule", protocolToName(protocol))
+	}
+
 	p.b.Load8(R1, R9, stateOffIPProto)
 	protoNum := protocolToNumber(protocol)
 	if negate {
@@ -625,6 +766,11 @@ func (p *Builder) writeProtoMatch(negate bool, protocol *proto.Protocol) {
 }
 
 func (p *Builder) writeICMPTypeMatch(negate bool, icmpType uint8) {
+	if negate {
+		p.b.AddCommentF("If ICMP type == %d, skip to next rule", icmpType)
+	} else {
+		p.b.AddCommentF("If ICMP type != %d, skip to next rule", icmpType)
+	}
 	p.b.Load8(R1, R9, stateOffICMPType)
 	if negate {
 		p.b.JumpEqImm64(R1, int32(icmpType), p.endOfRuleLabel())
@@ -634,6 +780,11 @@ func (p *Builder) writeICMPTypeMatch(negate bool, icmpType uint8) {
 }
 
 func (p *Builder) writeICMPTypeCodeMatch(negate bool, icmpType, icmpCode uint8) {
+	if negate {
+		p.b.AddCommentF("If ICMP type == %d and code == %d, skip to next rule", icmpType, icmpCode)
+	} else {
+		p.b.AddCommentF("If ICMP type != %d or code != %d, skip to next rule", icmpType, icmpCode)
+	}
 	p.b.Load16(R1, R9, stateOffICMPType)
 	if negate {
 		p.b.JumpEqImm64(R1, (int32(icmpCode)<<8)|int32(icmpType), p.endOfRuleLabel())
@@ -642,25 +793,98 @@ func (p *Builder) writeICMPTypeCodeMatch(negate bool, icmpType, icmpCode uint8) 
 	}
 }
 func (p *Builder) writeCIDRSMatch(negate bool, leg matchLeg, cidrs []string) {
-	p.b.Load32(R1, R9, leg.offsetToStateIPAddressField())
+	if p.policyDebugEnabled {
+		cidrStrings := "{"
+		if len(cidrs) == 0 {
+			cidrStrings = "{}"
+		}
+
+		for _, cidrStr := range cidrs {
+			cidrStrings = cidrStrings + fmt.Sprintf("%s,", cidrStr)
+		}
+		cidrStrings = cidrStrings[:len(cidrStrings)-1] + "}"
+
+		if negate {
+			p.b.AddCommentF("If %s in %s, skip to next rule", leg, cidrStrings)
+		} else {
+			p.b.AddCommentF("If %s not in %s, skip to next rule", leg, cidrStrings)
+		}
+	}
 
 	var onMatchLabel string
 	if negate {
 		// Match negated, if we match any CIDR then we jump to the next rule.
 		onMatchLabel = p.endOfRuleLabel()
 	} else {
-		// Match is non-negated, if we match, got to the next match criteria.
+		// Match is non-negated, if we match, go to the next match criteria.
 		onMatchLabel = p.freshPerRuleLabel()
 	}
-	for _, cidrStr := range cidrs {
-		cidr := ip.MustParseCIDROrIP(cidrStr)
-		addrU32 := bits.ReverseBytes32(cidr.Addr().(ip.V4Addr).AsUint32()) // TODO IPv6
-		maskU32 := bits.ReverseBytes32(math.MaxUint32 << (32 - cidr.Prefix()) & math.MaxUint32)
 
-		p.b.MovImm32(R2, int32(maskU32))
-		p.b.And32(R2, R1)
-		p.b.JumpEqImm32(R2, int32(addrU32), onMatchLabel)
+	size := ip.IPv4SizeDword
+	if p.forIPv6 {
+		size = ip.IPv6SizeDword
 	}
+
+	addrU32 := make([]uint32, size)
+	maskU32 := make([]uint32, size)
+	for cidrIndex, cidrStr := range cidrs {
+		// Number of CIDRs isn't bounded so may need to split mid-rule.
+		p.maybeSplitProgram()
+
+		cidr := ip.MustParseCIDROrIP(cidrStr)
+		if p.forIPv6 {
+			addrU64P1, addrU64P2 := cidr.Addr().(ip.V6Addr).AsUint64Pair()
+			addrU32[0] = bits.ReverseBytes32(uint32(addrU64P1 >> 32))
+			addrU32[1] = bits.ReverseBytes32(uint32(addrU64P1))
+			addrU32[2] = bits.ReverseBytes32(uint32(addrU64P2 >> 32))
+			addrU32[3] = bits.ReverseBytes32(uint32(addrU64P2))
+
+			var maskU64P1, maskU64P2 uint64
+			if cidr.Prefix() > 64 {
+				maskU64P1 = math.MaxUint64
+				maskU64P2 = uint64(math.MaxUint64 << (128 - cidr.Prefix()) & math.MaxUint64)
+			} else {
+				maskU64P1 = uint64(math.MaxUint64 << (64 - cidr.Prefix()) & math.MaxUint64)
+				maskU64P2 = 0
+			}
+			maskU32[0] = bits.ReverseBytes32(uint32(maskU64P1 >> 32))
+			maskU32[1] = bits.ReverseBytes32(uint32(maskU64P1))
+			maskU32[2] = bits.ReverseBytes32(uint32(maskU64P2 >> 32))
+			maskU32[3] = bits.ReverseBytes32(uint32(maskU64P2))
+		} else { // IPv4
+			addrU32[0] = bits.ReverseBytes32(cidr.Addr().(ip.V4Addr).AsUint32())
+			maskU32[0] = bits.ReverseBytes32(math.MaxUint32 << (32 - cidr.Prefix()) & math.MaxUint32)
+		}
+
+		lastAddr := addrU32[0]
+		for section, addr := range addrU32 {
+			// Optimisation: If mask for this section, i.e. this match, is 0,
+			// then we can skip the match since the result of AND operation is
+			// irrelevant of packet address. However, we need to check at least one 32bit section.
+			if section > 0 && maskU32[section] == 0 {
+				break
+			}
+
+			offset := leg.offsetToStateIPAddressField()
+			offset.Offset += int16(section * 4)
+			p.b.Load32(R1, R9, offset)
+			p.b.MovImm32(R2, int32(maskU32[section]))
+			p.b.And32(R2, R1)
+
+			lastAddr = addr
+			// If a 32bits section of an IPv6 does not match, we can skip the rest and jump to the
+			// next CIDR, rather than checking all 4 32bits sections.
+			if section != len(addrU32)-1 {
+				p.b.JumpNEImm32(R2, int32(addr), p.endOfcidrV6Match(cidrIndex))
+			}
+		}
+
+		p.b.JumpEqImm32(R2, int32(lastAddr), onMatchLabel)
+		if p.forIPv6 {
+			p.b.LabelNextInsn(p.endOfcidrV6Match(cidrIndex))
+		}
+	}
+
 	if !negate {
 		// If we fall through then none of the CIDRs matched so the rule doesn't match.
 		p.b.Jump(p.endOfRuleLabel())
@@ -676,6 +900,12 @@ func (p *Builder) writeIPSetMatch(negate bool, leg matchLeg, ipSets []string) {
 		id := p.ipSetIDProvider.GetNoAlloc(ipSetID)
 		if id == 0 {
 			log.WithField("setID", ipSetID).Panic("Failed to look up IP set ID.")
+		}
+
+		if negate {
+			p.b.AddCommentF("If %s matches ipset %s (0x%x), skip to next rule", leg, ipSetID, id)
+		} else {
+			p.b.AddCommentF("If %s doesn't match ipset %s (0x%x), skip to next rule", leg, ipSetID, id)
 		}
 
 		keyOffset := leg.stackOffsetToIPSetKey()
@@ -708,6 +938,12 @@ func (p *Builder) writeIPSetOrMatch(leg matchLeg, ipSets []string) {
 			log.WithField("setID", ipSetID).Panic("Failed to look up IP set ID.")
 		}
 
+		if len(ipSets) == 1 {
+			p.b.AddCommentF("If %s doesn't match ipset %s (0x%x), skip to next rule", leg, ipSetID, id)
+		} else {
+			p.b.AddCommentF("If %s doesn't match ipset %s (0x%x), jump to next ipset", leg, ipSetID, id)
+		}
+
 		keyOffset := leg.stackOffsetToIPSetKey()
 		p.setUpIPSetKey(id, keyOffset, leg.offsetToStateIPAddressField(), leg.offsetToStatePortField())
 		p.b.LoadMapFD(R1, uint32(p.ipSetMapFD))
@@ -721,6 +957,9 @@ func (p *Builder) writeIPSetOrMatch(leg matchLeg, ipSets []string) {
 	}
 
 	// If packet reaches here, it hasn't matched any of the IP sets.
+	if len(ipSets) > 1 {
+		p.b.AddCommentF("If %s doesn't match any of the IP sets, skip to next rule", leg)
+	}
 	p.b.Jump(p.endOfRuleLabel())
 	// Label the next match so we can skip to it on success.
 	p.b.LabelNextInsn(onMatchLabel)
@@ -738,9 +977,23 @@ func (p *Builder) writePortsMatch(negate bool, leg matchLeg, ports []*proto.Port
 		onMatchLabel = p.freshPerRuleLabel()
 	}
 
+	if p.policyDebugEnabled {
+		portRangeStr := "{"
+		for idx, portRange := range ports {
+			portRangeStr = portRangeStr + protoPortRangeToString(portRange)
+			if idx != len(ports)-1 {
+				portRangeStr = portRangeStr + ","
+			}
+		}
+		portRangeStr = portRangeStr + "}"
+		if negate {
+			p.b.AddCommentF("If %s port is within any of %s, skip to next rule", leg, portRangeStr)
+		} else {
+			p.b.AddCommentF("If %s port is not within any of %s, skip to next rule", leg, portRangeStr)
+		}
+	}
 	// R1 = port to test against.
 	p.b.Load16(R1, R9, leg.offsetToStatePortField())
-
 	for _, portRange := range ports {
 		if portRange.First == portRange.Last {
 			// Optimisation, single port, just do a comparison.
@@ -759,14 +1012,38 @@ func (p *Builder) writePortsMatch(negate bool, leg matchLeg, ports []*proto.Port
 				p.b.LabelNextInsn(skipToNextPortLabel)
 			}
 		}
+
+		// Number of ports not bounded so may need to split mid-rule.
+		if p.maybeSplitProgram() {
+			// Program was split so the next instruction goes in the new program.
+			// Need to reload our register(s).
+			p.b.Load16(R1, R9, leg.offsetToStatePortField())
+		}
+	}
+
+	if p.policyDebugEnabled {
+		namedPortStr := "{"
+		for idx, ipSetID := range namedPorts {
+			namedPortStr = namedPortStr + ipSetID
+			if idx != len(namedPorts)-1 {
+				namedPortStr = namedPortStr + ","
+			}
+		}
+		namedPortStr = namedPortStr + "}"
+		if negate {
+			p.b.AddCommentF("If %s port is within any of the named ports %s, skip to next rule", leg, namedPortStr)
+		} else {
+			p.b.AddCommentF("If %s port is not within any of the named ports %s, skip to next rule", leg, namedPortStr)
+		}
 	}
 
 	for _, ipSetID := range namedPorts {
+		p.maybeSplitProgram()
+
 		id := p.ipSetIDProvider.GetNoAlloc(ipSetID)
 		if id == 0 {
 			log.WithField("setID", ipSetID).Panic("Failed to look up IP set ID.")
 		}
-
 		keyOffset := leg.stackOffsetToIPSetKey()
 		p.setUpIPSetKey(id, keyOffset, leg.offsetToStateIPAddressField(), leg.offsetToStatePortField())
 		p.b.LoadMapFD(R1, uint32(p.ipSetMapFD))
@@ -795,6 +1072,110 @@ func (p *Builder) endOfRuleLabel() string {
 	return fmt.Sprintf("rule_%d_no_match", p.ruleID)
 }
 
+func (p *Builder) endOfcidrV6Match(cidrIndex int) string {
+	return fmt.Sprintf("rule_%d_cidr_%d_end", p.ruleID, cidrIndex)
+}
+
+// maybeSplitProgram checks how large/complex the program has become and, if
+// it reaches the threshold, starts a new policy program and adds it to
+// p.blocks.
+//
+// Returns true if the program was split.  After a split only the registers
+// initialised by writeProgramHeader are valid so, if the caller was using
+// any other registers, they must be recalculated if maybeSplitProgram returns
+// true.
+func (p *Builder) maybeSplitProgram() bool {
+	// Verifier imposes a limit on how many jumps can be on a path through
+	// the bytecode (taken or not).  Since our code falls through to the next
+	// rule by default, to first approximation, all our jumps are on the same
+	// path.
+	if p.b.NumJumps < p.maxJumpsPerProgram {
+		return false
+	}
+	if p.policyMapStride == 0 {
+		// Cannot split; parameters not set.  We'll just have to hope the
+		// program fits.
+		return false
+	}
+
+	p.b.SetTrampolinesEnabled(false) // We're about to write a special trampoline...
+	p.b.AddCommentF("Splitting program after %d jumps", p.b.NumJumps)
+	p.b.MovImm64(R0, 0)
+	p.b.Jump("next-program")
+
+	// Program footer takes care of "allow" "deny" "exit" labels.
+	p.writeProgramFooter()
+
+	// Find any jump targets that need to jump to the next program.  This may
+	// include a next-tier label or an internal rule label, if we're called
+	// from within a rule-writing method.
+	var targets []string
+	for _, t := range p.b.UnresolvedJumpTargets() {
+		if t == "next-program" {
+			// Skip our label, we're about to resolve that below.
+			continue
+		}
+		targets = append(targets, t)
+	}
+
+	// Write a landing pad for each dangling jump target.  Each landing pad
+	// sets R0 to a unique value before jumping to the next-program label.
+	log.WithFields(log.Fields{
+		"danglingTargets": targets,
+		"numRules":        p.numRulesInProgram,
+		"numJumps":        p.b.NumJumps,
+		"numProgs":        len(p.blocks),
+	}).Debug("Splitting policy program")
+	for i, t := range targets {
+		p.b.LabelNextInsn(t)
+		p.b.MovImm64(R0, int32(i+1))
+		if i != len(targets)-1 {
+			p.b.Jump("next-program")
+		}
+	}
+	p.b.LabelNextInsn("next-program")
+	// Stash the trampoline offset in the policy result so the next program
+	// can pick it up.
+	p.b.Store32(R9, R0, stateOffPolResult)
+	// Calculate the index of the next program.
+	// With a "stride" of 1000, the first sub-program is at position n, then
+	// the second goes at position 1000+n, then the next at 2000+n and so on.
+	// The current block is in p.blocks already so this will calculate 1000+n
+	// on the first time through.
+	jumpIdx := SubProgramJumpIdx(p.policyMapIndex, len(p.blocks), p.policyMapStride)
+
+	p.b.Mov64(R1, R6)                            // First arg is the context.
+	p.b.LoadMapFD(R2, uint32(p.policyJumpMapFD)) // Second arg is the map.
+	p.b.AddCommentF(fmt.Sprintf("Tail call to policy program at index %d * %d + %d = %d", p.policyMapStride, len(p.blocks), p.policyMapIndex, jumpIdx))
+	p.b.MovImm64(R3, int32(jumpIdx)) // Third arg is index to jump to.
+	p.b.Call(HelperTailCall)
+	p.writeExitTarget() // Drop if tail call fails.
+
+	// Now start the new program...
+	p.numRulesInProgram = 0
+	p.b = NewBlock(p.policyDebugEnabled)
+	p.blocks = append(p.blocks, p.b)
+	// Header initialises the long-lived registers.
+	p.b.AddCommentF(fmt.Sprintf("##### Start of program %d #####", len(p.blocks)-1))
+	p.writeProgramHeader()
+	// Then write our trampoline.
+	p.b.Load32(R0, R9, stateOffPolResult)
+	// Reset the policy result field to its default value.
+	p.b.MovImm32(R1, 0)
+	p.b.Store32(R9, R1, stateOffPolResult)
+	for i, t := range targets {
+		p.b.JumpEqImm64(R0, int32(i+1), t)
+	}
+	// If none of the trampoline jumps hit then we fall through.  This
+	// continues whatever code was being written when we were called.
+
+	return true
+}
+
+func SubProgramJumpIdx(polProgIdx, subProgIdx, stride int) int {
+	return polProgIdx + subProgIdx*stride
+}
+
 func protocolToNumber(protocol *proto.Protocol) uint8 {
 	var pcol uint8
 	switch p := protocol.NumberOrName.(type) {
@@ -813,4 +1194,65 @@ func protocolToNumber(protocol *proto.Protocol) uint8 {
 		pcol = uint8(p.Number)
 	}
 	return pcol
+}
+
+// WithPolicyDebug enables policy debug.
+func WithPolicyDebugEnabled() Option {
+	return func(b *Builder) {
+		b.policyDebugEnabled = true
+	}
+}
+
+func WithAllowDenyJumps(allow, deny int) Option {
+	return func(b *Builder) {
+		b.allowJmp = allow
+		b.denyJmp = deny
+		b.useJmps = true
+	}
+}
+
+func WithIPv6() Option {
+	return func(p *Builder) {
+		p.forIPv6 = true
+	}
+}
+
+// WithPolicyMapIndexAndStride tells the builder the "shape" of the policy
+// jump map, allowing it to split the program if it gets too large.
+// entryPointIdx is the jump map key for the first "entry point" program.
+// stride is the number of indexes to skip to get to the next sub-program.
+// If WithPolicyMapIndexAndStride is not provided, program-splitting is
+// disabled.
+func WithPolicyMapIndexAndStride(entryPointIdx, stride int) Option {
+	return func(b *Builder) {
+		b.policyMapIndex = entryPointIdx
+		b.policyMapStride = stride
+	}
+}
+
+func protocolToName(protocol *proto.Protocol) string {
+	var pcol string
+	switch p := protocol.NumberOrName.(type) {
+	case *proto.Protocol_Name:
+		return strings.ToLower(p.Name)
+	case *proto.Protocol_Number:
+		switch p.Number {
+		case 6:
+			pcol = "tcp"
+		case 11:
+			pcol = "udp"
+		case 1:
+			pcol = "icmp"
+		case 132:
+			pcol = "sctp"
+		}
+	}
+	return pcol
+}
+
+func protoPortRangeToString(portRange *proto.PortRange) string {
+	if portRange.First == portRange.Last {
+		return fmt.Sprintf("%d", portRange.First)
+	}
+	return fmt.Sprintf("%d-%d", portRange.First, portRange.Last)
 }

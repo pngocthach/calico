@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 
 	libipam "github.com/projectcalico/calico/libcalico-go/lib/ipam"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,6 +50,7 @@ import (
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils/cri"
 	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane"
 	"github.com/projectcalico/calico/cni-plugin/pkg/types"
+	"github.com/projectcalico/calico/cni-plugin/pkg/wait"
 )
 
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
@@ -310,7 +313,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		logger.Debugf("Bypassing IPAM to set the result to: %+v", overriddenResult)
 
 		// Convert overridden IPAM result into current Result.
-		// This method fill in all the empty fields necessory for CNI output according to spec.
+		// This method fill in all the empty fields necessary for CNI output according to spec.
 		result, err = cniv1.NewResultFromResult(overriddenResult)
 		if err != nil {
 			return nil, err
@@ -427,6 +430,13 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		}
 	}
 
+	// Handle source IP spoofing annotation
+	sourcePrefixes, err := k8sconversion.HandleSourceIPSpoofingAnnotation(annot)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.Spec.AllowSpoofedSourcePrefixes = sourcePrefixes
+
 	// List of DNAT ipaddrs to map to this workload endpoint
 	floatingIPs := annot["cni.projectcalico.org/floatingIPs"]
 
@@ -481,7 +491,8 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// Pod resource. (In Enterprise) Felix also modifies the pod through a patch and setting this avoids patching the
 	// same fields as Felix so that we can't clobber Felix's updates.
 	ctxPatchCNI := k8sresources.ContextWithPatchMode(ctx, k8sresources.PatchModeCNI)
-	if _, err := utils.CreateOrUpdate(ctxPatchCNI, calicoClient, endpoint); err != nil {
+	var endpointOut *libapi.WorkloadEndpoint
+	if endpointOut, err = utils.CreateOrUpdate(ctxPatchCNI, calicoClient, endpoint); err != nil {
 		logger.WithError(err).Error("Error creating/updating endpoint in datastore.")
 		releaseIPAM()
 		return nil, err
@@ -493,12 +504,33 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		Name: endpoint.Spec.InterfaceName},
 	)
 
+	// Conditionally wait for host-local Felix to program the policy for this WEP.
+	// Error if negative, ignore if 0.
+	if conf.PolicySetupTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("invalid pod startup delay of %d", conf.PolicySetupTimeoutSeconds)
+	} else if conf.PolicySetupTimeoutSeconds > 0 {
+		if runtime.GOOS == "windows" {
+			logger.Warn("Config policy_setup_timeout_seconds is not supported on Windows. Ignoring...")
+		} else {
+			if conf.EndpointStatusDir == "" {
+				conf.EndpointStatusDir = "/var/run/calico/endpoint-status"
+			}
+			timeout := time.Duration(conf.PolicySetupTimeoutSeconds) * time.Second
+			// Must use endpointOut because we need the endpoint's Name field
+			// to be filled in.
+			err := wait.ForEndpointReadyWithTimeout(conf.EndpointStatusDir, endpointOut, timeout)
+			if err != nil {
+				logrus.WithError(err).Warn("Error waiting for endpoint to become ready. Unblocking pod creation...")
+			}
+		}
+	}
+
 	return result, nil
 }
 
 // CmdDelK8s performs CNI DEL processing when running under Kubernetes. In Kubernetes, we identify workload endpoints based on their
 // pod name and namespace rather than container ID, so we may receive multiple DEL calls for the same pod, but with different container IDs.
-// As such, we must only delete the workload endpoint when the provided CNI_CONATAINERID matches the value on the WorkloadEndpoint. If they do not match,
+// As such, we must only delete the workload endpoint when the provided CNI_CONTAINERID matches the value on the WorkloadEndpoint. If they do not match,
 // it means the DEL is for an old sandbox and the pod is still running. We should still clean up IPAM allocations, since they are identified by the
 // container ID rather than the pod name and namespace. If they do match, then we can delete the workload endpoint.
 func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIdentifiers, args *skel.CmdArgs, conf types.NetConf, logger *logrus.Entry) error {
@@ -537,7 +569,7 @@ func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIde
 			// we shouldn't delete the workload endpoint. We identify workload endpoints based on pod name and namespace, which means
 			// we can receive DEL commands for an old sandbox for a currently running pod. However, we key IPAM allocations based on the
 			// CNI_CONTAINERID, so we should still do that below for this case.
-			logger.WithField("WorkloadEndpoint", wep).Warning("CNI_CONTAINERID does not match WorkloadEndpoint ConainerID, don't delete WEP.")
+			logger.WithField("WorkloadEndpoint", wep).Warning("CNI_CONTAINERID does not match WorkloadEndpoint ContainerID, don't delete WEP.")
 		} else if _, err = c.WorkloadEndpoints().Delete(
 			ctx,
 			wep.Namespace,
@@ -839,7 +871,7 @@ func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clients
 	// Config can be overridden by config passed in explicitly in the network config.
 	configOverrides := &clientcmd.ConfigOverrides{}
 
-	// If an API root is given, make sure we're using using the name / port rather than
+	// If an API root is given, make sure we're using the name / port rather than
 	// the full URL. Earlier versions of the config required the full `/api/v1/` extension,
 	// so split that off to ensure compatibility.
 	conf.Policy.K8sAPIRoot = strings.Split(conf.Policy.K8sAPIRoot, "/api/")[0]
@@ -868,9 +900,9 @@ func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clients
 	}
 
 	// Use the kubernetes client code to load the kubeconfig file and combine it with the overrides.
-	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+	config, err := winutils.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
-		configOverrides).ClientConfig()
+		configOverrides)
 	if err != nil {
 		return nil, err
 	}

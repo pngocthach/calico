@@ -88,6 +88,11 @@ from keystoneauth1.identity import v3
 from keystoneauth1 import session
 from keystoneclient.v3.client import Client as KeystoneClient
 
+# Register [AGENT] options, which we need in order to successfully use
+# PluginReportStateAPI.
+from neutron.conf.agent import common as config
+config.register_agent_state_opts_helper(cfg.CONF)
+
 LOG = log.getLogger(__name__)
 
 calico_opts = [
@@ -152,7 +157,7 @@ PRIORITY_RETRY = 2
 # any Neutron process, forked or not, should only ever have *one* Calico
 # Mechanism Driver in it. It's used by our monkeypatch of the
 # security_groups_rule_updated method below to locate the mechanism driver.
-# TODO(nj): Let's not do this any more. Please?
+# TODO(nj): Let's not do this anymore. Please?
 mech_driver = None
 
 

@@ -250,12 +250,15 @@ var _ = Describe("Policy manager", func() {
 
 var _ = Describe("Raw egress policy manager", func() {
 	var (
-		policyMgr    *policyManager
-		rawTable     *mockTable
-		neededIPSets set.Set
+		policyMgr        *policyManager
+		rawTable         *mockTable
+		neededIPSets     set.Set[string]
+		numCallbackCalls int
 	)
 
 	BeforeEach(func() {
+		neededIPSets = nil
+		numCallbackCalls = 0
 		rawTable = newMockTable("raw")
 		ruleRenderer := rules.NewRenderer(rules.Config{
 			IPSetConfigV4:               ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, "cali", nil, nil),
@@ -267,7 +270,27 @@ var _ = Describe("Raw egress policy manager", func() {
 			IptablesMarkEndpoint:        0xff00,
 			IptablesMarkNonCaliEndpoint: 0x0100,
 		})
-		policyMgr = newRawEgressPolicyManager(rawTable, ruleRenderer, 4, func(ipSets set.Set) { neededIPSets = ipSets })
+		policyMgr = newRawEgressPolicyManager(
+			rawTable,
+			ruleRenderer,
+			4,
+			func(ipSets set.Set[string]) {
+				neededIPSets = ipSets
+				numCallbackCalls++
+			})
+	})
+
+	It("correctly reports no IP sets at start of day", func() {
+		err := policyMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(neededIPSets).ToNot(BeNil())
+		Expect(neededIPSets.Len()).To(BeZero())
+		Expect(numCallbackCalls).To(Equal(1))
+
+		By("Not repeating the callback.")
+		err = policyMgr.CompleteDeferredWork()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(numCallbackCalls).To(Equal(1))
 	})
 
 	It("correctly reports needed IP sets", func() {
@@ -356,7 +379,7 @@ func MatchIPSets(items ...interface{}) *ipSetsMatcher {
 }
 
 func (m *ipSetsMatcher) Match(actual interface{}) (success bool, err error) {
-	actualSet := actual.(set.Set)
+	actualSet := actual.(set.Set[string])
 	actualCopy := actualSet.Copy()
 	for _, expected := range m.items {
 		actualCopy.Add("cali40" + expected.(string))
@@ -366,11 +389,11 @@ func (m *ipSetsMatcher) Match(actual interface{}) (success bool, err error) {
 }
 
 func (m *ipSetsMatcher) FailureMessage(actual interface{}) (message string) {
-	return fmt.Sprintf("Expected %v to match IP set IDs: %v", actual.(set.Set), m.items)
+	return fmt.Sprintf("Expected %v to match IP set IDs: %v", actual.(set.Set[string]), m.items)
 }
 
 func (m *ipSetsMatcher) NegatedFailureMessage(actual interface{}) (message string) {
-	return fmt.Sprintf("Expected %v not to match IP set IDs: %v", actual.(set.Set), m.items)
+	return fmt.Sprintf("Expected %v not to match IP set IDs: %v", actual.(set.Set[string]), m.items)
 }
 
 type mockPolRenderer struct {

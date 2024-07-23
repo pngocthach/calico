@@ -1,6 +1,6 @@
 PACKAGE_NAME = github.com/projectcalico/calico
 
-include metadata.mk 
+include metadata.mk
 include lib.Makefile
 
 DOCKER_RUN := mkdir -p ./.go-pkg-cache bin $(GOMOD_CACHE) && \
@@ -19,8 +19,6 @@ DOCKER_RUN := mkdir -p ./.go-pkg-cache bin $(GOMOD_CACHE) && \
 		-v $(CURDIR)/.go-pkg-cache:/go-cache:rw \
 		-w /go/src/$(PACKAGE_NAME)
 
-MAKE_DIRS=$(shell ls -d */)
-
 clean:
 	$(MAKE) -C api clean
 	$(MAKE) -C apiserver clean
@@ -34,13 +32,52 @@ clean:
 	$(MAKE) -C node clean
 	$(MAKE) -C pod2daemon clean
 	$(MAKE) -C typha clean
-	$(MAKE) -C calico clean
+	rm -rf ./bin
+
+ci-preflight-checks:
+	$(MAKE) check-dockerfiles
+	$(MAKE) check-language
+	$(MAKE) generate
+	$(MAKE) check-dirty
+
+check-dockerfiles:
+	./hack/check-dockerfiles.sh
+
+check-language:
+	./hack/check-language.sh
 
 generate:
+	$(MAKE) gen-semaphore-yaml
 	$(MAKE) -C api gen-files
 	$(MAKE) -C libcalico-go gen-files
 	$(MAKE) -C felix gen-files
+	$(MAKE) -C calicoctl gen-crds
 	$(MAKE) -C app-policy protobuf
+	$(MAKE) gen-manifests
+
+gen-manifests: bin/helm
+	cd ./manifests && \
+		OPERATOR_VERSION=$(OPERATOR_VERSION) \
+		CALICO_VERSION=$(CALICO_VERSION) \
+		./generate.sh
+
+# Get operator CRDs from the operator repo, OPERATOR_BRANCH_NAME must be set
+get-operator-crds: var-require-all-OPERATOR_BRANCH_NAME
+	cd ./charts/tigera-operator/crds/ && \
+	for file in operator.tigera.io_*.yaml; do echo "downloading $$file from operator repo" && curl -fsSL https://raw.githubusercontent.com/tigera/operator/${OPERATOR_BRANCH_NAME}/pkg/crds/operator/$${file%_crd.yaml}.yaml -o $${file}; done
+	cd ./manifests/ocp/ && \
+	for file in operator.tigera.io_*.yaml; do echo "downloading $$file from operator repo" && curl -fsSL https://raw.githubusercontent.com/tigera/operator/${OPERATOR_BRANCH_NAME}/pkg/crds/operator/$${file%_crd.yaml}.yaml -o $${file}; done
+
+gen-semaphore-yaml:
+	cd .semaphore && ./generate-semaphore-yaml.sh
+
+# Build the tigera-operator helm chart.
+chart: bin/tigera-operator-$(GIT_VERSION).tgz
+bin/tigera-operator-$(GIT_VERSION).tgz: bin/helm $(shell find ./charts/tigera-operator -type f)
+	bin/helm package ./charts/tigera-operator \
+	--destination ./bin/ \
+	--version $(GIT_VERSION) \
+	--app-version $(GIT_VERSION)
 
 # Build all Calico images for the current architecture.
 image:
@@ -54,7 +91,7 @@ image:
 	$(MAKE) -C node image IMAGETAG=$(GIT_VERSION) VALIDARCHES=$(ARCH)
 
 ###############################################################################
-# Run local e2e smoke test against the checked-out code 
+# Run local e2e smoke test against the checked-out code
 # using a local kind cluster.
 ###############################################################################
 E2E_FOCUS ?= "sig-network.*Conformance"
@@ -68,17 +105,17 @@ e2e-test:
 ###############################################################################
 # Build the release tool.
 hack/release/release: $(shell find ./hack/release -type f -name '*.go')
-	$(DOCKER_RUN) $(CALICO_BUILD) go build -v -o $@ ./hack/release/cmd
+	$(call build_binary, ./hack/release/cmd, $@)
 
 # Install ghr for publishing to github.
-hack/release/ghr: 
+hack/release/ghr:
 	$(DOCKER_RUN) -e GOBIN=/go/src/$(PACKAGE_NAME)/hack/release/ $(CALICO_BUILD) go install github.com/tcnksm/ghr@v0.14.0
 
 # Build a release.
-release: hack/release/release 
+release: hack/release/release
 	@hack/release/release -create
 
-# test the release code
+# Test the release code
 release-test:
 	$(DOCKER_RUN) $(CALICO_BUILD) ginkgo -cover -r hack/release/pkg
 
@@ -90,9 +127,69 @@ release-publish: hack/release/release hack/release/ghr
 create-release-branch: hack/release/release
 	@hack/release/release -new-branch
 
-gen-semaphore-yaml:
-	cd .semaphore && ./generate-semaphore-yaml.sh
+# Currently our openstack builds either build *or* build and publish,
+# hence why we have two separate jobs here that do almost the same thing.
+build-openstack: bin/yq
+	$(eval VERSION=$(shell bin/yq '.version' charts/calico/values.yaml))
+	$(info Building openstack packages for version $(VERSION))
+	$(MAKE) -C hack/release/packaging release VERSION=$(VERSION)
 
-check-dirty:
-	@if [ "$$(git --no-pager diff --stat)" != "" ]; then \
-	echo "The following files are dirty"; git --no-pager diff --stat; exit 1; fi
+publish-openstack: bin/yq
+	$(eval VERSION=$(shell bin/yq '.version' charts/calico/values.yaml))
+	$(info Publishing openstack packages for version $(VERSION))
+	$(MAKE) -C hack/release/packaging release-publish VERSION=$(VERSION)
+
+## Kicks semaphore job which syncs github released helm charts with helm index file
+.PHONY: helm-index
+helm-index:
+	@echo "Triggering semaphore workflow to update helm index."
+	SEMAPHORE_PROJECT_ID=30f84ab3-1ea9-4fb0-8459-e877491f3dea \
+			     SEMAPHORE_WORKFLOW_BRANCH=master \
+			     SEMAPHORE_WORKFLOW_FILE=../releases/calico/helmindex/update_helm.yml \
+			     $(MAKE) semaphore-run-workflow
+
+# Creates the tar file used for installing Calico on OpenShift.
+bin/ocp.tgz: manifests/ocp/ bin/yq
+	mkdir -p bin/tmp
+	cp -r manifests/ocp bin/tmp/
+	$(DOCKER_RUN) $(CALICO_BUILD) /bin/bash -c "                                        \
+		for file in bin/tmp/ocp/*crd* ;                                                 \
+        	do bin/yq -i 'del(.. | select(has(\"description\")).description)' \$$file ; \
+        done"
+	tar czvf $@ -C bin/tmp ocp
+	rm -rf bin/tmp
+
+## Generates release notes for the given version.
+.PHONY: release-notes
+release-notes:
+ifndef GITHUB_TOKEN
+	$(error GITHUB_TOKEN must be set)
+endif
+ifndef VERSION
+	$(error VERSION must be set)
+endif
+	VERSION=$(VERSION) GITHUB_TOKEN=$(GITHUB_TOKEN) python2 ./hack/release/generate-release-notes.py
+
+## Update the AUTHORS.md file.
+update-authors:
+ifndef GITHUB_TOKEN
+	$(error GITHUB_TOKEN must be set)
+endif
+	@echo "# Calico authors" > AUTHORS.md
+	@echo "" >> AUTHORS.md
+	@echo "This file is auto-generated based on commit records reported" >> AUTHORS.md
+	@echo "by git for the projectcalico/calico repository. It is ordered alphabetically." >> AUTHORS.md
+	@echo "" >> AUTHORS.md
+	@docker run -ti --rm --net=host \
+		-v $(REPO_ROOT):/code \
+		-w /code \
+		-e GITHUB_TOKEN=$(GITHUB_TOKEN) \
+		python:3 \
+		bash -c '/usr/local/bin/python hack/release/get-contributors.py >> /code/AUTHORS.md'
+
+###############################################################################
+# Post-release validation
+###############################################################################
+
+postrelease-checks:
+	$(MAKE) -C hack/postrelease all

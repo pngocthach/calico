@@ -120,6 +120,7 @@ type Config struct {
 	ServerMinBatchingAgeThresholdSecs    time.Duration `config:"seconds;0.01"`
 	ServerPingIntervalSecs               time.Duration `config:"seconds;10"`
 	ServerPongTimeoutSecs                time.Duration `config:"seconds;60"`
+	ServerHandshakeTimeoutSecs           time.Duration `config:"seconds;10"`
 	ServerPort                           int           `config:"port;0"`
 
 	// Server-side TLS config for Typha's communication with Felix.  If any of these are
@@ -136,14 +137,21 @@ type Config struct {
 	DebugMemoryProfilePath  string `config:"file;;"`
 	DebugDisableLogDropping bool   `config:"bool;false"`
 
-	ConnectionRebalancingMode  string        `config:"oneof(none,kubernetes);none"`
-	ConnectionDropIntervalSecs time.Duration `config:"seconds;1"`
-	MaxConnectionsUpperLimit   int           `config:"int(1,);10000"`
-	MaxConnectionsLowerLimit   int           `config:"int(1,);400"`
-	K8sServicePollIntervalSecs time.Duration `config:"seconds;30"`
-	K8sNamespace               string        `config:"string;kube-system"`
-	K8sServiceName             string        `config:"string;calico-typha"`
-	K8sPortName                string        `config:"string;calico-typha"`
+	// DebugHost is the host to bind the debug server port to.  Only used if DebugPort is non-zero.
+	DebugHost string `config:"host-address;localhost"`
+	// DebugPort is the port to bind the pprof debug server to or 0 to disable the debug port.
+	DebugPort int `config:"int(0,65535);"`
+
+	ConnectionRebalancingMode             string        `config:"oneof(none,kubernetes);none"`
+	ConnectionDropIntervalSecs            time.Duration `config:"seconds;1"`
+	ShutdownTimeoutSecs                   time.Duration `config:"seconds;300"`
+	ShutdownConnectionDropIntervalMaxSecs time.Duration `config:"seconds;1"`
+	MaxConnectionsUpperLimit              int           `config:"int(1,);10000"`
+	MaxConnectionsLowerLimit              int           `config:"int(1,);400"`
+	K8sServicePollIntervalSecs            time.Duration `config:"seconds;30"`
+	K8sNamespace                          string        `config:"string;kube-system"`
+	K8sServiceName                        string        `config:"string;calico-typha"`
+	K8sPortName                           string        `config:"string;calico-typha"`
 
 	// State tracking.
 

@@ -24,10 +24,6 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"github.com/projectcalico/calico/felix/bpf/cachingmap"
-
-	"github.com/projectcalico/calico/felix/bpf/nat"
-
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -45,15 +41,13 @@ func benchmarkProxyUpdates(b *testing.B, svcN, epsN int) {
 		eps := makeEps(svcN, epsN)
 		k8s := fake.NewSimpleClientset(append(svcs, eps...)...)
 
-		feCache := cachingmap.New(nat.FrontendMapParameters, &mock.DummyMap{})
-		beCache := cachingmap.New(nat.BackendMapParameters, &mock.DummyMap{})
-
-		syncer, err := proxy.NewSyncer(
+		syncer, err := proxy.NewSyncer(4,
 			[]net.IP{net.IPv4(1, 1, 1, 1)},
-			feCache,
-			beCache,
+			&mock.DummyMap{},
+			&mock.DummyMap{},
 			&mock.DummyMap{},
 			proxy.NewRTCache(),
+			nil,
 		)
 		Expect(err).ShouldNot(HaveOccurred())
 
@@ -113,7 +107,7 @@ func makeSvcs(n int) []runtime.Object {
 		ip := net.IPv4(10, byte((i&0xff0000)>>16), byte((i&0xff00)>>8), byte(i&0xff))
 		svcs[i] = &v1.Service{
 			TypeMeta:   typeMetaV1("Service"),
-			ObjectMeta: objectMeataV1(fmt.Sprintf("service-%d", i)),
+			ObjectMeta: objectMetaV1(fmt.Sprintf("service-%d", i)),
 			Spec: v1.ServiceSpec{
 				ClusterIP: ip.String(),
 				Type:      v1.ServiceTypeClusterIP,
@@ -143,7 +137,7 @@ func makeEps(sn, ep int) []runtime.Object {
 		}
 		ep := &v1.Endpoints{
 			TypeMeta:   typeMetaV1("Endpoints"),
-			ObjectMeta: objectMeataV1(fmt.Sprintf("service-%d", i)),
+			ObjectMeta: objectMetaV1(fmt.Sprintf("service-%d", i)),
 			Subsets: []v1.EndpointSubset{
 				{
 					Addresses: addrs,

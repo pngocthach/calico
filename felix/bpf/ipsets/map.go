@@ -24,7 +24,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/ip"
 )
 
@@ -40,8 +40,7 @@ const IPSetEntrySize = 20
 
 type IPSetEntry [IPSetEntrySize]byte
 
-var MapParameters = bpf.MapParameters{
-	Filename:   "/sys/fs/bpf/tc/globals/cali_v4_ip_sets",
+var MapParameters = maps.MapParameters{
 	Type:       "lpm_trie",
 	KeySize:    IPSetEntrySize,
 	ValueSize:  4,
@@ -50,8 +49,30 @@ var MapParameters = bpf.MapParameters{
 	Flags:      unix.BPF_F_NO_PREALLOC,
 }
 
-func Map(mc *bpf.MapContext) bpf.Map {
-	return mc.NewPinnedMap(MapParameters)
+func init() {
+	SetMapSize(MapParameters.MaxEntries)
+	SetMapSize(MapV6Parameters.MaxEntries)
+}
+
+func SetMapSize(size int) {
+	maps.SetSize(MapParameters.VersionedName(), size)
+}
+
+func Map() maps.Map {
+	return maps.NewPinnedMap(MapParameters)
+}
+
+type IPSetEntryInterface interface {
+	SetID() uint64
+	Addr() net.IP
+	PrefixLen() uint32
+	Protocol() uint8
+	Port() uint16
+	AsBytes() []byte
+}
+
+func (e IPSetEntry) AsBytes() []byte {
+	return e[:]
 }
 
 func (e IPSetEntry) SetID() uint64 {
@@ -74,7 +95,13 @@ func (e IPSetEntry) Port() uint16 {
 	return binary.LittleEndian.Uint16(e[16:18])
 }
 
-func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) *IPSetEntry {
+func IPSetEntryFromBytes(b []byte) IPSetEntryInterface {
+	var e IPSetEntry
+	copy(e[:], b)
+	return e
+}
+
+func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) IPSetEntryInterface {
 	var entry IPSetEntry
 	// TODO Detect endianness
 	if proto == 0 {
@@ -88,12 +115,12 @@ func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) *
 	binary.BigEndian.PutUint32(entry[12:16], cidr.Addr().(ip.V4Addr).AsUint32())
 	binary.LittleEndian.PutUint16(entry[16:18], port)
 	entry[18] = proto
-	return &entry
+	return entry
 }
 
 var DummyValue = []byte{1, 0, 0, 0}
 
-func ProtoIPSetMemberToBPFEntry(id uint64, member string) *IPSetEntry {
+func ProtoIPSetMemberToBPFEntry(id uint64, member string) IPSetEntryInterface {
 	var cidrStr string
 	var port uint16
 	var protocol uint8

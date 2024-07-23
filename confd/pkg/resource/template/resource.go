@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -88,7 +87,20 @@ func NewTemplateResource(path string, config Config) (*TemplateResource, error) 
 	addFuncs(tr.funcMap, tr.store.FuncMap)
 
 	if runtime.GOOS == "windows" {
-		tr.shellCmd = "powershell"
+		// On Windows HPC containers, $PATH does not contain the directory with 'powershell.exe'. Add it so that the powershell command works.
+		_, err = exec.LookPath("powershell.exe")
+		if err != nil {
+			path := os.Getenv("PATH")
+			err = os.Setenv("PATH", path+";C:/Windows/System32/WindowsPowerShell/v1.0/")
+			if err != nil {
+				return nil, fmt.Errorf("Cannot add powershell to Windows PATH: %s", err.Error())
+			}
+			_, err = exec.LookPath("powershell.exe")
+			if err != nil {
+				return nil, fmt.Errorf("Cannot find powershell.exe after addding default path to Windows PATH: %s", err.Error())
+			}
+		}
+		tr.shellCmd = "powershell.exe"
 	} else {
 		tr.shellCmd = "/bin/sh"
 	}
@@ -161,7 +173,7 @@ func (t *TemplateResource) createStageFile() error {
 	}
 
 	// create TempFile in Dest directory to avoid cross-filesystem issues
-	temp, err := ioutil.TempFile(filepath.Dir(t.Dest), "."+filepath.Base(t.Dest))
+	temp, err := os.CreateTemp(filepath.Dir(t.Dest), "."+filepath.Base(t.Dest))
 	if err != nil {
 		return err
 	}
@@ -248,11 +260,11 @@ func (t *TemplateResource) sync(key string) error {
 				// try to open the file and write to it
 				var contents []byte
 				var rerr error
-				contents, rerr = ioutil.ReadFile(staged)
+				contents, rerr = os.ReadFile(staged)
 				if rerr != nil {
 					return rerr
 				}
-				if err := ioutil.WriteFile(t.Dest, contents, t.FileMode); err != nil {
+				if err := os.WriteFile(t.Dest, contents, t.FileMode); err != nil {
 					log.WithError(err).WithField("filename", t.Dest).Error("failed to write to file")
 					return err
 				}

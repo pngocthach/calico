@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ const (
 	ChainNamePrefix = "cali-"
 	// IPSetNamePrefix: similarly for IP sets, we use the following prefix; the IP sets layer
 	// adds its own "-" so it isn't included here.
-	IPSetNamePrefix = "cali"
+	IPSetNamePrefix = ipsets.IPSetNamePrefix
 
 	ChainFilterInput   = ChainNamePrefix + "INPUT"
 	ChainFilterForward = ChainNamePrefix + "FORWARD"
@@ -74,6 +74,9 @@ const (
 	PolicyOutboundPfx  PolicyChainNamePrefix  = ChainNamePrefix + "po-"
 	ProfileInboundPfx  ProfileChainNamePrefix = ChainNamePrefix + "pri-"
 	ProfileOutboundPfx ProfileChainNamePrefix = ChainNamePrefix + "pro-"
+
+	PolicyGroupInboundPrefix  string = ChainNamePrefix + "gi-"
+	PolicyGroupOutboundPrefix string = ChainNamePrefix + "go-"
 
 	ChainWorkloadToHost       = ChainNamePrefix + "wl-to-host"
 	ChainFromWorkloadDispatch = ChainNamePrefix + "from-wl-dispatch"
@@ -123,9 +126,18 @@ const (
 	KubeProxyInsertRuleRegex = `-j KUBE-[a-zA-Z0-9-]*SERVICES|-j KUBE-FORWARD`
 )
 
+type PolicyDirection string
+
+const (
+	PolicyDirectionInbound  PolicyDirection = "inbound"  // AKA ingress
+	PolicyDirectionOutbound PolicyDirection = "outbound" // AKA egress
+)
+
 // Typedefs to prevent accidentally passing the wrong prefix to the Policy/ProfileChainName()
-type PolicyChainNamePrefix string
-type ProfileChainNamePrefix string
+type (
+	PolicyChainNamePrefix  string
+	ProfileChainNamePrefix string
+)
 
 var (
 	// AllHistoricChainNamePrefixes lists all the prefixes that we've used for chains.  Keeping
@@ -173,19 +185,13 @@ type RuleRenderer interface {
 	StaticNATTableChains(ipVersion uint8) []*iptables.Chain
 	StaticNATPostroutingChains(ipVersion uint8) []*iptables.Chain
 	StaticRawTableChains(ipVersion uint8) []*iptables.Chain
-	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack, enforceRPF bool) []*iptables.Chain
+	StaticBPFModeRawChains(ipVersion uint8, wgEncryptHost, disableConntrack bool) []*iptables.Chain
 	StaticMangleTableChains(ipVersion uint8) []*iptables.Chain
 	StaticFilterForwardAppendRules() []iptables.Rule
 
 	WorkloadDispatchChains(map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
-	WorkloadEndpointToIptablesChains(
-		ifaceName string,
-		epMarkMapper EndpointMarkMapper,
-		adminUp bool,
-		ingressPolicies []string,
-		egressPolicies []string,
-		profileIDs []string,
-	) []*iptables.Chain
+	WorkloadEndpointToIptablesChains(ifaceName string, epMarkMapper EndpointMarkMapper, adminUp bool, ingressPolicies []*PolicyGroup, egressPolicies []*PolicyGroup, profileIDs []string) []*iptables.Chain
+	PolicyGroupToIptablesChains(group *PolicyGroup) []*iptables.Chain
 
 	WorkloadInterfaceAllowChains(endpoints map[proto.WorkloadEndpointID]*proto.WorkloadEndpoint) []*iptables.Chain
 
@@ -201,29 +207,29 @@ type RuleRenderer interface {
 	HostEndpointToFilterChains(
 		ifaceName string,
 		epMarkMapper EndpointMarkMapper,
-		ingressPolicyNames []string,
-		egressPolicyNames []string,
-		ingressForwardPolicyNames []string,
-		egressForwardPolicyNames []string,
+		ingressPolicies []*PolicyGroup,
+		egressPolicies []*PolicyGroup,
+		ingressForwardPolicies []*PolicyGroup,
+		egressForwardPolicies []*PolicyGroup,
 		profileIDs []string,
 	) []*iptables.Chain
 	HostEndpointToMangleEgressChains(
 		ifaceName string,
-		egressPolicyNames []string,
+		egressPolicies []*PolicyGroup,
 		profileIDs []string,
 	) []*iptables.Chain
 	HostEndpointToRawEgressChain(
 		ifaceName string,
-		egressPolicyNames []string,
+		egressPolicies []*PolicyGroup,
 	) *iptables.Chain
 	HostEndpointToRawChains(
 		ifaceName string,
-		ingressPolicyNames []string,
-		egressPolicyNames []string,
+		ingressPolicies []*PolicyGroup,
+		egressPolicies []*PolicyGroup,
 	) []*iptables.Chain
 	HostEndpointToMangleIngressChains(
 		ifaceName string,
-		preDNATPolicyNames []string,
+		preDNATPolicies []*PolicyGroup,
 	) []*iptables.Chain
 
 	PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain
@@ -238,14 +244,21 @@ type RuleRenderer interface {
 	BlockedCIDRsToIptablesChains(cidrs []string, ipVersion uint8) []*iptables.Chain
 
 	WireguardIncomingMarkChain() *iptables.Chain
+
+	IptablesFilterDenyAction() iptables.Action
 }
 
 type DefaultRuleRenderer struct {
 	Config
-	inputAcceptActions []iptables.Action
-	filterAllowAction  iptables.Action
-	mangleAllowAction  iptables.Action
-	blockCIDRAction    iptables.Action
+	inputAcceptActions       []iptables.Action
+	filterAllowAction        iptables.Action
+	mangleAllowAction        iptables.Action
+	blockCIDRAction          iptables.Action
+	iptablesFilterDenyAction iptables.Action
+}
+
+func (r *DefaultRuleRenderer) IptablesFilterDenyAction() iptables.Action {
+	return r.iptablesFilterDenyAction
 }
 
 func (r *DefaultRuleRenderer) ipSetConfig(ipVersion uint8) *ipsets.IPVersionConfig {
@@ -281,9 +294,10 @@ type Config struct {
 	OpenStackMetadataPort        uint16
 	OpenStackSpecialCasesEnabled bool
 
-	VXLANEnabled bool
-	VXLANPort    int
-	VXLANVNI     int
+	VXLANEnabled   bool
+	VXLANEnabledV6 bool
+	VXLANPort      int
+	VXLANVNI       int
 
 	IPIPEnabled            bool
 	FelixConfigIPIPEnabled *bool
@@ -291,15 +305,19 @@ type Config struct {
 	// by the host when sending traffic to a workload over IPIP.
 	IPIPTunnelAddress net.IP
 	// Same for VXLAN.
-	VXLANTunnelAddress net.IP
+	VXLANTunnelAddress   net.IP
+	VXLANTunnelAddressV6 net.IP
 
 	AllowVXLANPacketsFromWorkloads bool
 	AllowIPIPPacketsFromWorkloads  bool
 
 	WireguardEnabled            bool
+	WireguardEnabledV6          bool
 	WireguardInterfaceName      string
+	WireguardInterfaceNameV6    string
 	WireguardIptablesMark       uint32
 	WireguardListeningPort      int
+	WireguardListeningPortV6    int
 	WireguardEncryptHostTraffic bool
 	RouteSource                 string
 
@@ -307,6 +325,7 @@ type Config struct {
 	EndpointToHostAction      string
 	IptablesFilterAllowAction string
 	IptablesMangleAllowAction string
+	IptablesFilterDenyAction  string
 
 	FailsafeInboundHostPorts  []config.ProtoPort
 	FailsafeOutboundHostPorts []config.ProtoPort
@@ -316,10 +335,10 @@ type Config struct {
 	NATPortRange                       numorstring.Port
 	IptablesNATOutgoingInterfaceFilter string
 
-	NATOutgoingAddress net.IP
-	BPFEnabled         bool
-
-	ServiceLoopPrevention string
+	NATOutgoingAddress             net.IP
+	BPFEnabled                     bool
+	BPFForceTrackPacketsFromIfaces []string
+	ServiceLoopPrevention          string
 }
 
 var unusedBitsInBPFMode = map[string]bool{
@@ -365,6 +384,18 @@ func (c *Config) validate() {
 func NewRenderer(config Config) RuleRenderer {
 	log.WithField("config", config).Info("Creating rule renderer.")
 	config.validate()
+
+	// First, what should we do when packets are not accepted.
+	var iptablesFilterDenyAction iptables.Action
+	switch config.IptablesFilterDenyAction {
+	case "REJECT":
+		log.Info("packets that are not passed by any policy or profile will be rejected.")
+		iptablesFilterDenyAction = iptables.RejectAction{}
+	default:
+		log.Info("packets that are not passed by any policy or profile will be dropped.")
+		iptablesFilterDenyAction = iptables.DropAction{}
+	}
+
 	// Convert configured actions to rule slices.
 	// First, what should we do with packets that come from workloads to the host itself.
 	var inputAcceptActions []iptables.Action
@@ -372,6 +403,9 @@ func NewRenderer(config Config) RuleRenderer {
 	case "DROP":
 		log.Info("Workload to host packets will be dropped.")
 		inputAcceptActions = []iptables.Action{iptables.DropAction{}}
+	case "REJECT":
+		log.Info("Workload to host packets will be rejected.")
+		inputAcceptActions = []iptables.Action{iptables.RejectAction{}}
 	case "ACCEPT":
 		log.Info("Workload to host packets will be accepted.")
 		inputAcceptActions = []iptables.Action{iptables.AcceptAction{}}
@@ -413,10 +447,11 @@ func NewRenderer(config Config) RuleRenderer {
 	}
 
 	return &DefaultRuleRenderer{
-		Config:             config,
-		inputAcceptActions: inputAcceptActions,
-		filterAllowAction:  filterAllowAction,
-		mangleAllowAction:  mangleAllowAction,
-		blockCIDRAction:    blockCIDRAction,
+		Config:                   config,
+		inputAcceptActions:       inputAcceptActions,
+		filterAllowAction:        filterAllowAction,
+		mangleAllowAction:        mangleAllowAction,
+		blockCIDRAction:          blockCIDRAction,
+		iptablesFilterDenyAction: iptablesFilterDenyAction,
 	}
 }

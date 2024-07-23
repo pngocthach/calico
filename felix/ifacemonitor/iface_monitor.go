@@ -16,6 +16,7 @@ package ifacemonitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -46,13 +48,15 @@ const (
 )
 
 type InterfaceStateCallback func(ifaceName string, ifaceState State, ifIndex int)
-type AddrStateCallback func(ifaceName string, addrs set.Set)
+type AddrStateCallback func(ifaceName string, addrs set.Set[string])
+type InSyncCallback func()
 
 type Config struct {
 	// InterfaceExcludes is a list of interface names that we don't want callbacks for.
 	InterfaceExcludes []*regexp.Regexp
 	// ResyncInterval is the interval at which we rescan all the interfaces.  If <0 rescan is disabled.
 	ResyncInterval time.Duration
+	NetlinkTimeout time.Duration
 }
 
 type InterfaceMonitor struct {
@@ -66,6 +70,7 @@ type InterfaceMonitor struct {
 
 	StateCallback    InterfaceStateCallback
 	AddrCallback     AddrStateCallback
+	InSyncCallback   InSyncCallback
 	fatalErrCallback func(error)
 }
 
@@ -74,11 +79,14 @@ type ifaceInfo struct {
 	Name       string
 	State      State
 	TrackAddrs bool
-	Addrs      set.Set
+	Addrs      set.Set[string]
 }
 
-func New(config Config, fatalErrCallback func(error)) *InterfaceMonitor {
-	// Interface monitor using the real netlink, and resyncing every 10 seconds.
+func New(config Config,
+	featureDetector environment.FeatureDetectorIface,
+	fatalErrCallback func(error),
+) *InterfaceMonitor {
+	// Interface monitor using the real netlink.
 	var resyncC <-chan time.Time
 	if config.ResyncInterval > 0 {
 		log.WithField("interval", config.ResyncInterval).Info(
@@ -86,7 +94,7 @@ func New(config Config, fatalErrCallback func(error)) *InterfaceMonitor {
 		resyncTicker := time.NewTicker(config.ResyncInterval)
 		resyncC = resyncTicker.C
 	}
-	return NewWithStubs(config, &netlinkReal{}, resyncC, fatalErrCallback)
+	return NewWithStubs(config, newRealNetlink(featureDetector, config.NetlinkTimeout), resyncC, fatalErrCallback)
 }
 
 func NewWithStubs(config Config, netlinkStub netlinkStub, resyncC <-chan time.Time, fatalErrCallback func(error)) *InterfaceMonitor {
@@ -121,6 +129,8 @@ func (m *InterfaceMonitor) MonitorInterfaces() {
 			if nlCancelC, err = m.netlinkStub.Subscribe(updates, routeUpdates); err != nil {
 				// If we can't even subscribe, something must have gone very wrong.  Bail.
 				m.fatalErrCallback(fmt.Errorf("failed to subscribe to netlink: %w", err))
+				filterUpdatesCancel()
+				return
 			}
 			go FilterUpdates(filterUpdatesCtx, filteredRouteUpdates, routeUpdates, filteredUpdates, updates)
 		}
@@ -132,8 +142,12 @@ func (m *InterfaceMonitor) MonitorInterfaces() {
 		err := m.resync()
 		if err != nil {
 			m.fatalErrCallback(fmt.Errorf("failed to read from netlink (initial resync): %w", err))
+			filterUpdatesCancel()
+			return
 		}
 
+		// Let the main goroutine know that we're in sync in order to unblock dataplane programming.
+		m.InSyncCallback()
 	readLoop:
 		for {
 			log.WithFields(log.Fields{
@@ -161,6 +175,9 @@ func (m *InterfaceMonitor) MonitorInterfaces() {
 				err := m.resync()
 				if err != nil {
 					m.fatalErrCallback(fmt.Errorf("failed to read from netlink (resync): %w", err))
+					close(nlCancelC)
+					filterUpdatesCancel()
+					return
 				}
 			}
 		}
@@ -199,6 +216,10 @@ func (m *InterfaceMonitor) handleNetlinkRouteUpdate(update netlink.RouteUpdate) 
 
 	// Early check: avoid logging anything for excluded interfaces.
 	if info != nil && !info.TrackAddrs {
+		return
+	}
+
+	if update.Dst == nil {
 		return
 	}
 
@@ -264,7 +285,7 @@ func (m *InterfaceMonitor) storeAndNotifyLink(ifaceExists bool, link netlink.Lin
 	m.storeAndNotifyLinkInner(ifaceExists, newName, link)
 }
 
-func linkIsOperUp(link netlink.Link) bool {
+func LinkIsOperUp(link netlink.Link) bool {
 	// We need the operstate of the interface; this is carried in the IFF_RUNNING flag.  The
 	// IFF_UP flag contains the admin state, which doesn't tell us whether we can program routes
 	// etc.
@@ -294,7 +315,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 	}
 	newState := StateNotPresent
 	if ifaceExists {
-		if linkIsOperUp(link) {
+		if LinkIsOperUp(link) {
 			newState = StateUp
 		} else {
 			newState = StateDown
@@ -309,7 +330,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 				Idx:        ifIndex,
 				Name:       ifaceName,
 				TrackAddrs: trackAddrs,
-				Addrs:      set.New(),
+				Addrs:      set.New[string](),
 			}
 		}
 		m.ifaceNameToIdx[ifaceName] = ifIndex
@@ -350,10 +371,14 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 	// channels.  We deliberately do this regardless of the link state, as in some cases this
 	// will allow us to secure a Host Endpoint interface _before_ it comes up, and so eliminate
 	// a small window of insecurity.
-	newAddrs := set.New()
+	newAddrs := set.New[string]()
 	for _, family := range [2]int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		routes, err := m.netlinkStub.ListLocalRoutes(link, family)
 		if err != nil {
+			if errors.Is(err, unix.ENODEV) {
+				log.Debug("Tried to list routes for interface but it is gone, ignoring...")
+				continue
+			}
 			log.WithError(err).Warn("Netlink route list operation failed.")
 		}
 		for _, route := range routes {
@@ -383,7 +408,7 @@ func (m *InterfaceMonitor) resync() error {
 		log.WithError(err).Warn("Netlink list operation failed.")
 		return err
 	}
-	currentIfaces := set.New()
+	currentIfaces := set.New[string]()
 	for _, link := range links {
 		attrs := link.Attrs()
 		if attrs == nil {

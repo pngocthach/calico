@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,13 @@
 package bpf
 
 import (
-	"errors"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	"github.com/projectcalico/calico/felix/bpf/asm"
 )
-
-type MapFD uint32
-
-func (f MapFD) Close() error {
-	log.WithField("fd", int(f)).Debug("Closing MapFD")
-	return unix.Close(int(f))
-}
 
 type ProgFD uint32
 
@@ -38,8 +32,8 @@ func (f ProgFD) Close() error {
 	return unix.Close(int(f))
 }
 
-func IsNotExists(err error) bool {
-	return err == unix.ENOENT
+func (f ProgFD) FD() uint32 {
+	return uint32(f)
 }
 
 type ProgResult struct {
@@ -48,21 +42,15 @@ type ProgResult struct {
 	DataOut  []byte
 }
 
-type MapInfo struct {
-	Type       int
-	KeySize    int
-	ValueSize  int
-	MaxEntries int
+// PolicyDebugInfo describes policy debug info
+type PolicyDebugInfo struct {
+	IfaceName  string    `json:"ifacename"`
+	Hook       string    `json:"hook"`
+	PolicyInfo asm.Insns `json:"policyInfo"`
+	Error      string    `json:"error"`
 }
 
 const (
-	ObjectDir      = "/usr/lib/calico/bpf"
 	RuntimeProgDir = "/var/run/calico/bpf/prog"
+	RuntimePolDir  = "/var/run/calico/bpf/policy"
 )
-
-// ErrIterationFinished is returned by the MapIterator's Next() method when there are no more keys.
-var ErrIterationFinished = errors.New("iteration finished")
-
-// ErrVisitedTooManyKeys is returned by the MapIterator's Next() method if it sees many more keys than there should
-// be in the map.
-var ErrVisitedTooManyKeys = errors.New("visited 10x the max size of the map keys")

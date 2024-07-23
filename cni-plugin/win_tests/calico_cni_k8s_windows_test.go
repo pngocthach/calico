@@ -37,6 +37,9 @@ import (
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/testutils"
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
 	"github.com/projectcalico/calico/cni-plugin/pkg/k8s"
@@ -46,9 +49,6 @@ import (
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 )
 
 func ensureNamespace(clientset *kubernetes.Clientset, name string) {
@@ -91,7 +91,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 	BeforeSuite(func() {
 		log.Infof("CONTAINER_RUNTIME=%v", os.Getenv("CONTAINER_RUNTIME"))
 
-		//Clean-up Networks if left over in previous run
+		// Clean-up Networks if left over in previous run
 		hnsNetworkList, _ := hcsshim.HNSListNetworkRequest("GET", "", "")
 		log.WithField("hnsNetworkList: ", hnsNetworkList).Infof("List of Network")
 		for _, network := range hnsNetworkList {
@@ -101,8 +101,6 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(err).NotTo(HaveOccurred())
 			}
 		}
-		// Create a random seed
-		rand.Seed(time.Now().UTC().UnixNano())
 		hostname, _ = names.Hostname()
 		ctx = context.Background()
 		for i := 1; i <= 3; i++ {
@@ -240,7 +238,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			Expect(len(result.IPs)).Should(Equal(1))
 			ip := result.IPs[0].Address.IP.String()
 			log.Debugf("ip is %v ", ip)
-			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 			Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 			// datastore things:
@@ -335,7 +333,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				log.Debugf("containerID %v ", containerID)
 				log.Debugf("result %v ", result)
 				Expect(len(result.IPs)).Should(Equal(1))
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -416,7 +414,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				ids := names.WorkloadEndpointIdentifiers{
@@ -495,7 +493,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -599,7 +597,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -770,7 +768,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -982,7 +980,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 					Expect(len(result.IPs)).Should(Equal(1))
 					ip := result.IPs[0].Address.IP.String()
 					log.Debugf("ip is %v ", ip)
-					result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+					result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 					Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 					// datastore things:
@@ -1556,7 +1554,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 					lastNWName = podNwName
 					nwsName = append(nwsName, podNwName)
 				}
-				//Network should  be same
+				// Network should  be same
 				Expect(nwName).Should(Equal(podNwName))
 			}
 		})
@@ -1817,7 +1815,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			Expect(len(result.IPs)).Should(Equal(1))
 			ip := result.IPs[0].Address.IP.String()
 			log.Debugf("ip is %v ", ip)
-			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 			Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 			// datastore things:
@@ -2051,7 +2049,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			log.Infof("Checking timestamp container 1 %s", containerID1)
 			justDeleted, err := utils.CheckWepJustDeleted(containerID1, 12)
 			Expect(err).ShouldNot(HaveOccurred())
-			//JustDeleted for container1 could vary because it depends on how long it takes to delete container2.
+			// JustDeleted for container1 could vary because it depends on how long it takes to delete container2.
 
 			log.Infof("Checking timestamp container 2 %s", containerID2)
 			justDeleted, err = utils.CheckWepJustDeleted(containerID2, 12)
@@ -2069,7 +2067,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			ensureTimestamp(containerID3)
 
 			// Make sure timeout on pod1, pod2 deletion timestamp. 7+7 > 12
-			log.Infof("Sleeping further 7 seonds")
+			log.Infof("Sleeping further 7 seconds")
 			time.Sleep(time.Second * 7)
 			justDeleted, err = utils.CheckWepJustDeleted(containerID1, 12)
 			Expect(err).ShouldNot(HaveOccurred())

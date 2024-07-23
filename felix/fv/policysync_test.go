@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,6 +31,9 @@ import (
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/selector"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -55,7 +57,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 	var (
 		etcd              *containers.Container
-		felix             *infrastructure.Felix
+		tc                infrastructure.TopologyContainers
 		calicoClient      client.Interface
 		infra             infrastructure.DatastoreInfra
 		w                 [3]*workload.Workload
@@ -67,7 +69,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 		// Create a temporary directory to map into the container as /var/run/calico/policysync, which
 		// is where we tell Felix to put the policy sync mounts and credentials.
 		var err error
-		tempDir, err = ioutil.TempDir("", "felixfv")
+		tempDir, err = os.MkdirTemp("", "felixfv")
 		Expect(err).NotTo(HaveOccurred())
 
 		// Configure felix to enable the policy sync API.
@@ -78,13 +80,13 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 		// options.ExtraEnvVars["FELIX_DebugDisableLogDropping"] = "true"
 		// options.FelixLogSeverity = "debug"
 		options.ExtraVolumes[tempDir] = "/var/run/calico/policysync"
-		felix, etcd, calicoClient, infra = infrastructure.StartSingleNodeEtcdTopology(options)
+		tc, etcd, calicoClient, infra = infrastructure.StartSingleNodeEtcdTopology(options)
 		infrastructure.CreateDefaultProfile(calicoClient, "default", map[string]string{"default": ""}, "default == ''")
 
 		// Create three workloads, using that profile.
 		for ii := range w {
 			iiStr := strconv.Itoa(ii)
-			w[ii] = workload.Run(felix, "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
+			w[ii] = workload.Run(tc.Felixes[0], "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
 			w[ii].WorkloadEndpoint.Spec.Endpoint = "eth0"
 			w[ii].WorkloadEndpoint.Spec.Orchestrator = "k8s"
 			w[ii].WorkloadEndpoint.Spec.Pod = "fv-pod-" + iiStr
@@ -98,7 +100,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 		for ii := range w {
 			w[ii].Stop()
 		}
-		felix.Stop()
+		tc.Stop()
 
 		if CurrentGinkgoTestDescription().Failed {
 			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
@@ -141,7 +143,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 			credentialFileName := credentials.Uid + binder.CredentialsExtension
 
 			credsFileTmp := filepath.Join(tempDir, credentialFileName)
-			err = ioutil.WriteFile(credsFileTmp, attrs, 0777)
+			err = os.WriteFile(credsFileTmp, attrs, 0777)
 			if err != nil {
 				return err
 			}
@@ -209,7 +211,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 				createWorkloadConn := func(i int) (*grpc.ClientConn, proto.PolicySyncClient) {
 					var opts []grpc.DialOption
-					opts = append(opts, grpc.WithInsecure())
+					opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 					opts = append(opts, grpc.WithDialer(unixDialer))
 					var conn *grpc.ClientConn
 					conn, err = grpc.Dial(hostWlSocketPath[i], opts...)
@@ -225,7 +227,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 						// Use the fact that anything we exec inside the Felix container runs as root to fix the
 						// permissions on the socket so the test process can connect.
 						Eventually(hostWlSocketPath[i], "3s").Should(BeAnExistingFile())
-						felix.Exec("chmod", "a+rw", containerWlSocketPath[i])
+						tc.Felixes[0].Exec("chmod", "a+rw", containerWlSocketPath[i])
 						wlConn[i], wlClient[i] = createWorkloadConn(i)
 					}
 				})
@@ -311,7 +313,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 								Expect(err).NotTo(HaveOccurred())
 
 								if wlIdx != 2 {
-									Eventually(mockWlClient[wlIdx].ActivePolicies, waitTime).Should(Equal(set.New()))
+									Eventually(mockWlClient[wlIdx].ActivePolicies, waitTime).Should(Equal(set.New[proto.PolicyID]()))
 								}
 							}
 						}
@@ -375,26 +377,26 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 									IngressPolicyNames: []string{"default.policy-0"},
 								}}}))
 
-							Consistently(mockWlClient[1].ActivePolicies).Should(Equal(set.New()))
-							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New()))
+							Consistently(mockWlClient[1].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
+							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
 						})
 
 						It("should be correctly mapped to proto policy", func() {
 							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.From(
 								policyID,
 							)))
-							policy := mockWlClient[0].ActivePolicy(policyID)
+							protoPol := mockWlClient[0].ActivePolicy(policyID)
 							// The rule IDs are fairly random hashes, check they're there but
 							// ignore them for the comparison.
-							for _, r := range policy.InboundRules {
+							for _, r := range protoPol.InboundRules {
 								Expect(r.RuleId).NotTo(Equal(""))
 								r.RuleId = ""
 							}
-							for _, r := range policy.OutboundRules {
+							for _, r := range protoPol.OutboundRules {
 								Expect(r.RuleId).NotTo(Equal(""))
 								r.RuleId = ""
 							}
-							Expect(policy).To(Equal(
+							Expect(protoPol).To(Equal(
 								&proto.Policy{
 									Namespace: "", // Global policy has no namespace
 									InboundRules: []*proto.Rule{
@@ -417,6 +419,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 											Action: "allow",
 										},
 									},
+									OriginalSelector: selector.Normalise(policy.Spec.Selector),
 								},
 							))
 						})
@@ -429,7 +432,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 							_, err := calicoClient.GlobalNetworkPolicies().Delete(ctx, "policy-0", options.DeleteOptions{})
 							Expect(err).NotTo(HaveOccurred())
 
-							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New()))
+							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
 						})
 
 						It("should handle a change of selector", func() {
@@ -447,7 +450,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 							Eventually(mockWlClient[0].EndpointToPolicyOrder).Should(Equal(
 								map[string][]mock.TierInfo{"k8s/fv/fv-pod-0/eth0": {}}))
-							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New()))
+							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
 
 							By("Updating workload 1 to make the policy active")
 							Eventually(mockWlClient[1].ActivePolicies).Should(Equal(set.From(policyID)))
@@ -458,7 +461,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 									IngressPolicyNames: []string{"default.policy-0"},
 								}}}))
 
-							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New()))
+							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
 						})
 
 						It("should handle a change of profiles", func() {

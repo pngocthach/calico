@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) 2020 Tigera, Inc. All rights reserved.
+# Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -116,6 +116,9 @@ bin_allow_list_patterns=(
   zless
   zmore
 
+  # Needed for eBPF mode to mount the cgroupv2 filesystem on the host.
+  mountns
+
   # Used by this script.
   '/find$'
   '/ldd$'
@@ -213,8 +216,18 @@ while read -r path; do
     continue
   fi
   # Well-known plugins, not directly linked.
-  if [[ "$path" =~ xtables|netfilter|conntrack|ct_|pam|libnss|libresolv ]] && ! [[ "$path" =~ systemd ]] ; then
+  if [[ "$path" =~ xtables|netfilter|conntrack|ct_|libnss|libresolv ]] && ! [[ "$path" =~ systemd ]] ; then
     echo "PLUGIN: $path"
+    libs_to_keep[$path]=true
+    continue
+  fi
+  # These libraries and hmac files under /usr/lib64 are needed when ubi container
+  # is running in FIPS mode. They are not directly linked by the allowed binaries.
+  # * /usr/lib64/.libcrypto.so.x.y.z.hmac
+  # * /usr/lib64/.libssl.so.x.y.z.hmac
+  # * /usr/lib64/libssl.so.x.y.z
+  if [[ "$path" =~ .libcrypto|.libssl|libssl ]]; then
+    echo "FIPS PLUGIN: $path"
     libs_to_keep[$path]=true
     continue
   fi
@@ -225,6 +238,7 @@ done < <(find /usr/lib64 \( -type f -or -type l \))
 # binaries and libraries that we don't want.
 packages_to_keep=(
   bash
+  bzip2-libs
   ca-certificates
   conntrack-tools
   coreutils-single
@@ -241,6 +255,7 @@ packages_to_keep=(
   langpacks
   libacl
   libattr
+  libbpf
   libcap
   libcrypto
   libelf
@@ -256,15 +271,14 @@ packages_to_keep=(
   libpwquality
   libselinux
   libzstd
+  libz
   ncurses
   net-tools
   openssl-libs
   p11-kit-trust
-  pam
   pcre
   redhat-release
   rootfiles
-  rpm
   sed
   setup
   shadow-utils
@@ -353,6 +367,10 @@ rm -rf \
   /usr/share/gcc-8 \
   /usr/share/X11 \
   /usr/share/zsh \
+  /usr/share/python* \
+  /usr/share/**/python* \
+  /usr/lib/python* \
+  /usr/lib/**/python* \
   /in-the-container \
   /usr/bin/ldd \
   "$0"

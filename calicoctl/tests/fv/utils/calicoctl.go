@@ -15,15 +15,17 @@
 package utils
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 )
 
-var calicoctl = "/go/src/github.com/projectcalico/calico/calicoctl/bin/calicoctl-linux-amd64"
+var calicoctl = "/go/src/github.com/projectcalico/calico/calicoctl/bin/calicoctl-linux-" + runtime.GOARCH
 var version_helper = "/go/src/github.com/projectcalico/calico/calicoctl/tests/fv/helper/bin/calico_version_helper"
 
 func getEnv(kdd bool) []string {
@@ -44,7 +46,7 @@ func getEnv(kdd bool) []string {
 
 func Calicoctl(kdd bool, args ...string) string {
 	out, err := CalicoctlMayFail(kdd, args...)
-	Expect(err).NotTo(HaveOccurred())
+	Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to run calicoctl (kdd:%v) %v", kdd, args))
 	return out
 }
 

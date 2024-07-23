@@ -15,7 +15,7 @@
 # We require the 64-bit version of Powershell, which should live at the following path.
 $powerShellPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $baseDir = "$PSScriptRoot\..\.."
-$NSSMPath = "$baseDir\nssm-2.24\win64\nssm.exe"
+$NSSMPath = "$baseDir\nssm\win64\nssm.exe"
 
 function fileIsMissing($path)
 {
@@ -92,6 +92,30 @@ function Test-CalicoConfiguration()
     }
 }
 
+function Set-EnvVarIfNotSet {
+    param(
+        [parameter(Mandatory=$true)] $var,
+        [parameter(Mandatory=$true)] $defaultValue
+    )
+    if (-not (Test-Path "env:$var"))
+    {
+        Write-Host ("Environment variable $var is not set. Setting it to the default value: {0}" -f $defaultValue)
+        [Environment]::SetEnvironmentVariable($var, $defaultValue, 'Process')
+    } else {
+        Write-Host ("Environment variable $var is already set: {0}" -f (gci env:$var | select -expand Value))
+    }
+}
+
+function Set-ConfigParameters {
+    param(
+        [parameter(Mandatory=$true)] $var,
+        [parameter(Mandatory=$true)] $value
+    )
+    $OldString='Set-EnvVarIfNotSet -var "{0}".*$' -f $var
+    $NewString='Set-EnvVarIfNotSet -var "{0}" -defaultValue "{1}"' -f $var, $value
+    (Get-Content $baseDir\config.ps1) -replace $OldString, $NewString | Set-Content $baseDir\config.ps1 -Force
+}
+
 function Install-CNIPlugin()
 {
     Write-Host "Copying CNI binaries to $env:CNI_BIN_DIR"
@@ -152,9 +176,16 @@ function Install-CNIPlugin()
 function Remove-CNIPlugin()
 {
     $cniConfFile = $env:CNI_CONF_DIR + "\" + $env:CNI_CONF_FILENAME
-    Write-Host "Removing $cniConfFile and Calico binaries."
-    rm $cniConfFile
-    rm "$env:CNI_BIN_DIR/calico*.exe"
+    if (Test-Path $cniConfFile) {
+        Write-Host "Removing Calico CNI conf file at $cniConfFile ..."
+        rm $cniConfFile
+    }
+
+    $cniBinPath = "$env:CNI_BIN_DIR/calico*.exe"
+    if (Test-Path $cniBinPath) {
+        Write-Host "Removing Calico CNI binaries at $cniBinPath ..."
+        rm $cniBinPath
+    }
 }
 
 function Install-NodeService()
@@ -446,9 +477,20 @@ function Get-PlatformType()
     # EC2
     $restError = $null
     Try {
-        $awsNodeName=Invoke-RestMethod -uri http://169.254.169.254/latest/meta-data/local-hostname -ErrorAction Ignore
+        $awsNodeName = Invoke-RestMethod -uri http://169.254.169.254/latest/meta-data/local-hostname -ErrorAction Ignore
     } Catch {
-        $restError = $_
+        if ($_.Exception.Response.StatusCode.value__ -eq 401) {
+            # IMDSv2
+            Try {
+                $token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token -ErrorAction Ignore
+                $awsNodeName = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token" = $token} -uri http://169.254.169.254/latest/meta-data/local-hostname -ErrorAction Ignore
+            }
+            Catch {
+                $restError = $_
+            }
+        } else {
+            $restError = $_
+        }
     }
     if ($restError -eq $null) {
         return ("ec2")

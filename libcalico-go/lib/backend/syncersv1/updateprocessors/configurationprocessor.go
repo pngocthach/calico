@@ -38,7 +38,7 @@ const (
 // Configuration-type resources to the v1 model.  This converter basically
 // expands each field as a separate key and uses a stringified of the field as the
 // configuration value.  If the field is not specified in the configuration resource
-// we expand that that a delete for the associated key.
+// we expand that to a delete for the associated key.
 //
 // If the field specifies a "confignamev1" tag, then the value in that tag is used
 // as the config name, otherwise the struct field name is used.
@@ -103,12 +103,12 @@ var (
 // each field, using either the name of the field or the value in the confignamev1 tag
 // as the name of the config key and the value of the field converted to the config value.
 // The struct field values are converted as follows:
-// -  if the field is nil, or an empty string - the converted value is nil indicating a
-//    deletion of the config key.
-// -  if a converter has been provided for the field then the value is converted using
-//    that converter.
-// -  if it is a string field, the value is used as is.
-// -  booleans and ints are stringified in the standard way
+//   - if the field is nil, or an empty string - the converted value is nil indicating a
+//     deletion of the config key.
+//   - if a converter has been provided for the field then the value is converted using
+//     that converter.
+//   - if it is a string field, the value is used as is.
+//   - booleans and ints are stringified in the standard way
 //
 // This converter caches a list of additional config names that it has seen defined in
 // annotations.  This is used as a simplistic mechanism for sending deletes for config
@@ -243,6 +243,13 @@ func (c *configUpdateProcessor) processAddOrModified(kvp *model.KVPair) ([]*mode
 				case []string:
 					// Make a list of strings comma delimited
 					value = strings.Join(vt, ",")
+				case map[string]string:
+					// Make it a comma separate list of key value pairs
+					var kvp string
+					for k, v := range vt {
+						kvp += k + "=" + v + ","
+					}
+					value = kvp
 				default:
 					value = fmt.Sprintf("%v", vt)
 				}

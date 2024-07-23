@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,7 +50,7 @@ const (
 	assertionTimeout = 3 * gracePeriod
 )
 
-// assertConsistenteState performs checks on the provided IPAM controller's internal
+// assertConsistentState performs checks on the provided IPAM controller's internal
 // caches to ensure that they are consistent with each other. Useful for ensuring that
 // at any arbitrary point in time, we're not in an unknown state.
 func assertConsistentState(c *ipamController) {
@@ -86,12 +86,12 @@ func assertConsistentState(c *ipamController) {
 }
 
 var _ = Describe("IPAM controller UTs", func() {
-
 	var c *ipamController
 	var cli client.Interface
 	var cs kubernetes.Interface
-	var ni cache.Indexer
 	var stopChan chan struct{}
+	var pods chan *v1.Pod
+	var nodes chan *v1.Node
 
 	BeforeEach(func() {
 		// Create a fake clientset with nothing in it.
@@ -102,7 +102,8 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		// Create a node indexer with the fake clientset
 		factory := informers.NewSharedInformerFactory(cs, 0)
-		ni = factory.Core().V1().Nodes().Informer().GetIndexer()
+		podInformer := factory.Core().V1().Pods().Informer()
+		nodeInformer := factory.Core().V1().Nodes().Informer()
 
 		// Config for the test.
 		cfg := config.NodeControllerConfig{
@@ -112,9 +113,30 @@ var _ = Describe("IPAM controller UTs", func() {
 		// stopChan is used in AfterEach to stop the controller in each test.
 		stopChan = make(chan struct{})
 
+		pods = make(chan *v1.Pod, 1)
+		_, err := podInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				pod := obj.(*v1.Pod)
+				pods <- pod
+			},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		nodes = make(chan *v1.Node, 1)
+		_, err = nodeInformer.AddEventHandler(&cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				node := obj.(*v1.Node)
+				nodes <- node
+			},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		factory.Start(stopChan)
+		cache.WaitForCacheSync(stopChan, podInformer.HasSynced)
+		cache.WaitForCacheSync(stopChan, nodeInformer.HasSynced)
+
 		// Create a new controller. We don't register with a data feed,
 		// as the tests themselves will drive the controller.
-		c = NewIPAMController(cfg, cli, cs, ni)
+		c = NewIPAMController(cfg, cli, cs, podInformer.GetIndexer(), nodeInformer.GetIndexer())
 	})
 
 	AfterEach(func() {
@@ -653,6 +675,8 @@ var _ = Describe("IPAM controller UTs", func() {
 
 		// Start the controller.
 		c.Start(stopChan)
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		idx := 0
 		handle := "test-handle"
@@ -718,6 +742,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Create a pod for the allocation so that it doesn't get GC'd.
 		pod := v1.Pod{}
@@ -726,6 +752,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Spec.NodeName = "kname"
 		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -878,6 +906,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Create a pod for the allocation - the pod will have a single IP in its status, but there will be
 		// two IPs allocated which belong to the pod's handle - one "leaked" and one valid. This simulates
@@ -891,6 +921,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Status.PodIPs = []v1.PodIP{{IP: "10.0.0.0"}}
 		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
 
 		// Add a new block with the IPv4 address.
 		idx := 0
@@ -1017,7 +1049,6 @@ var _ = Describe("IPAM controller UTs", func() {
 			// Deleting the pod should invalidate the IPv4 address, and result in both IPs being GC'd.
 			err = cs.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			c.OnKubernetesPodDeleted(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 		})
 
 		By("Verifying final state", func() {
@@ -1052,6 +1083,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -1120,6 +1153,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Create a pod for the allocation so that it doesn't get GC'd.
 		pod := v1.Pod{}
@@ -1128,6 +1163,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Spec.NodeName = "kname"
 		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -1214,7 +1251,7 @@ var _ = Describe("IPAM controller UTs", func() {
 		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
 	})
 
-	It("should NOT clean up empty blocks if the node is full", func() {
+	It("should clean up empty blocks even if the node is full", func() {
 		// Create Calico and k8s nodes for the test.
 		n := libapiv3.Node{}
 		n.Name = "cnode"
@@ -1225,6 +1262,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Create a pod for the allocation so that it doesn't get GC'd.
 		pod := v1.Pod{}
@@ -1233,6 +1272,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Spec.NodeName = "kname"
 		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -1312,11 +1353,14 @@ var _ = Describe("IPAM controller UTs", func() {
 		// Mark the syncer as InSync so that the GC will be enabled.
 		c.onStatusUpdate(bapi.InSync)
 
-		// The empty block should NOT be released, because the other block on the node is full.
+		// The empty block should be released after the grace period.
 		fakeClient := cli.IPAM().(*fakeIPAMClient)
+		Eventually(func() bool {
+			return fakeClient.affinityReleased(fmt.Sprintf("%s/%s", blockCIDR2, "cnode"))
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
 		Consistently(func() bool {
 			return fakeClient.affinityReleased(fmt.Sprintf("%s/%s", blockCIDR2, "cnode"))
-		}, assertionTimeout, 100*time.Millisecond).Should(BeFalse())
+		}, assertionTimeout, 100*time.Millisecond).Should(BeTrue())
 	})
 
 	It("should NOT clean up all blocks assigned to a node", func() {
@@ -1330,6 +1374,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		kn.Name = "kname"
 		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
 
 		// Create a pod for the allocation so that it doesn't get GC'd.
 		pod := v1.Pod{}
@@ -1338,6 +1384,8 @@ var _ = Describe("IPAM controller UTs", func() {
 		pod.Spec.NodeName = "kname"
 		_, err = cs.CoreV1().Pods(pod.Namespace).Create(context.TODO(), &pod, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		var gotPod *v1.Pod
+		Eventually(pods).WithTimeout(time.Second).Should(Receive(&gotPod))
 
 		// Start the controller.
 		c.Start(stopChan)
@@ -1398,7 +1446,84 @@ var _ = Describe("IPAM controller UTs", func() {
 		}
 		Eventually(numBlocks, 1*time.Second, 100*time.Millisecond).Should(Equal(1))
 		Consistently(numBlocks, assertionTimeout, 100*time.Millisecond).Should(Equal(1))
-
 	})
 
+	// This test verifies that the GC cleans up blocks even if the total number of free addresses on the node
+	// is small.
+	// Reference: https://github.com/projectcalico/calico/issues/7987
+	It("should clean up small IPAM blocks", func() {
+		// Create Calico and k8s nodes for the test.
+		n := libapiv3.Node{}
+		n.Name = "cnode"
+		n.Spec.OrchRefs = []libapiv3.OrchRef{{NodeName: "kname", Orchestrator: apiv3.OrchestratorKubernetes}}
+		_, err := cli.Nodes().Create(context.TODO(), &n, options.SetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		kn := v1.Node{}
+		kn.Name = "kname"
+		_, err = cs.CoreV1().Nodes().Create(context.TODO(), &kn, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		var node *v1.Node
+		Eventually(nodes).WithTimeout(time.Second).Should(Receive(&node))
+
+		// Start the controller.
+		c.Start(stopChan)
+
+		// Add small, empty blocks to the node.
+		// Use a block size of 31, resulting in 2 allocations per block.
+		for i := 0; i < 5; i++ {
+			unallocated := make([]int, 64)
+			for i := 0; i < len(unallocated); i++ {
+				unallocated[i] = i
+			}
+			cidr := net.MustParseCIDR(fmt.Sprintf("10.0.%d.0/31", i))
+			aff := "host:cnode"
+			key := model.BlockKey{CIDR: cidr}
+			b := model.AllocationBlock{
+				CIDR:        cidr,
+				Affinity:    &aff,
+				Allocations: make([]*int, 64),
+				Unallocated: unallocated,
+				Attributes:  []model.AllocationAttribute{},
+			}
+			kvp := model.KVPair{
+				Key:   key,
+				Value: &b,
+			}
+			update := bapi.Update{KVPair: kvp, UpdateType: bapi.UpdateTypeKVNew}
+			c.onUpdate(update)
+		}
+
+		// Wait for controller state to update with all blocks.
+		Eventually(func() bool {
+			done := c.pause()
+			defer done()
+			return len(c.allBlocks) == 5
+		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+		// The controller should recognize them all as empty.
+		Eventually(func() bool {
+			done := c.pause()
+			defer done()
+			return len(c.emptyBlocks) == 5
+		}, 1*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+		// Mark the syncer as InSync so that the GC will be enabled.
+		c.onStatusUpdate(bapi.InSync)
+
+		// 4 out of the 5 empty blocks should be released, but not all.
+		numBlocks := func() int {
+			done := c.pause()
+			defer done()
+			return len(c.blocksByNode["cnode"])
+		}
+		Eventually(numBlocks, assertionTimeout, 100*time.Millisecond).Should(Equal(1))
+		Consistently(numBlocks, assertionTimeout, 100*time.Millisecond).Should(Equal(1))
+		numBlocks = func() int {
+			done := c.pause()
+			defer done()
+			return len(c.emptyBlocks)
+		}
+		Eventually(numBlocks, 1*time.Second, 100*time.Millisecond).Should(Equal(1))
+		Consistently(numBlocks, assertionTimeout, 100*time.Millisecond).Should(Equal(1))
+	})
 })

@@ -68,14 +68,14 @@ func NewNetworkMigrator(ctx context.Context, k8sClientset *kubernetes.Clientset,
 func (m *networkMigrator) Initialise() error {
 	// Set calico image
 	d := daemonset(m.config.CalicoDaemonsetName)
-	image, err := d.GetContainerImage(m.k8sClientset, namespaceKubeSystem, calicoNodeContainerName)
+	image, err := d.GetContainerImage(m.k8sClientset, m.config.CalicoDaemonsetNamespace, calicoNodeContainerName)
 	if err != nil {
 		return err
 	}
 	m.calicoImage = image
 
 	// Set calico CNI config file name
-	cniConf, err := d.GetContainerEnv(m.k8sClientset, namespaceKubeSystem, calicoCniContainerName, calicoCniConfigEnvName)
+	cniConf, err := d.GetContainerEnv(m.k8sClientset, m.config.CalicoDaemonsetNamespace, calicoCniContainerName, calicoCniConfigEnvName)
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func (m *networkMigrator) removeFlannelNetworkAndInstallDummyCalicoCNI(node *v1.
 	// Run a remove-flannel pod with specified nodeName, this will bypass kube-scheduler.
 	// https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodename
 	pod := k8spod("remove-flannel")
-	podLog, err := pod.RunPodOnNodeTillComplete(m.k8sClientset, namespaceKubeSystem, m.calicoImage, node.Name, cmd, m.config.CniConfigDir, true, true)
+	podLog, err := pod.RunPodOnNodeTillComplete(m.k8sClientset, m.config.CalicoDaemonsetNamespace, m.calicoImage, node.Name, cmd, m.config.CniConfigDir, true, true)
 	if podLog != "" {
 		log.Infof("remove-flannel pod logs: %s.", podLog)
 	}
@@ -127,7 +127,7 @@ func (m *networkMigrator) checkCalicoVxlan(node *v1.Node) error {
 	cmd := fmt.Sprintf("for i in $(seq 1 10); do ip link show %s && code=0 && break || code=$? && sleep 1; done; (exit $code)", calicoVxlanTunnelDeviceName)
 
 	pod := k8spod("check-calico")
-	podLog, err := pod.RunPodOnNodeTillComplete(m.k8sClientset, namespaceKubeSystem, m.calicoImage, node.Name, cmd, m.config.CniConfigDir, true, true)
+	podLog, err := pod.RunPodOnNodeTillComplete(m.k8sClientset, m.config.CalicoDaemonsetNamespace, m.calicoImage, node.Name, cmd, m.config.CniConfigDir, true, true)
 	if podLog != "" {
 		log.Infof("check-calico pod logs: %s.", podLog)
 	}
@@ -138,12 +138,10 @@ func (m *networkMigrator) checkCalicoVxlan(node *v1.Node) error {
 // Drain node, remove Flannel and setup Calico network for a node.
 func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 	log.Infof("Setting node label to disable Flannel daemonset pod on node %s.", node.Name)
-	// Set two node labels at the beginning of network migration.
-	// - Label nodeNetworkNone stops Flannel pod from being scheduled on this node.
-	//   Flannel pod currently running on the node starts to be evicted as the side effect.
-	// - Label nodeMigrationInProgress marks that the node is in migration process.
+
+	// Label nodeMigrationInProgress marks that the node is in migration process.
 	n := k8snode(node.Name)
-	err := n.addNodeLabels(m.k8sClientset, nodeNetworkNone, nodeMigrationInProgress)
+	err := n.addNodeLabels(m.k8sClientset, nodeMigrationInProgress)
 	if err != nil {
 		log.WithError(err).Errorf("Error adding node labels to disable Flannel network and mark migration in process for node %s.", node.Name)
 		return err
@@ -156,10 +154,17 @@ func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 		return err
 	}
 
+	// Label the node to evict the flannel / canal pod from this node. Do this after evicting other pods.
+	err = n.addNodeLabels(m.k8sClientset, nodeNetworkNone)
+	if err != nil {
+		log.WithError(err).Errorf("Error adding node labels to disable Flannel network and mark migration in process for node %s.", node.Name)
+		return err
+	}
+
 	log.Infof("Removing flannel tunnel device/routes on %s.", node.Name)
 	// Remove Flannel network from node.
 	// Note Flannel vxlan tunnel device (flannel.1) is created by Flannel daemonset pod (not Flannel CNI)
-	// Therefor if Flannel daemonset pod can not run on this node, the tunnel device will not be recreated
+	// Therefore if Flannel daemonset pod cannot run on this node, the tunnel device will not be recreated
 	// after we delete it.
 	err = m.removeFlannelNetworkAndInstallDummyCalicoCNI(node)
 	if err != nil {
@@ -189,7 +194,7 @@ func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 
 	log.Infof("Wait up to 5 minutes for Calico daemonset pod to become Ready on %s.", node.Name)
 	// Calico daemonset pod should start running now.
-	err = n.waitPodReadyForNode(m.k8sClientset, namespaceKubeSystem, 1*time.Second, 5*time.Minute, calicoPodLabel)
+	err = n.waitPodReadyForNode(m.k8sClientset, m.config.CalicoDaemonsetNamespace, 1*time.Second, 5*time.Minute, calicoPodLabel)
 	if err != nil {
 		log.WithError(err).Errorf("Calico node pod failed on node %s", node.Name)
 		return err

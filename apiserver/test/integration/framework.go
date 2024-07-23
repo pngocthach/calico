@@ -15,6 +15,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"math/rand"
@@ -23,12 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/klog/v2"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	calicoclient "github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
@@ -38,10 +38,6 @@ import (
 )
 
 const defaultEtcdPathPrefix = ""
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 type TestServerConfig struct {
 	etcdServerList []string
@@ -116,18 +112,6 @@ func withConfigGetFreshApiserverServerAndClient(
 	return pcs, clientset, cfg, shutdownServer
 }
 
-func getFreshApiserverServerAndClient(
-	t *testing.T,
-	newEmptyObj func() runtime.Object,
-) (*apiserver.ProjectCalicoServer, calicoclient.Interface, func()) {
-	serverConfig := &TestServerConfig{
-		etcdServerList: []string{"http://localhost:2379"},
-		emptyObjFunc:   newEmptyObj,
-	}
-	pcs, client, _, shutdownFunc := withConfigGetFreshApiserverServerAndClient(t, serverConfig)
-	return pcs, client, shutdownFunc
-}
-
 func getFreshApiserverAndClient(
 	t *testing.T,
 	newEmptyObj func() runtime.Object,
@@ -140,21 +124,13 @@ func getFreshApiserverAndClient(
 	return client, shutdownFunc
 }
 
-func customizeFreshApiserverAndClient(
-	t *testing.T,
-	serverConfig *TestServerConfig,
-) (calicoclient.Interface, func()) {
-	_, client, _, shutdownFunc := withConfigGetFreshApiserverServerAndClient(t, serverConfig)
-	return client, shutdownFunc
-}
-
 func waitForApiserverUp(serverURL string, stopCh <-chan struct{}) error {
 	interval := 1 * time.Second
 	timeout := 30 * time.Second
 	startWaiting := time.Now()
 	tries := 0
-	return wait.PollImmediate(interval, timeout,
-		func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true,
+		func(ctx context.Context) (bool, error) {
 			select {
 			// we've been told to stop, so no reason to keep going
 			case <-stopCh:
